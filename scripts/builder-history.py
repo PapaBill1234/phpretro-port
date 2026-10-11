@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import time
 
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 _MAX_WORKTREES = 4096
@@ -42,7 +43,7 @@ def _paths(root: Path) -> tuple[Path, Path, Path]:
 
 def _read_registry(path: Path) -> list[str]:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         return []
     except OSError as error:
@@ -95,7 +96,15 @@ def _locked(lock_path: Path):
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Invalid worktree registry lock")
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + 3.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError("Worktree registry lock acquisition timed out") from None
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         yield fd
     finally:
         os.close(fd)

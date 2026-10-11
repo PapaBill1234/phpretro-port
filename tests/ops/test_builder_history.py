@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import stat
 import tempfile
+import time
 import unittest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -72,7 +73,38 @@ class BuilderHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid worktree registry lock"):
             history.registered_worktrees(self.root)
 
-    def test_registry_and_lock_permissions_are_restrictive(self):
+    def test_fifo_registry_is_rejected_without_blocking(self):
+        doctor = self.root / ".builder/doctor"
+        doctor.mkdir(parents=True)
+        os.mkfifo(doctor / "worktrees.json")
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "Invalid worktree registry"):
+            history.registered_worktrees(self.root)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_stuck_lock_holder_times_out(self):
+        history.register_worktree(self.root, "existing")
+        lock_path = self.root / ".builder/doctor/worktrees.lock"
+        context = multiprocessing.get_context("fork")
+        ready = context.Event()
+
+        def hold_lock(path, signal):
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            history.fcntl.flock(fd, history.fcntl.LOCK_EX)
+            signal.set()
+            time.sleep(4)
+            os.close(fd)
+
+        process = context.Process(target=hold_lock, args=(str(lock_path), ready))
+        process.start()
+        self.assertTrue(ready.wait(2))
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "lock acquisition timed out"):
+            history.register_worktree(self.root, "blocked")
+        self.assertGreaterEqual(time.monotonic() - started, 2.8)
+        process.join(5)
+        self.assertEqual(process.exitcode, 0)
+
         history.register_worktree(self.root, "worker")
         for path in (self.root / ".builder", self.root / ".builder/doctor"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
