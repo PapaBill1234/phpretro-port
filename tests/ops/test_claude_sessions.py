@@ -32,10 +32,11 @@ class HandoffTests(unittest.TestCase):
 
     def test_complete_owned_session_is_not_restarted(self):
         existing = [name for name, _, _ in sessions.WINDOWS]
+        snapshot = {"running": True, "windows": [{"window": name, "state": "open"} for name in existing]}
         with patch.object(sessions, "exists", return_value=True), patch.object(sessions, "owned"), \
-                patch.object(sessions, "names", return_value=existing), patch.object(sessions, "status", return_value={"running": True}), \
+                patch.object(sessions, "names", return_value=existing), patch.object(sessions, "status", return_value=snapshot), \
                 patch.object(sessions, "clean_checkpoint") as checkpoint, patch.object(sessions, "configure_window") as configure:
-            self.assertEqual(sessions.start(), {"running": True})
+            self.assertEqual(sessions.start(), snapshot)
             checkpoint.assert_not_called()
             configure.assert_not_called()
 
