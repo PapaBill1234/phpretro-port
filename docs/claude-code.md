@@ -27,7 +27,7 @@ python3 scripts/claude-builder.py --role lead -- -p 'Summarize the next open gap
 
 Workers require an initial Git commit and get their own native worktree. `worktree.baseRef=head` starts a new worktree at the current checkout's commit. Uncommitted files are not copied. A reused name reopens its existing checkout; confirm its branch and actual starting SHA. Give each editing worker a distinct task claim and worktree. [Worktree semantics](https://code.claude.com/docs/en/worktrees)
 
-The launcher bypasses the machine's older `claude` shell wrapper by selecting the raw pinned executable, currently `~/.local/share/claude/versions/2.1.287`. `PHPRETRO_CLAUDE_BIN` can select a reviewed replacement raw executable. A script wrapper is rejected. Project sessions use ignored `.builder/claude` as `CLAUDE_CONFIG_DIR`, load project settings, and leave previous machine workflows and STOP files untouched.
+The current `~/.local/bin/claude` wrapper and desktop entrypoint use this builder. The older wrapper is preserved in the private launcher backups. The builder selects the raw pinned executable, currently `~/.local/share/claude/versions/2.1.287`. `PHPRETRO_CLAUDE_BIN` can select a reviewed replacement raw executable. A script wrapper is rejected. Project sessions use ignored `.builder/claude` as `CLAUDE_CONFIG_DIR`, load project settings, and leave previous machine workflows and STOP files untouched.
 
 ## Desktop launcher and permissions
 

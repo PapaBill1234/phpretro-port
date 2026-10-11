@@ -156,6 +156,7 @@ def main() -> int:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
            and key not in ("A6API_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY")}
+    env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "/usr/bin:/bin")
     env.update({
         "ANTHROPIC_BASE_URL": data["anthropic_base_url"],
         "ANTHROPIC_AUTH_TOKEN": key,
