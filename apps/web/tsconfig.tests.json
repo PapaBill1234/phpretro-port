@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "noEmit": false, "outDir": ".test-build" },
-  "include": ["src/site.ts", "src/locales.ts", "tests"]
+  "include": ["src/site.ts", "src/locales.ts", "src/auth.ts", "src/AccountPanel.tsx", "tests"]
 }
