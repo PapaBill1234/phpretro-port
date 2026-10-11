@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 
 import importlib.util
@@ -36,6 +38,50 @@ def within(path, directory):
     return path.resolve().is_relative_to(directory.resolve())
 
 
+def _entry_identity(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _read_scoped(entry, root):
+    """Read an indexed file through trusted directory descriptors only."""
+    relative = Path(entry["path"])
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError("Session path is not relative to the project root")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    root_fd = os.open(root, flags)
+    fds = [root_fd]
+    try:
+        parent_fd = root_fd
+        for component in relative.parts[:-1]:
+            if component in ("", "."):
+                continue
+            parent_fd = os.open(component, flags, dir_fd=parent_fd)
+            fds.append(parent_fd)
+        leaf_fd = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          dir_fd=parent_fd)
+        fds.append(leaf_fd)
+        info = os.fstat(leaf_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Indexed session is not a regular file")
+        identity = (info.st_dev, info.st_ino)
+        expected = (entry.get("device"), entry.get("inode"))
+        if expected != identity:
+            raise ValueError("Indexed session changed while it was being read")
+        chunks = []
+        while True:
+            chunk = os.read(leaf_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
 def catalog(root=ROOT):
     root = root.resolve()
     history = root / ".builder/claude/projects"
@@ -50,18 +96,23 @@ def catalog(root=ROOT):
         for path in sorted(directory.rglob("*.jsonl")):
             if path.is_symlink() or not path.is_file() or not within(path, directory):
                 continue
+            identity = _entry_identity(path)
+            if identity is None:
+                continue
             relative = str(path.relative_to(root))
             entries.append({"id": hashlib.sha256(relative.encode()).hexdigest()[:20],
                             "kind": "claude-subagent" if "subagents" in path.parts else "claude",
                             "path": relative, "cwd": str(cwd),
-                            "bytes": path.stat().st_size, "modified_epoch": path.stat().st_mtime})
+                            "bytes": path.stat().st_size, "modified_epoch": path.stat().st_mtime,
+                            "device": identity[0], "inode": identity[1]})
     imported = root / ".builder/doctor/imports/current-codex.jsonl"
     if imported.is_file() and not imported.is_symlink() and within(imported, root / ".builder/doctor/imports") and within(imported, root):
         relative = str(imported.relative_to(root))
         entries.append({"id": hashlib.sha256(relative.encode()).hexdigest()[:20],
                         "kind": "codex-current-chat-snapshot", "path": relative,
                         "cwd": str(root), "bytes": imported.stat().st_size,
-                        "modified_epoch": imported.stat().st_mtime})
+                        "modified_epoch": imported.stat().st_mtime,
+                        "device": imported.stat().st_dev, "inode": imported.stat().st_ino})
     return entries
 
 
@@ -71,8 +122,7 @@ def read_session(session_id, offset=0, limit=16000, root=ROOT):
     match = next((e for e in catalog(root) if e["id"] == session_id), None)
     if match is None:
         raise ValueError("Session is not in this project's scoped index")
-    path = root / match["path"]
-    content = path.read_text(encoding="utf-8")
+    content = _read_scoped(match, root)
     end = min(offset + limit, len(content))
     return {"session": match, "offset": offset, "next_offset": end if end < len(content) else None,
             "characters": len(content), "content": content[offset:end]}
@@ -83,7 +133,7 @@ def search(query, offset=0, limit=10, root=ROOT):
         raise ValueError("Use a nonempty literal query, offset >= 0, and limit 1..25")
     hits = []
     for entry in catalog(root):
-        content = (root / entry["path"]).read_text(encoding="utf-8")
+        content = _read_scoped(entry, root)
         start = 0
         while True:
             position = content.find(query, start)
