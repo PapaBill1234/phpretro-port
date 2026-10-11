@@ -63,14 +63,34 @@ def run(args):
             if args.command == "claim":
                 if row["status"] != "queued":
                     raise ValueError("task already claimed or complete; inspect before recovery")
-                for dependency in json.loads(row["dependencies"]):
+                dependencies = set(json.loads(row["dependencies"]))
+                accepted_dependencies = set()
+                for dependency in dependencies:
                     found = db.execute("SELECT status FROM tasks WHERE id=?", (dependency,)).fetchone()
-                    if not found or found["status"] != "integrated":
+                    if not found or found["status"] not in ("integrated", "accepted"):
                         raise ValueError("dependency is not integrated: " + dependency)
+                    if found["status"] == "accepted":
+                        accepted_dependencies.add(dependency)
                 scope = json.loads(row["scope"])
-                for other in db.execute("SELECT id,scope FROM tasks WHERE status IN ('claimed','submitted','accepted')"):
-                    if any(covers(a,b) or covers(b,a) for a in scope for b in json.loads(other["scope"])):
-                        raise ValueError("write scope overlaps task " + other["id"])
+                continued = set()
+                for other in db.execute("SELECT id,scope,status,commit_sha FROM tasks WHERE status IN ('claimed','submitted','accepted')"):
+                    overlap = any(covers(a,b) or covers(b,a) for a in scope for b in json.loads(other["scope"]))
+                    if not overlap:
+                        continue
+                    if other["status"] == "accepted" and other["id"] in accepted_dependencies and other["commit_sha"]:
+                        try:
+                            subprocess.run(
+                                ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", other["commit_sha"], row["base"]],
+                                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                        except subprocess.CalledProcessError:
+                            pass
+                        else:
+                            continued.add(other["id"])
+                            continue
+                    raise ValueError("write scope overlaps task " + other["id"])
+                if accepted_dependencies - continued:
+                    raise ValueError("dependency is not integrated: " + sorted(accepted_dependencies - continued)[0])
                 db.execute("UPDATE tasks SET status='claimed',owner=?,lease_until=? WHERE id=?",
                            (args.owner, int(time.time()) + args.lease_seconds, args.id))
             elif args.command == "renew":
