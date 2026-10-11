@@ -1,7 +1,6 @@
 {
   "model": "sonnet",
   "effortLevel": "high",
-  "disableAllHooks": true,
   "crossSessionInbound": "accept",
   "worktree": {
     "baseRef": "head"
@@ -11,8 +10,7 @@
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-6.1-sol",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-6-luna",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.1-sol",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku"
   },
   "permissions": {
     "allow": [
@@ -22,5 +20,6 @@
       "mcp__jev__jev_gate"
     ],
     "defaultMode": "bypassPermissions"
-  }
+  },
+  "disableBundledSkills": false
 }

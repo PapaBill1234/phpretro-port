@@ -17,6 +17,12 @@ import subprocess
 import sys
 import uuid
 
+import importlib.util
+
+_history_spec = importlib.util.spec_from_file_location("builder_history", Path(__file__).resolve().parent / "builder-history.py")
+history_registry = importlib.util.module_from_spec(_history_spec)
+_history_spec.loader.exec_module(history_registry)
+
 ROOT = Path(__file__).resolve().parents[1]
 RESERVED = {
     "--model", "--agent", "--effort", "--settings", "--setting-sources",
@@ -26,7 +32,7 @@ RESERVED = {
     "--mcp-config", "--strict-mcp-config", "--bare", "--safe-mode",
     "--restricted", "--system-prompt", "--system-prompt-file",
     "--append-system-prompt", "--append-system-prompt-file",
-    "--worktree", "-w", "--plugin-dir", "--plugin-url",
+    "--worktree", "-w", "--plugin-dir", "--plugin-url", "--no-session-persistence",
 }
 
 
@@ -113,6 +119,13 @@ def git_head(path: Path = ROOT) -> str:
     return result.stdout.strip()
 
 
+def worker_path(name: str) -> Path:
+    result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    if result.returncode:
+        raise SetupError("Active checkout must be a Git repository.")
+    return Path(result.stdout.strip()).parent / ".claude" / "worktrees" / name
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("lead", "backup", "worker", "reviewer"), default="lead")
@@ -141,6 +154,7 @@ def main() -> int:
         "endpoint": data["anthropic_base_url"], "binary": str(binary),
         "credential_source": key_source, "credential_available": True,
         "config_home": str(config_home), "permission_mode": "bypassPermissions",
+        "session_persistence": True, "context_scope": "current PHPRetro project and its named worker sessions",
         "worker_worktree": worktree_name if options.role == "worker" else None,
         "secrets_in_logs": False, "spending_guard_enforced_by_launcher": False,
     }
@@ -149,9 +163,11 @@ def main() -> int:
         return 0
     if options.role == "worker":
         # Reviewed settings pin worktree.baseRef=head; record the task base.
-        worktree_path = ROOT / ".claude" / "worktrees" / worktree_name
+        worktree_path = worker_path(worktree_name)
         summary["reused_worktree"] = worktree_path.exists()
         summary["starting_head"] = git_head(worktree_path if worktree_path.exists() else ROOT)
+    if options.role == "worker":
+        history_registry.register_worktree(ROOT, worktree_name)
     config_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
@@ -161,7 +177,6 @@ def main() -> int:
         "ANTHROPIC_BASE_URL": data["anthropic_base_url"],
         "ANTHROPIC_AUTH_TOKEN": key,
         "CLAUDE_CONFIG_DIR": str(config_home),
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     })
     for alias, model in data["aliases"].items():
         env[f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL"] = model
@@ -174,11 +189,12 @@ def main() -> int:
                "--tools", role["tools"], "--setting-sources", "project",
                "--settings", str(ROOT / ".claude/settings.json"),
                "--strict-mcp-config", "--mcp-config",
-               str(mcp) if mcp.exists() else '{"mcpServers":{}}', "--no-chrome"]
+               str(mcp) if mcp.exists() else '{"mcpServers":{}}',
+               "--append-system-prompt-file", str(ROOT / ".claude/project-scope.md")]
     if options.role == "worker":
         command += ["--worktree", worktree_name]
     if not any(token in ("--name", "-n") or token.startswith("--name=") for token in extra):
-        command += ["--name", f"phpretro-{options.role}"]
+        command += ["--name", worktree_name if options.role == "worker" else f"phpretro-{options.role}"]
     command += extra
     print("[phpretro-builder] " + json.dumps(summary), file=sys.stderr, flush=True)
     os.chdir(ROOT)

@@ -1,0 +1,10 @@
+{
+  "worktrees": [
+    "luna-discovery",
+    "luna-backend",
+    "luna-frontend",
+    "g03-strict-sso",
+    "doctor-history-registration",
+    "doctor-continuation"
+  ]
+}

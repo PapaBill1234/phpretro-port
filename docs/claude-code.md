@@ -49,7 +49,7 @@ The Windows **Claude Code - Ubuntu** shortcut opens Windows Terminal and connect
 
 The launcher reserves model, agent, effort, permission, tool, settings, MCP and worktree flags. It rejects overrides, including bypass-permission flags. Change the reviewed project configuration for a role change. At the operator's explicit request it passes `--permission-mode bypassPermissions`; it does not claim that an instruction file is a security boundary. Reviewer tools are Read/Grep/Glob plus the judge-only MCP tool. Editing workers have edit/test tools only in their assigned task scope; enforce write scope in the task/integration process.
 
-Hooks are disabled in these sessions, no Jev gate is installed, and agent teams remain off during bootstrap. Same-machine peer messaging is available in this CLI version through ListAgents/SendMessage and a shared local inbox mechanism. Messages do not grant consent or run slash commands. Only coordinate this project's named sessions and assigned tasks. [Cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging)
+No hooks are configured by this project and no Jev gate is installed. Bundled skills remain enabled; the launcher no longer forces the blanket nonessential-traffic switch or disables browser integration. Cloud/account features still require their own supported authentication. Same-machine peer messaging is available in this CLI version through ListAgents/SendMessage and a shared local inbox mechanism. Messages do not grant consent or run slash commands. Only coordinate this project's named sessions and assigned tasks. [Cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging)
 
 ## Private credentials
 
@@ -63,7 +63,7 @@ OpenRouter is a separate credential for Jev. The A6API launcher removes inherite
 
 ## Doctor and usage
 
-In an interactive session, run `/doctor` for setup health and context-cost suggestions, or `/doctor prompt-audit` for conflicting/outdated instructions. Native `/doctor` may request confirmation before changing configuration. A read-only reviewer cannot apply fixes. Standalone read-only installation diagnostics are available with the raw binary's `doctor` subcommand. [Doctor reference](https://code.claude.com/docs/en/skills)
+In an interactive session, run `/doctor` for setup health and context-cost suggestions, or `/doctor prompt-audit` for conflicting/outdated instructions. The operator has authorized routine project Doctor fixes without further questions; the lead has default tools and explicit permission bypass. A read-only reviewer cannot apply fixes. `.claude/project-scope.md` is appended at launch to keep this work within the active checkout and its builder worktrees; it excludes failed projects and global-history scans and is an instruction, not an OS sandbox. Standalone read-only installation diagnostics are available with the raw binary's `doctor` subcommand. [Doctor reference](https://code.claude.com/docs/en/skills)
 
 Use `/usage` for session tokens and cache behavior. Many CLI processes do not automatically become one token audit, and short handoffs do not guarantee total savings. Connect metadata-only OpenTelemetry to one local collector and correlate task, role, run and session IDs; retain input/output/cache counters separately. Provider-reported model aliases describe the endpoint response, not verified underlying weights. Cost figures require confirmed A6API billing rates. [Monitoring](https://code.claude.com/docs/en/monitoring-usage)
 
@@ -72,3 +72,11 @@ The launcher starts one process; it does not create an unbounded swarm, enforce 
 ## Validation before sustained autonomy
 
 See `setup-status.md` for observed checks and unresolved items. Run a bounded fixture for every role after changing CLI, models, agents or endpoint. Confirm the selected subagent model from actual transcript/usage evidence, rather than the definition alone. Confirm worker branches and acceptance checks before integration. Do not restart or clear the old runtime's STOP to make the new project appear active.
+
+## Saved project sessions and scheduled continuation
+
+Every native builder shares the ignored `.builder/claude` history. The launcher rejects `--no-session-persistence`, including print-mode runs. Coordinator, worker, reviewer and nested subagent histories remain in their native JSONL format. A worker defaults to its unique worktree name for peer discovery; an explicit session name remains supported. Session saving does not automatically inject every history into every prompt.
+
+Use `/port-context` or `python3 scripts/project-sessions.py list` for the scoped index. `read ID --offset 0 --limit 16000` returns private content with a next character offset; follow it to read complete records. `search 'literal query' --limit 10` searches only indexed sessions and paginates hits. The index includes the current checkout and explicitly registered launcher worktrees, nested subagents, and an optional dated snapshot of the current Codex migration dialogue (operator and public assistant messages, excluding tool/system/developer records). It excludes global Claude/Codex histories and failed projects. Imported context is a snapshot, not a live connector. Never commit raw sessions or publicize private contents.
+
+The local Codex automation **Continue active PHPRetro port** runs every30minutes against this workspace through SSH. Its entrypoint `python3 scripts/continue-project.py --run` checks private readiness, skips when busy, and holds a project lock through one externally bounded15-minute native coordinator segment and its atomic checkpoint. `--check` inspects readiness without inference. It resumes claimed work, uses Luna implementation/Sol review, and saves a current handoff. The Codex computer/app must be available; no legacy Ubuntu timer or prior project's STOP is changed. Native turn limits remain advisory and provider spending rates/cash budgets remain unresolved.
