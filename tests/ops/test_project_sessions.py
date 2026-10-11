@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("sessions", REPO / "scripts/project-sessions.py")
@@ -59,6 +60,61 @@ class SessionTests(unittest.TestCase):
             pieces.append(result["content"])
             offset = result["next_offset"]
         self.assertEqual("".join(pieces), (self.main / "main.jsonl").read_text())
+
+    def test_indexed_reads_reject_leaf_and_parent_replacements(self):
+        for operation in ("read", "search"):
+            target = self.main / "main.jsonl"
+            original = sessions.catalog
+
+            def swap_leaf(root=self.root):
+                entries = original(root)
+                target.unlink()
+                target.symlink_to(self.foreign)
+                return entries
+
+            with mock.patch.object(sessions, "catalog", side_effect=swap_leaf):
+                with self.assertRaises((ValueError, OSError)):
+                    if operation == "read":
+                        sessions.read_session(next(e for e in original(self.root) if e["path"].endswith("main.jsonl"))["id"], root=self.root)
+                    else:
+                        sessions.search("DO NOT INCLUDE", root=self.root)
+            target.unlink(missing_ok=True)
+            target.write_text("restored", encoding="utf-8")
+
+        directory = self.main
+        moved = self.history / "main-moved"
+        original = sessions.catalog
+
+        def swap_parent(root=self.root):
+            entries = original(root)
+            directory.rename(moved)
+            directory.symlink_to(self.history / sessions.encoded(self.root.parent / "failed-project"), target_is_directory=True)
+            return entries
+
+        with mock.patch.object(sessions, "catalog", side_effect=swap_parent):
+            with self.assertRaises((ValueError, OSError)):
+                sessions.search("DO NOT INCLUDE", root=self.root)
+
+    def test_indexed_reads_reject_regular_inode_replacement_but_allow_append(self):
+        target = self.main / "main.jsonl"
+        entry = next(e for e in sessions.catalog(self.root) if e["path"].endswith("main.jsonl"))
+        with target.open("a", encoding="utf-8") as stream:
+            stream.write(" appended")
+        self.assertEqual(len(sessions.search("appended", root=self.root)["hits"]), 1)
+
+        original = sessions.catalog
+
+        def replace(root=self.root):
+            entries = original(root)
+            replacement = target.with_name("replacement.jsonl")
+            replacement.write_text("replacement", encoding="utf-8")
+            target.unlink()
+            replacement.rename(target)
+            return entries
+
+        with mock.patch.object(sessions, "catalog", side_effect=replace):
+            with self.assertRaises(ValueError):
+                sessions.search("replacement", root=self.root)
 
     def test_unknown_ids_traversal_symlink_and_invalid_page_rejected(self):
         (self.main / "escape.jsonl").symlink_to(self.foreign)
