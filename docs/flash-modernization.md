@@ -1,0 +1,62 @@
+# Flash widget modernization and original asset production
+
+Status: planned reimplementations. No SWF conversion, rendering engine or Octane compatibility is implemented by this planning package.
+
+This inventory is pinned to [PHPRetro commit `8ab8f81e6bcd09fc661547cb032ef045149c095e`](https://github.com/Quackster/PHPRetro/tree/8ab8f81e6bcd09fc661547cb032ef045149c095e). There are **8 SWF files, 7 distinct binaries**; the two `avatars_big.swf` files are identical. All have compressed `CWS` headers. All report SWF version 8 except `habbos_v2.swf`, which reports version 9. There are no bundled ActionScript/FLA/MXML source files. The role of a binary is inferred from its embedding code and filename; internal resource behavior still needs a dedicated specification.
+
+These are CMS widgets/resources. The game's hotel page embeds an external Shockwave **DCR** through `client_dcr`, using `application/x-director`. Replacing these CMS SWFs does not itself provide a modern game client. Octane, its resource format and its protocol compatibility with Polaris are a distinct release milestone. [Hotel embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/client.php#L93).
+
+## Complete SWF inventory
+
+| Bundled path | Bytes / version | Observed role and evidence | Planned replacement and missing contract |
+| --- | --- | --- | --- |
+| `flash/HabboRegistration.swf` | 60,403 / v8 | Avatar selector used by registration, profile and tryout; receives figure/gender, figure-data/draw-order/localization URLs and club flags. [Registration embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/templates/register_header.php#L114), [profile embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/profile.php#L443), [tryout](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/tryout.php#L51) | React editor, typed figure model and canvas preview with original/authorized resource pack. Validate supported figure IDs, layering, gender/club policy and saved appearances against target client. Server validates selection independently of UI. |
+| `flash/BadgeEditor.swf` | 43,359 / v8 | Group badge composer; reads badge data and posts group ID/encoded badge to an update route. [Embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/habblet/groups_actions_show_badge_editor.php#L30) | React controls and canvas composition using newly drawn primitives. Specify code grammar, palettes, positioning/layers, target emulator badge support and preview/output rendering. Never trust a browser-supplied group owner or arbitrary image path. |
+| `flash/traxplayer/traxplayer.swf` | 10,084 / v8 | Home/group song player; receives song URL and external sample URL. [Embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/habblet/myhabbo_traxplayer_select_song.php#L34) | Web Audio scheduler with play/stop/volume/accessibility controls and original/authorized samples. Specify track timing, sample-ID mapping and duration limits. Target songs table/parser support is unverified. |
+| `flash/intro/habbos.swf` | 23,732 / v8 | Landing promo variant 1; receives promo-habbos XML, CTA text/link and video/localization URL. [Landing embed](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/index.php#L75) | Original landing art with CSS/canvas animation and semantic CTA. Record responsive placement and localized text lengths; preserve reduced-motion mode. |
+| `flash/intro/habbos_v2.swf` | 11,595 / v9 | Landing promo variant 2 chosen by `site_flash_promo`; same embedding flow. [Variant selection](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/index.php#L75) | Alternative original landing composition selected by theme/content configuration. Confirm distinct observed behavior before promising identical animation. |
+| `flash/intro/Habbo_intro.swf` | 342,236 / v8 | Intro animation referenced as `video_link` by landing promo. [Reference](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/index.php#L87) | Newly authored CSS/canvas sequence or original video with playback controls/captions where relevant. Do not extract/re-encode original animation as the new deliverable. |
+| `flash/avatars_big.swf` | 71,326 / v8 | Avatar resource located at editor `base` URL; exact internal linkage not established by PHP embed. [Editor base](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/templates/register_header.php#L115) | Replace with versioned original/authorized sprite atlas or vector resources and manifest. Confirm which figure parts, poses, palettes and draw ordering widgets actually require. |
+| `flash/intro/avatars_big.swf` | 71,326 / v8 | Identical SHA-256 to `flash/avatars_big.swf`; resource at landing promo `base_url`. [Landing base](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/index.php#L78) | Reuse one approved resource module with explicit package version; do not create duplicate asset work. Verify intended intro resource use before implementation. |
+
+The two avatar resources have SHA-256 `de7d5e3e41204f…` (prefix shown only as an inventory identity, not a security verification record). Full hashes should be regenerated by implementation tooling and retained in the source manifest.
+
+## Technology responsibilities
+
+- **React/TypeScript:** UI state, form validation feedback, localization, keyboard controls, editor controls, theme integration and game launch shell. Start here for all widget rewrites.
+- **Canvas/HTML5/Web Audio:** avatar/badge preview drawing, compositing, animation and audio scheduling. Use semantic DOM controls around canvases and keyboard alternatives.
+- **Go:** authorization, figure/badge validation, asset-manifest serving, song/content APIs, durable MariaDB writes and Redis caching/invalidation. No SSO issuance or schema access belongs in a theme.
+- **Rust/WASM:** an optional shared parser or measured rendering hot path once benchmarks demonstrate a worthwhile improvement. The proposed TypeScript toolchain is not an automatic translator from SWF or PHP, and a Rust compiler for TypeScript does not mean a browser widget must be rewritten in Rust.
+
+The preferred strategy is behavior-first reimplementation, not bulk binary conversion. Keep the old embed variables and XML shape as evidence of the legacy contract; create clean target DTOs and a deliberate import adapter. Do not copy historical XML data/resource packs into production without provenance review.
+
+## Capability and schema gaps
+
+| Capability | Legacy dependency | Gate before implementation completion |
+| --- | --- | --- |
+| `avatar.editor` | Figure strings, figure-data/draw-order XML, gender/club flags; upstream official imaging calls | Pinned Polaris/Octane figure grammar and supported catalog; local preview render agreement; test imported figures and unknown/retired IDs |
+| `avatar.wardrobe` | CMS `wardrobe` rows and game figure state | Map owner IDs, slots and game update behavior; ensure two concurrent saves cannot cross owners |
+| `groups.badge-editor` | Encoded badge, group membership rank, legacy GD renderer | Confirm target badge grammar and group authorization. New art may require its own namespace/resource changes in client and emulator |
+| `homes.trax-player` | Game `soundmachine_songs` records containing data/title/user ID, legacy text serialization, MP3 sample IDs | Check whether target emulator/client has a compatible songs feature; define import/parser support, sample pack and scheduler semantics. Unsupported state must be visible in gaps tracker |
+| `landing.promo` | Site setting variant, dynamic promo avatars and intro sequence | Record reference dimensions/interactions; authored art and text catalogue ready; no game schema coupling required |
+| `hotel.launch` | External DCR URL, `ticket_sso`, Holograph connection configuration | Octane boot configuration, actual emulator protocol/version support, SSO transport, reconnect/error flows and resource URLs tested independently |
+
+The legacy song endpoint reads `soundmachine_songs` through [the Holograph adapter](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/includes/data/holograph.php#L449), then rewrites delimiters into `track1`–`track4` query-string fields in [`habblet/trax_song.php`](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/habblet/trax_song.php#L22). Use a bounded typed parser and escaping, not that string substitution as a production API.
+
+## Original asset production pipeline
+
+The original and modern themes should reproduce documented page structure, spacing, responsive behavior and interactions using independently authored implementation and assets. The user requires original assets. Visual fidelity should be measured against agreed page references while asset origin is assessed separately; a promise of 100% visual equality is not a substitute for those acceptance criteria.
+
+1. **Reference specification:** pin the legacy snapshot and date the modern habbo.com references. Record page/view/state/viewport, layout measurements, typography roles, component states, colors, transitions and accessibility behavior. Store observations rather than copied gallery bundles.
+2. **Asset work orders:** list every logo/illustration/avatar part/badge primitive/icon/background/font/audio sample. State intended dimensions, pixel density, palette, animation frames, format and target usage. Use original branding and only fonts whose license is recorded.
+3. **Independent creation:** draw original vectors/pixel art and create original music/audio samples, or commission/use resources whose license explicitly covers the intended delivery. Do not extract SWF sprites, copy official imaging responses, trace/export bundled proprietary artwork or redistribute official Trax samples as the new assets.
+4. **Compatibility design:** website artwork can be independent of game art. Avatar parts, badge codes and audio sample IDs can be game-resource contracts. An original game pack may require changes to Octane resources and Polaris identifiers/metadata; do not treat it as a CSS-only task. Decide the supported pack/version explicitly and track every required downstream change.
+5. **Manifest and review:** each output has path, creator, creation method/source, source URL if applicable, license, notice, revision, content hash and approval status. Review for accidentally copied names/resources and for consistency across themes. Keep source files and production exports separate.
+6. **Build and packaging:** generate atlas/vector/audio exports deterministically, validate dimensions/file signatures/manifests, optimize with bounded resource usage and serve through versioned paths. A shared approved pack is reused across themes rather than duplicated.
+7. **Verification:** capture page/editor screenshots at agreed viewports; test figure/badge round-trips, all supported layers/colors, reduced motion, keyboard use, text expansion and audio scheduling. Test a browser environment without Flash plugins. Reference screenshots themselves are research material, not redistributable artwork.
+
+PHP headers distinguish GPL 3.0 code from Sulake-owned images/scripts/layouts. Keep the port's applicable GPL code notices and third-party component notices; carry an explicit proprietary-asset exclusion/provenance record rather than inferring all assets share the code license. [Header notices](https://github.com/Quackster/PHPRetro/blob/8ab8f81e6bcd09fc661547cb032ef045149c095e/includes/core.php#L3). A new asset still needs recorded authorship and license. Game-resource rights and the practical size of an original compatible art pack remain release requirements.
+
+## Completion evidence
+
+Each widget is complete only when its behavior spec, target capability, typed API contract, approved asset manifest, implementation and meaningful verification are present. A gap cannot be closed solely because the SWF reference was removed. Prioritize the avatar editor and hotel launch contracts, then badges, then Trax and promo animations according to the accepted release scope. Keep unsupported emulator capabilities and unapproved resources in `docs/gaps.md` with an owner and a testable next action.
