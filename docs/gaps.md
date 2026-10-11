@@ -6,15 +6,15 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 
 | ID | Gap | Priority / gate | State | Next evidence needed |
 |---|---|---|---|---|
-| G01 | Actual Go/React/MariaDB/Redis foundation | P0 / alpha | Partial: pure Go/frontend contract subset | clean-checkout app, real migrations, Redis outage fixture |
-| G02 | Polaris identity/password/schema adapter | P0 / alpha | Specified, missing | live MariaDB contract tests, bcrypt interoperability |
+| G01 | Actual Go/React/MariaDB/Redis foundation | P0 / alpha | Verified development foundation | production deployment and recovery remain G20 |
+| G02 | Polaris identity/password/schema adapter | P0 / alpha | Partial: real identity adapter verified | registration/reset and full emulator migration |
 | G03 | SSO expiry, one-use/races, Octane launch/reconnect | P0 / alpha | Upstream discrepancy; port missing | real emulator expiry/replay/concurrency tests |
-| G04 | Authentication, staff MFA/RBAC, CSRF and revocation | P0 / alpha | Missing | negative role/IDOR/session tests |
-| G05 | a6api/Claude Code transport and model-role compatibility | P0 / builder | Readiness audit in progress | tool-call and subagent smoke tests, truthful usage metadata |
+| G04 | Authentication, staff MFA/RBAC, CSRF and revocation | P0 / alpha | Partial: existing-account login, staff MFA and settings authorization verified | reset/registration and remaining module permissions |
+| G05 | a6api/Claude Code transport and model-role compatibility | P0 / builder | Partial: native model roles, tools and Jev dispatch verified | interactive doctor audit and enforced provider budgets |
 | G06 | Coordinated worker claims, reviewed integration and budget enforcement | P0 / builder | Partial: atomic local task board; scheduler/price limiter missing | crash/resume and automated integration checks; pricing enforcement |
 | G07 | Original/authorized assets for CMS and Octane | P0 / public release | Missing | provenance catalogue plus replaced embedded/client resources |
 | G08 | Structural theme ABI and third-party theme adapters | P1 / beta | Specified, missing | both themes and a sample imported theme use same DTOs |
-| G09 | Housekeeping locale controls/content/catalogue fallback | P1 / beta | Missing | locale-switch/cache/plural/RTL fixtures |
+| G09 | Housekeeping locale controls/content/catalogue fallback | P1 / beta | Partial: audited enabled/default en/nl controls | content/catalogue fallback, plural and RTL fixtures |
 | G10 | Modern public-page layout/state fidelity | P1 / beta | Homepage observed; implementation missing | pinned route/state visual catalogue and original artwork |
 | G11 | Legacy public-page layout/state fidelity | P1 / beta | Source inventoried; implementation missing | characterization fixtures, both desktop/mobile behavior |
 | G12 | Avatar/badge/Trax/promotional SWF replacements | P1 / beta | 8-file inventory complete; implementation missing | widget contract tests and approved assets/audio |
@@ -23,7 +23,7 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 | G15 | Housekeeping's 22 original modules and new controls | P1 / full parity | Missing | audited permission matrix and real Polaris commands |
 | G16 | Club/vouchers/credits/shop and game-domain mappings | P1 / full parity | Missing | wallet ownership/idempotency and capability evidence |
 | G17 | Reversible legacy migration and game-data mapping | P0 / migration release | Missing | dry run, collisions, hash upgrade/reset, restore rehearsal |
-| G18 | ts-rust toolchain fit and same-upstream compiler oracle | P2 / foundation | Inspected, untested here | JSX/DTO/project-reference fixtures with pinned versions |
+| G18 | ts-rust toolchain fit and same-upstream compiler oracle | P2 / foundation | Verified for current DTO/JSX slices | broaden fixtures when toolchain or contracts change |
 | G19 | Aggregate token/cost analytics and matched Jev experiments | P1 / builder efficiency | Specified, missing | per-run usage, pricing provenance, matched correctness |
 | G20 | Performance, accessibility, observability and disaster recovery | P1 / public release | Missing | measured budgets, theme/locale matrix, restore report |
 | G21 | Authenticated current-Habbo reference states | P2 / measured fidelity | External reference missing | an authorized reference session or independently approved spec |
@@ -41,3 +41,9 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 For each completed slice append: task/issue ID; exact changed behavior; source/reference revision; checks run and results; commit/PR; remaining limitation; status (`missing`, `partial`, `verified`, `blocked-external`). A passing mock or a code-text assertion cannot close an integration gap. Store verbose test artifacts privately or in a sanitized evidence index rather than pasting transcripts here.
 
 New findings become a gap before their corresponding work is declared done. Reopen a verified gap when its contract or upstream revision changes and acceptance evidence no longer applies.
+
+## G02/G04/G09 implementation checkpoint — 2026-10-11
+
+Existing Polaris identities are read through column-scoped grants, with exact epoch/bcrypt/ban semantics. CMS staff enrollment is independent of game rank; fixed-lifetime Redis sessions observe live password/version and staff credential revisions. TOTP replay is enforced durably in MariaDB. Housekeeping updates site/theme/languages using locked authorization, revision conflicts and atomic audit. React implements login/logout, staff settings and conflict/error handling with memory-only CSRF.
+
+Evidence: [auth design](auth-design.md), [real integration](auth-integration.md), [validation](validation.md). This is partial port coverage: no game ticket, account creation, email reset, full CMS module authorization or measured layout parity. The native Sol review's session-reset finding was addressed by deleting old staff sessions; follow-up evidence is retained privately. Public commit/PR identifiers are obtained after checks and publication rather than guessed here.

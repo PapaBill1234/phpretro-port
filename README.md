@@ -19,4 +19,4 @@ No credentials, provider transcripts, upstream art, or legacy SWF binaries belon
 
 The provider connection and local machine readiness status are recorded in [setup status](docs/setup-status.md). Run `python3 scripts/repo-check.py` to validate the public package. Observed checks and remaining verification are in [validation](docs/validation.md).
 
-The first development implementation supplies persisted site settings, dependency readiness and two original theme previews. [Start locally](docs/run-local.md) for the runnable foundation and its current scope.
+The development implementation supplies existing-account Polaris login, opaque Redis sessions, separately enrolled staff MFA, audited housekeeping theme/locale settings, dependency readiness and two original theme previews. [Start locally](docs/run-local.md) for startup and operator enrollment. [Auth integration](docs/auth-integration.md) records real MariaDB/Redis and Java/Go bcrypt evidence. Game launch, full layout parity and the remaining CMS modules are still in the gaps ledger.

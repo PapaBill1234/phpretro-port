@@ -1,4 +1,4 @@
-name: phpretro-port-dev
+name: ${COMPOSE_PROJECT_NAME:-phpretro-port-dev}
 
 services:
   mariadb:
@@ -21,7 +21,7 @@ services:
     image: redis:8.2-alpine
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Run scripts/dev-setup.py first}
-    command: [sh, -c, 'exec redis-server --requirepass "$${REDIS_PASSWORD}" --maxmemory 128mb --maxmemory-policy allkeys-lru --save "" --appendonly no']
+    command: [sh, -c, 'exec redis-server --requirepass "$${REDIS_PASSWORD}" --maxmemory 128mb --maxmemory-policy noeviction --save "" --appendonly no']
     healthcheck:
       test: [CMD-SHELL, 'REDISCLI_AUTH="$${REDIS_PASSWORD}" redis-cli ping | test "$$(cat)" = PONG']
       interval: 5s
@@ -29,7 +29,7 @@ services:
       retries: 20
     networks: [internal]
   migrate:
-    image: phpretro-port-dev-cms
+    image: ${COMPOSE_PROJECT_NAME:-phpretro-port-dev}-cms
     build: .
     command: [--migrate]
     environment:
@@ -38,24 +38,54 @@ services:
       mariadb: {condition: service_healthy}
     networks: [internal]
   cms:
-    image: phpretro-port-dev-cms
+    image: ${COMPOSE_PROJECT_NAME:-phpretro-port-dev}-cms
     build: .
     environment:
       CMS_DATABASE_DSN: cms_app:${CMS_DB_PASSWORD}@tcp(mariadb:3306)/phpretro_cms?parseTime=true&charset=utf8mb4
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
+      POLARIS_DATABASE_DSN: cms_polaris_bridge:${CMS_POLARIS_DB_PASSWORD:?Run scripts/dev-setup.py}@tcp(mariadb:3306)/polaris?parseTime=true&charset=utf8mb4
+      CMS_STAFF_ENCRYPTION_KEY: ${CMS_STAFF_ENCRYPTION_KEY:?Run scripts/dev-setup.py}
+      CMS_PUBLIC_ORIGIN: ${CMS_PUBLIC_ORIGIN:-http://127.0.0.1:8789}
+      CMS_COOKIE_SECURE: ${CMS_COOKIE_SECURE:-false}
+      CMS_TRUSTED_PROXY_CIDRS: ${CMS_TRUSTED_PROXY_CIDRS:-}
     depends_on:
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
+      configure-auth: {condition: service_completed_successfully}
     restart: unless-stopped
     networks: [internal]
   web:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
-    ports: [127.0.0.1:8789:80]
+    ports: ["127.0.0.1:${WEB_PORT:-8789}:80"]
     depends_on: [cms]
     networks: [internal, edge]
+
+  configure-auth:
+    image: mariadb:11.8
+    entrypoint: [sh, /configure-auth.sh]
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      CMS_POLARIS_DB_PASSWORD: ${CMS_POLARIS_DB_PASSWORD:?Run scripts/dev-setup.py}
+    volumes: [./infra/mariadb/configure-auth.sh:/configure-auth.sh:ro]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [internal]
+
+  operator:
+    profiles: [ops]
+    image: ${COMPOSE_PROJECT_NAME:-phpretro-port-dev}-cms
+    build: .
+    command: [--help]
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      CMS_MIGRATION_DSN: cms_migrator:${CMS_MIGRATION_DB_PASSWORD}@tcp(mariadb:3306)/phpretro_cms?parseTime=true&charset=utf8mb4
+      POLARIS_DATABASE_DSN: cms_polaris_bridge:${CMS_POLARIS_DB_PASSWORD}@tcp(mariadb:3306)/polaris?parseTime=true&charset=utf8mb4
+      CMS_STAFF_ENCRYPTION_KEY: ${CMS_STAFF_ENCRYPTION_KEY}
+    volumes: [./.builder/enrollment:/enrollment]
+    networks: [internal]
 
 networks:
   internal:

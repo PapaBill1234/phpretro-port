@@ -1,5 +1,6 @@
 .env
 .env.*
+.env-upgrade-*
 !.env.example
 *.pem
 *.key
