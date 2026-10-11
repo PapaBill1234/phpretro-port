@@ -124,6 +124,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(Path(env["CLAUDE_CONFIG_DIR"]), self.root / ".builder/claude")
         change_directory.assert_called_once_with(self.root)
 
+    def test_backup_uses_sol_default_tools_and_same_private_history(self):
+        observed = {}
+        def capture(binary, command, environment):
+            observed.update(command=command, environment=environment)
+        with patch.object(builder, "ROOT", self.root), patch.object(builder, "native_binary", return_value=Path("/bin/true")), \
+                patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "A6API_API_KEY": "synthetic-only"}, clear=True), \
+                patch("sys.argv", ["builder", "--role", "backup"]), patch.object(builder.os, "execve", side_effect=capture), \
+                patch.object(builder.os, "chdir"), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(builder.main(), 0)
+        command = observed["command"]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
+        self.assertEqual(command[command.index("--agent") + 1], "lead")
+        self.assertEqual(command[command.index("--tools") + 1], "default")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "manual")
+        self.assertEqual(observed["environment"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-6.1-sol")
+        self.assertEqual(observed["environment"]["CLAUDE_CONFIG_DIR"], str(self.root / ".builder/claude"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,6 @@
 ---
 name: lead
 description: Coordinate PHPRetro tasks, schema contracts, integration and evidence; delegate bounded discovery and editing scopes.
-tools: Read, Grep, Glob, Edit, Write, Bash, Agent, Skill, SendMessage, ListAgents, mcp__jev__jev_judge
 model: sonnet
 effort: high
 ---
