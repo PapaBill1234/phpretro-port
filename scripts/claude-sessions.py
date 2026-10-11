@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSION = "phpretro-builder"
-TARGET = "=" + SESSION
+TARGET = SESSION
 WINDOWS = (
     ("coordinator", "lead", None),
     ("luna-discovery", "worker", "luna-discovery"),
@@ -31,7 +31,7 @@ def tmux(*args, check=True):
 
 
 def exists():
-    return tmux("has-session", "-t", TARGET, check=False).returncode == 0
+    return tmux("has-session", "-t", "=" + SESSION, check=False).returncode == 0
 
 
 def owned():
