@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -38,6 +39,7 @@ def ensure_private_dir(path: Path):
 
 
 def readiness():
+    ensure_private_dir(READINESS.parent)
     try:
         fd = os.open(READINESS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -103,16 +105,18 @@ def terminate_group(process, term_grace):
     """TERM, bounded leader wait, then KILL the group even if leader exited."""
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
     try:
         process.wait(timeout=term_grace)
     except subprocess.TimeoutExpired:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
     try:
         process.wait()
     except ChildProcessError:
@@ -179,7 +183,8 @@ def main(argv=None):
                           "stdout_log": str(out_path), "stderr_log": str(err_path)}))
         return 0 if code == 0 else code if code in (124, 137) else 1
     except (OSError, RuntimeError) as exc:
-        print(f"Continuation failed: {type(exc).__name__}", file=sys.stderr)
+        message = str(exc) if isinstance(exc, RuntimeError) else f"Continuation failed: {type(exc).__name__}"
+        print(message, file=sys.stderr)
         return 2
     finally:
         if fd is not None:
