@@ -1,0 +1,275 @@
+diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
+index 3cd5e99..5ffd8d4 100644
+--- a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
++++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
+@@ -50,10 +50,6 @@ public class SessionResumeManager {
+         LOGGER.info("[SessionResume] Parking {} (id={}) for {}s grace period",
+                 habbo.getHabboInfo().getUsername(), userId, graceSeconds);
+ 
+-        if (ssoTicket != null && !ssoTicket.isEmpty()) {
+-            restoreSsoTicket(userId, ssoTicket);
+-        }
+-
+         int previousEffectId = 0;
+         int previousEffectEnd = 0;
+         RoomUnit unit = habbo.getRoomUnit();
+@@ -156,29 +152,6 @@ public class SessionResumeManager {
+         // CMS al prossimo /client o azzerato al logout.
+     }
+ 
+-    private void restoreSsoTicket(int userId, String ssoTicket) {
+-        // Restore the old ticket ONLY if no fresh ticket has been written in the
+-        // meantime. On a hard-refresh the CMS writes a NEW auth_ticket for the same
+-        // user before this parking restore runs; without the guard we'd clobber it
+-        // with the old ticket, so the new connection's SSO wouldn't be found and the
+-        // client would get "session expired" on the first attempt. The guard means:
+-        // normal reconnect (ticket cleared to '' after login) -> restore; hard-refresh
+-        // (CMS already wrote a new ticket) -> leave the new ticket untouched.
+-        try (var connection = Emulator.getDatabase().getDataSource().getConnection();
+-             var statement = connection.prepareStatement("UPDATE users SET auth_ticket = ? WHERE id = ? AND (auth_ticket = '' OR auth_ticket IS NULL) LIMIT 1")) {
+-            statement.setString(1, ssoTicket);
+-            statement.setInt(2, userId);
+-            int updated = statement.executeUpdate();
+-            if (updated > 0) {
+-                LOGGER.info("[SessionResume] Restored SSO ticket for user {} during grace period", userId);
+-            } else {
+-                LOGGER.info("[SessionResume] Skipped SSO restore for user {} — a newer ticket is already present (likely a fresh login/hard-refresh)", userId);
+-            }
+-        } catch (Exception e) {
+-            LOGGER.error("[SessionResume] Failed to restore SSO ticket for user " + userId, e);
+-        }
+-    }
+-
+     private void applyPausedEffect(Habbo habbo) {
+         int effectId = getPausedEffectId();
+         if (effectId <= 0) return;
+@@ -211,17 +184,6 @@ public class SessionResumeManager {
+         }
+     }
+ 
+-    private void clearSsoTicket(int userId) {
+-        try (var connection = Emulator.getDatabase().getDataSource().getConnection();
+-             var statement = connection.prepareStatement("UPDATE users SET auth_ticket = ? WHERE id = ? LIMIT 1")) {
+-            statement.setString(1, "");
+-            statement.setInt(2, userId);
+-            statement.execute();
+-        } catch (Exception e) {
+-            LOGGER.error("[SessionResume] Failed to clear SSO ticket for user " + userId, e);
+-        }
+-    }
+-
+     private static class GhostSession {
+         final Habbo habbo;
+         final String ssoTicket;
+diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java
+index a03b06a..f66262b 100644
+--- a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java
++++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java
+@@ -113,61 +113,10 @@ public class HabboManager {
+     }
+ 
+     public Habbo loadHabbo(String sso) {
+-        int userId = 0;
+-
+-        // The SSO lookup deliberately ignores auth_ticket_expires_at: tickets are
+-        // single-use (consumed right after a successful login below), so replay is
+-        // bounded by consumption, not by a TTL. Third-party CMSes (e.g. AtomCMS)
+-        // only write auth_ticket, and a stale expiry left over from a built-in
+-        // issuer used to block their logins. The expiry column remains in use by
+-        // the emulator's own HTTP session endpoints.
+-        try (Connection connection = Emulator.getDatabase().getDataSource().getConnection();
+-                PreparedStatement statement =
+-                        connection.prepareStatement("SELECT id FROM users WHERE auth_ticket = ? LIMIT 1")) {
+-            statement.setString(1, sso);
+-            try (ResultSet s = statement.executeQuery()) {
+-                if (s.next()) {
+-                    userId = s.getInt("id");
+-                }
+-            }
+-            statement.close();
+-        } catch (SQLException e) {
+-            LOGGER.error("Caught SQL exception", e);
+-        }
+-
+-        Habbo habbo = loadHabbo(
+-                userId, "SELECT * FROM users WHERE auth_ticket = ? LIMIT 1", statement -> statement.setString(1, sso));
+-
+-        if (habbo != null) {
+-            this.consumeSsoTicket(habbo.getHabboInfo().getId());
+-        }
+-
+-        return habbo;
+-    }
+-
+-    /**
+-     * Consumes (clears) a user's SSO ticket after a successful login so it
+-     * cannot be replayed. Mid-session reconnects are unaffected: GameClient
+-     * disposal parks the habbo and SessionResumeManager restores the same
+-     * ticket for the reconnect grace window ("ticket cleared to '' after
+-     * login" is exactly the state its restore-guard expects), and newer
+-     * clients additionally carry a session-recovery token. Hotel owners can
+-     * keep tickets alive for debugging with emulator setting debug_sso = 1
+-     * (default 0).
+-     */
+-    public void consumeSsoTicket(int userId) {
+-        if (Emulator.getConfig().getBoolean("debug_sso", false)) {
+-            return;
+-        }
+-
+-        try (Connection connection = Emulator.getDatabase().getDataSource().getConnection();
+-                PreparedStatement statement = connection.prepareStatement(
+-                        "UPDATE users SET auth_ticket = '', auth_ticket_expires_at = NULL WHERE id = ? LIMIT 1")) {
+-            statement.setInt(1, userId);
+-            statement.execute();
+-        } catch (SQLException e) {
+-            LOGGER.error("Failed to consume SSO ticket for user " + userId, e);
+-        }
++        java.util.OptionalInt authenticated = SsoTicketConsumer.consume(sso);
++        if (authenticated.isEmpty()) return null;
++        // Consumption commits before identity loading; later load failures never restore SSO.
++        return loadHabboById(authenticated.getAsInt());
+     }
+ 
+     public Habbo loadHabboById(int userId) {
+diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
+new file mode 100644
+index 0000000..233831d
+--- /dev/null
++++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
+@@ -0,0 +1,58 @@
++package com.eu.habbo.habbohotel.users;
++
++import com.eu.habbo.Emulator;
++import java.nio.charset.StandardCharsets;
++import java.sql.Connection;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.util.OptionalInt;
++
++/** Atomic, one-use game SSO authentication. The caller must provide the packet bytes unchanged. */
++public final class SsoTicketConsumer {
++    private SsoTicketConsumer() {}
++
++    public static OptionalInt consume(String ticket) {
++        if (!isPrintableAscii(ticket) || Emulator.getConfig().getBoolean("debug_sso", false)) {
++            return OptionalInt.empty();
++        }
++        byte[] bytes = ticket.getBytes(StandardCharsets.US_ASCII);
++        try (Connection c = Emulator.getDatabase().getDataSource().getConnection()) {
++            c.setAutoCommit(false);
++            try {
++                int id = 0;
++                try (PreparedStatement lock = c.prepareStatement(
++                        "SELECT id FROM users WHERE CAST(auth_ticket AS BINARY) = ? "
++                        + "AND auth_ticket_expires_at IS NOT NULL AND auth_ticket_expires_at > CURRENT_TIMESTAMP FOR UPDATE")) {
++                    lock.setBytes(1, bytes);
++                    try (ResultSet rs = lock.executeQuery()) {
++                        if (!rs.next()) { c.rollback(); return OptionalInt.empty(); }
++                        id = rs.getInt(1);
++                    }
++                }
++                int changed;
++                try (PreparedStatement clear = c.prepareStatement(
++                        "UPDATE users SET auth_ticket = '', auth_ticket_expires_at = NULL "
++                        + "WHERE id = ? AND CAST(auth_ticket AS BINARY) = ? "
++                        + "AND auth_ticket_expires_at IS NOT NULL AND auth_ticket_expires_at > CURRENT_TIMESTAMP")) {
++                    clear.setInt(1, id); clear.setBytes(2, bytes); changed = clear.executeUpdate();
++                }
++                if (changed != 1) { c.rollback(); return OptionalInt.empty(); }
++                c.commit();
++                return OptionalInt.of(id);
++            } catch (SQLException e) {
++                try { c.rollback(); } catch (SQLException ignored) {}
++                return OptionalInt.empty();
++            }
++        } catch (SQLException e) { return OptionalInt.empty(); }
++    }
++
++    static boolean isPrintableAscii(String ticket) {
++        if (ticket == null || ticket.isEmpty() || ticket.length() > 512) return false;
++        for (int i = 0; i < ticket.length(); i++) {
++            char ch = ticket.charAt(i);
++            if (ch < 0x21 || ch > 0x7e) return false;
++        }
++        return true;
++    }
++}
+diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
+index 2e890b8..c7f501d 100644
+--- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
++++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
+@@ -155,26 +155,20 @@ public class SecureLoginEvent extends MessageHandler {
+                 Emulator.getGameServer().getGameClientManager().disposeClient(existingClient);
+             }
+ 
+-            int lookupUserId = 0;
+-            try (java.sql.Connection conn =
+-                            Emulator.getDatabase().getDataSource().getConnection();
+-                    java.sql.PreparedStatement stmt =
+-                            conn.prepareStatement("SELECT id FROM users WHERE auth_ticket = ? LIMIT 1")) {
+-                stmt.setString(1, sso);
+-                try (java.sql.ResultSet rs = stmt.executeQuery()) {
+-                    if (rs.next()) {
+-                        lookupUserId = rs.getInt("id");
+-                    }
+-                }
+-            } catch (Exception e) {
+-                LOGGER.error("Caught exception looking up user for session resume", e);
+-            }
+-
++            java.util.OptionalInt authenticated = com.eu.habbo.habbohotel.users.SsoTicketConsumer.consume(sso);
+             Habbo habbo = null;
+             boolean isSessionResume = false;
+-
+-            if (lookupUserId > 0) {
+-                habbo = SessionResumeManager.getInstance().resumeSession(lookupUserId);
++            if (authenticated.isPresent()) {
++                int authenticatedId = authenticated.getAsInt();
++                habbo = SessionResumeManager.getInstance().resumeSession(authenticatedId);
++                if (habbo == null) habbo = Emulator.getGameEnvironment().getHabboManager().loadHabboById(authenticatedId);
++                else isSessionResume = true;
++            } else if (!recoveryToken.isEmpty()) {
++                java.util.OptionalInt recoveredUser = SessionRecoveryRuntime.consume(recoveryToken);
++                if (recoveredUser.isPresent()) {
++                    habbo = Emulator.getGameEnvironment().getHabboManager().loadHabboById(recoveredUser.getAsInt());
++                    LOGGER.info("Recovered authenticated session for user id={}", recoveredUser.getAsInt());
++                }
+             }
+ 
+             if (habbo != null) {
+@@ -205,9 +199,6 @@ public class SecureLoginEvent extends MessageHandler {
+                     return;
+                 }
+ 
+-                Emulator.getGameEnvironment()
+-                        .getHabboManager()
+-                        .consumeSsoTicket(habbo.getHabboInfo().getId());
+             } else {
+                 HabboManager habboManager = Emulator.getGameEnvironment().getHabboManager();
+                 habbo = habboManager.loadHabbo(sso);
+diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
+index b9a5a9b..7b11460 100644
+--- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
++++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
+@@ -7,14 +7,14 @@ final class SecureLoginInputGuard {
+     }
+ 
+     static String normalizeSsoTicket(String ticket) {
+-        if (ticket == null) {
+-            return "";
+-        }
+-
+-        return ticket.replace(" ", "");
++        return ticket == null ? "" : ticket;
+     }
+ 
+     static boolean isValidSsoTicket(String ticket) {
+-        return ticket != null && !ticket.isEmpty() && ticket.length() <= MAX_SSO_TICKET_LENGTH;
++        if (ticket == null || ticket.isEmpty() || ticket.length() > MAX_SSO_TICKET_LENGTH) return false;
++        for (int i = 0; i < ticket.length(); i++) {
++            if (ticket.charAt(i) < 0x21 || ticket.charAt(i) > 0x7e) return false;
++        }
++        return true;
+     }
+ }
