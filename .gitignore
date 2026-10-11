@@ -15,6 +15,7 @@ work/
 node_modules/
 dist/
 coverage/
+.test-build/
 target/
 vendor/
 *.sqlite*

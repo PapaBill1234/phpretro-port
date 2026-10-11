@@ -1,0 +1,66 @@
+name: phpretro-port-dev
+
+services:
+  mariadb:
+    image: mariadb:11.8
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Run scripts/dev-setup.py first}
+      CMS_DB_PASSWORD: ${CMS_DB_PASSWORD:?Run scripts/dev-setup.py first}
+      CMS_MIGRATION_DB_PASSWORD: ${CMS_MIGRATION_DB_PASSWORD:?Run scripts/dev-setup.py first}
+      POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD:?Run scripts/dev-setup.py first}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./infra/mariadb/01-databases.sh:/docker-entrypoint-initdb.d/01-databases.sh:ro
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [internal]
+  redis:
+    image: redis:8.2-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Run scripts/dev-setup.py first}
+    command: [sh, -c, 'exec redis-server --requirepass "$${REDIS_PASSWORD}" --maxmemory 128mb --maxmemory-policy allkeys-lru --save "" --appendonly no']
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$${REDIS_PASSWORD}" redis-cli ping | test "$$(cat)" = PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [internal]
+  migrate:
+    image: phpretro-port-dev-cms
+    build: .
+    command: [--migrate]
+    environment:
+      CMS_MIGRATION_DSN: cms_migrator:${CMS_MIGRATION_DB_PASSWORD}@tcp(mariadb:3306)/phpretro_cms?parseTime=true&charset=utf8mb4
+    depends_on:
+      mariadb: {condition: service_healthy}
+    networks: [internal]
+  cms:
+    image: phpretro-port-dev-cms
+    build: .
+    environment:
+      CMS_DATABASE_DSN: cms_app:${CMS_DB_PASSWORD}@tcp(mariadb:3306)/phpretro_cms?parseTime=true&charset=utf8mb4
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    networks: [internal]
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports: [127.0.0.1:8789:80]
+    depends_on: [cms]
+    networks: [internal, edge]
+
+networks:
+  internal:
+    internal: true
+  edge: {}
+
+volumes:
+  mariadb-data:

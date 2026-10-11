@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+secrets
+.builder
+work
+**/node_modules
+**/dist
+**/.test-build
+**/__pycache__
+*.log
+*.jsonl

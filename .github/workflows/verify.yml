@@ -1,0 +1,54 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  builder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Public package integrity
+        run: python3 scripts/repo-check.py
+      - name: Builder protocol and coordination tests
+        run: python3 -m unittest discover -s tests/ops -v
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build ./...
+  frontend-contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/cms-contracts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.7.0
+          cache: npm
+          cache-dependency-path: packages/cms-contracts/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.10.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund && npm run build
+        working-directory: packages/cms-contracts
+      - run: npm ci --ignore-scripts --no-audit --no-fund && npm run check && npm run build
+        working-directory: apps/web

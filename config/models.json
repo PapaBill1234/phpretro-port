@@ -1,0 +1,38 @@
+{
+  "schema": "phpretro.builder.models.v1",
+  "anthropic_base_url": "https://api.a6api.com",
+  "provider_models_url": "https://api.a6api.com/v1/models",
+  "verified_at": "2026-10-11",
+  "native_claude_version": "2.1.287",
+  "aliases": {
+    "sonnet": "deepseek-v4.1-flash",
+    "haiku": "gpt-6-luna",
+    "opus": "gpt-6.1-sol"
+  },
+  "roles": {
+    "lead": {"alias": "sonnet", "model": "deepseek-v4.1-flash", "effort": "high", "agent": "lead", "tools": "Read,Grep,Glob,Edit,Write,Bash,Agent,Skill,SendMessage,ListAgents"},
+    "worker": {"alias": "haiku", "model": "gpt-6-luna", "effort": "medium", "agent": "worker", "tools": "Read,Grep,Glob,Edit,Write,Bash,Skill,SendMessage,ListAgents"},
+    "reviewer": {"alias": "opus", "model": "gpt-6.1-sol", "effort": "high", "agent": "reviewer", "tools": "Read,Grep,Glob"}
+  },
+  "reported_aliases": {
+    "deepseek-v4.1-flash": ["deepseek-v4.1-flash", "cb/deepseek-v4.1-flash"],
+    "gpt-6-luna": ["gpt-6-luna", "cb/gpt-6-luna"],
+    "gpt-6.1-sol": ["gpt-6.1-sol"]
+  },
+  "verification": {
+    "catalog": "passed",
+    "messages_text_all_models": "passed",
+    "messages_sse_tool_roundtrip_all_models": "passed",
+    "native_cli_read_luna": "passed",
+    "native_cli_lead": "passed",
+    "native_cli_worker_worktree": "passed",
+    "native_cli_reviewer_read": "passed",
+    "independent_native_Sol_builder_source_review": "completed_blockers_found",
+    "native_subagent_Explore_model_selection": "passed",
+    "native_subagent_reviewer_model_selection": "pending",
+    "judge_mcp_lead_worker": "passed",
+    "native_doctor_installation": "passed",
+    "interactive_doctor_prompt_audit": "pending",
+    "provider_billing_rates": "unknown"
+  }
+}

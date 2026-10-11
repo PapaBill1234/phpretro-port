@@ -1,0 +1,24 @@
+{
+  "name": "@phpretro-port/cms-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "description": "Source-derived pure CMS validators and locale helpers; no website implementation.",
+  "engines": { "node": ">=26.7.0" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "README.md", "SOURCE-ORIGIN.md"],
+  "scripts": {
+    "typecheck": "tsc-rs -p tsconfig.json --noEmit",
+    "typecheck:oracle": "tsc -p tsconfig.json --noEmit",
+    "check:compilers": "node scripts/compareCompilers.mjs",
+    "test": "tsc-rs -p tsconfig.json --outDir .test-build && node --test .test-build/tests/*.test.js",
+    "build": "tsc-rs -p tsconfig.build.json",
+    "check": "npm run check:compilers && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "tsc-rs": "0.2.0",
+    "typescript": "7.1.0-dev.20260929.1"
+  }
+}

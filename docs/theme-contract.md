@@ -1,6 +1,6 @@
 # CMS theme contract v1
 
-Status: proposed contract for implementation. Two first-party packages, `classic` and `modern`, share the same Go API and React application controllers. Classic preserves the old PHPRetro website structure; modern reproduces the agreed current-site layout through original implementation and artwork. Design fidelity is measured against a dated route/viewport reference set, not an unbounded claim of 100% parity with a changing website.
+Status: proposed contract for implementation. Two first-party packages, `legacy` and `modern`, share the same Go API and React application controllers. Legacy preserves the old PHPRetro website structure; modern reproduces the agreed current-site layout through original implementation and artwork. Design fidelity is measured against a dated route/viewport reference set, not an unbounded claim of 100% parity with a changing website.
 
 ## Boundary and package shape
 
@@ -8,7 +8,7 @@ The theme is a presentation package compiled with the application. It controls R
 
 ```text
 packages/theme-contract/        # Versioned TypeScript types and test harness
-packages/theme-classic/         # theme.json, entry.tsx, styles, assets, provenance.json
+packages/theme-legacy/         # theme.json, entry.tsx, styles, assets, provenance.json
 packages/theme-modern/
 apps/web/src/controllers/      # Shared headless forms, routing and data loading
 apps/web/src/theme/             # Registry, manifest validation, error boundaries
@@ -20,7 +20,7 @@ Themes imported from other open CMS projects are ported into this interface as s
 
 ```json
 {
-  "id": "classic",
+  "id": "legacy",
   "name": "Classic",
   "version": "1.0.0",
   "contractVersion": "1.0",
@@ -118,7 +118,7 @@ Octane's existing custom-theme system is explicitly CSS-only and cannot implemen
 
 | Contract | Proof required |
 |---|---|
-| API neutrality | Same page fixtures, endpoints, authentication and permissions pass under classic and modern |
+| API neutrality | Same page fixtures, endpoints, authentication and permissions pass under legacy and modern |
 | Install validation | Unknown ABI, duplicate ID, missing required route, unsafe asset or incomplete required locale is rejected |
 | Route/slot coverage | All canonical routes render; every optional slot fallback is tested with a missing renderer |
 | Theme switching | Default/user choices persist; disabled/unknown IDs fall back; rollback works without a DB migration |

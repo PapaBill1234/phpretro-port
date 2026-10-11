@@ -1,0 +1,30 @@
+{
+  "name": "@phpretro-port/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "engines": { "node": ">=26.7.0" },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc-rs -p tsconfig.json --noEmit",
+    "typecheck:oracle": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc-rs -p tsconfig.tests.json && node --test .test-build/tests/*.test.js",
+    "check": "npm run typecheck && npm run typecheck:oracle && npm test",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@phpretro-port/cms-contracts": "file:../../packages/cms-contracts",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.3",
+    "@vitejs/plugin-react": "4.7.0",
+    "tsc-rs": "0.2.0",
+    "typescript": "7.1.0-dev.20260929.1",
+    "vite": "6.4.4"
+  }
+}
