@@ -77,13 +77,18 @@ def start():
         current = names()
         if len(current) != len(set(current)):
             raise SetupError("Duplicate window names found; inspect them before continuing.")
-        if all(name in current for name, _, _ in WINDOWS):
-            return status()
+        snapshot = status()
+        if all(name in current for name, _, _ in WINDOWS) and all(item["state"] == "open" for item in snapshot["windows"]):
+            return snapshot
     clean_checkpoint()
     for name, role, worktree in WINDOWS:
-        if name in current:
-            continue
         shell = command(role, worktree, name)
+        if name in current:
+            target = SESSION + ":" + name
+            dead = tmux("list-panes", "-t", target, "-F", "#{pane_dead}").stdout.splitlines()
+            if dead == ["1"]:
+                tmux("respawn-pane", "-t", target, "-c", str(ROOT), shell)
+            continue
         if not present:
             window = tmux("new-session", "-d", "-s", SESSION, "-n", name, "-c", str(ROOT), "-P", "-F", "#{window_id}", shell).stdout.strip()
             tmux("set-option", "-t", TARGET, "@phpretro_root", str(ROOT))
