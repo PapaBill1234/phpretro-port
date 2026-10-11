@@ -117,7 +117,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertNotIn(key, env)
         command = observed["command"]
         self.assertEqual(command[command.index("--tools") + 1], "Read,Grep,Glob")
-        self.assertEqual(command[command.index("--permission-mode") + 1], "manual")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "bypassPermissions")
         self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
         self.assertNotIn(synthetic, stderr.getvalue())
         self.assertNotIn(synthetic, " ".join(command))
@@ -137,7 +137,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
         self.assertEqual(command[command.index("--agent") + 1], "lead")
         self.assertEqual(command[command.index("--tools") + 1], "default")
-        self.assertEqual(command[command.index("--permission-mode") + 1], "manual")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "bypassPermissions")
         self.assertEqual(observed["environment"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-6.1-sol")
         self.assertEqual(observed["environment"]["CLAUDE_CONFIG_DIR"], str(self.root / ".builder/claude"))
 

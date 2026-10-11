@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Start a project-scoped Claude CLI through the verified A6API Messages route.
 
-No shell evaluation, provider-key logging, global edits, permission bypass or
-unattended swarm. This launcher does not enforce the supervisor's spending ledger.
+No shell evaluation, provider-key logging or unattended swarm. Permission bypass
+is enabled explicitly at the operator's request. This launcher does not enforce the supervisor's spending ledger.
 """
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def main() -> int:
         "role": options.role, "model": role["model"], "effort": role["effort"],
         "endpoint": data["anthropic_base_url"], "binary": str(binary),
         "credential_source": key_source, "credential_available": True,
-        "config_home": str(config_home), "permission_mode": "manual",
+        "config_home": str(config_home), "permission_mode": "bypassPermissions",
         "worker_worktree": worktree_name if options.role == "worker" else None,
         "secrets_in_logs": False, "spending_guard_enforced_by_launcher": False,
     }
@@ -169,7 +169,7 @@ def main() -> int:
         env["PHPRETRO_OPENROUTER_ENV"] = os.environ["PHPRETRO_OPENROUTER_ENV"]
     mcp = ROOT / ".mcp.json"
     command = [str(binary), "--model", role["model"], "--agent", role["agent"],
-               "--effort", role["effort"], "--permission-mode", "manual",
+               "--effort", role["effort"], "--permission-mode", "bypassPermissions",
                "--tools", role["tools"], "--setting-sources", "project",
                "--settings", str(ROOT / ".claude/settings.json"),
                "--strict-mcp-config", "--mcp-config",
