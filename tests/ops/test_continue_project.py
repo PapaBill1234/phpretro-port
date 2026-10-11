@@ -1,3 +1,4 @@
+import fcntl
 import importlib.util
 import json
 import os
@@ -56,6 +57,17 @@ class ContinuationRunnerTests(unittest.TestCase):
                 runner.READINESS.write_text(replacement)
             self.assertEqual(self.invoke("--run"), 2)
 
+    def test_symlink_readiness_ancestor_rejected(self):
+        doctor = self.root / ".builder" / "doctor"
+        runner.READINESS.unlink()
+        doctor.rmdir()
+        target = self.root / "elsewhere"
+        target.mkdir()
+        doctor.symlink_to(target, target_is_directory=True)
+        with mock.patch.object(runner.subprocess, "Popen") as popen:
+            self.assertEqual(self.invoke("--run"), 2)
+            popen.assert_not_called()
+
     def test_run_holds_lock_through_checkpoint_and_logs_are_private(self):
         observed = []
         class Child:
@@ -64,14 +76,54 @@ class ContinuationRunnerTests(unittest.TestCase):
                 observed.append(runner.lock_status() == "busy")
                 return 0
         with mock.patch.object(runner.subprocess, "Popen", return_value=Child()) as popen:
-            self.assertEqual(self.invoke("--run"), 0)
+            original_atomic = runner.atomic_json
+            def checkpoint(path, data):
+                observed.append(runner.lock_status() == "busy")
+                original_atomic(path, data)
+            with mock.patch.object(runner, "atomic_json", side_effect=checkpoint):
+                self.assertEqual(self.invoke("--run"), 0)
             command = popen.call_args.args[0]
-        self.assertEqual(observed, [True])
+        self.assertEqual(observed, [True, True])
         self.assertIn(str(self.root), command[command.index("-p") + 1])
         record = json.loads((runner.STATE / "last-run.json").read_text())
         self.assertEqual(os.stat(runner.STATE / "last-run.json").st_mode & 0o777, 0o600)
         for key in ("stdout_log", "stderr_log"):
             self.assertEqual(os.stat(record[key]).st_mode & 0o777, 0o600)
+
+    def test_terminate_group_reaps_real_leader_and_grandchild(self):
+        pid_file = self.root / "grandchild.pid"
+        code = ("import os,signal,subprocess,time; "
+                "g=subprocess.Popen(['python3','-c',%r]); open(%r,'w').write(str(g.pid)); "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)" %
+                ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)", str(pid_file)))
+        proc = subprocess.Popen(["python3", "-c", code], start_new_session=True)
+        try:
+            for _ in range(50):
+                if pid_file.exists():
+                    break
+                import time
+                time.sleep(0.02)
+            self.assertTrue(pid_file.exists())
+            grandchild = int(pid_file.read_text())
+            runner.terminate_group(proc, 0.05)
+            self.assertIsNotNone(proc.poll())
+            for _ in range(50):
+                try:
+                    state = Path(f"/proc/{grandchild}/stat").read_text().split(") ", 1)[1].split()[0]
+                    if state == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                import time
+                time.sleep(0.02)
+            try:
+                state = Path(f"/proc/{grandchild}/stat").read_text().split(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                state = "gone"
+            self.assertIn(state, ("Z", "gone"))
+        finally:
+            if proc.poll() is None:
+                runner.terminate_group(proc, 0.05)
 
     def test_timeout_kills_group_after_leader_exits(self):
         calls = []
@@ -88,22 +140,35 @@ class ContinuationRunnerTests(unittest.TestCase):
             calls.append(sig)
         with mock.patch.object(runner.subprocess, "Popen", return_value=child):
             with mock.patch.object(runner.os, "killpg", side_effect=killpg):
-                with mock.patch.object(runner, "terminate_group", wraps=runner.terminate_group):
-                    self.assertEqual(self.invoke("--run"), 124)
+                self.assertEqual(self.invoke("--run"), 124)
         self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
         record = json.loads((runner.STATE / "last-run.json").read_text())
         self.assertTrue(record["timed_out"])
         self.assertEqual(record["exit_code"], 124)
 
-    def test_busy_lock_separate_descriptor_skips(self):
-        import fcntl
-        fd = os.open(runner.STATE / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    def test_busy_lock_separate_process_skips(self):
+        import sys
+        lock = runner.STATE / "run.lock"
+        lock.touch()
+        marker = self.root / "holder.ready"
+        code = ("import fcntl, pathlib, time; fd=open(%r,'r+'); fcntl.flock(fd, fcntl.LOCK_EX); "
+                "pathlib.Path(%r).write_text('ready'); time.sleep(2)") % (str(lock), str(marker))
+        proc = subprocess.Popen([sys.executable, "-c", code])
         try:
-            self.assertEqual(self.invoke("--check"), 0)
+            for _ in range(100):
+                if marker.exists():
+                    break
+                import time
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            with mock.patch.object(runner.subprocess, "Popen") as popen:
+                with mock.patch("builtins.print") as output:
+                    self.assertEqual(self.invoke("--run"), 0)
+                popen.assert_not_called()
+                self.assertIn('"reason": "busy"', output.call_args.args[0])
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            proc.terminate()
+            proc.wait()
 
     def test_symlink_lock_rejected(self):
         (runner.STATE / "run.lock").symlink_to(self.root / "target")
