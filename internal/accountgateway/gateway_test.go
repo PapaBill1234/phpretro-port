@@ -250,7 +250,11 @@ func TestVerifiedBindingFailuresPreserveRegistrationAndConsumeClaim(t *testing.T
 		f.g.cfg.Validator = fakeValidator{id: VerifiedIdentity{Subject: "acct+1", ClientID: c, Nonce: "n", HostID: "stable-host", Scopes: []string{"openid", "api-plan"}}}
 		p = start(t, f, "bound")
 		s, c = cbargs(t, p)
-		id := VerifiedIdentity{Subject: "acct+1", ClientID: c, Nonce: "n", HostID: "stable-host", Scopes: []string{"openid", "api-plan"}}
+		u, err := url.Parse(p.AuthorizeURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := VerifiedIdentity{Subject: "acct+1", ClientID: c, Nonce: u.Query().Get("nonce"), HostID: "stable-host", Scopes: []string{"openid", "api-plan"}}
 		mutate(&id)
 		f.g.cfg.Validator = fakeValidator{id: id}
 		if _, err := f.g.Callback("bound", s, "code", c, f.g.cfg.CallbackURI, ""); !errors.Is(err, ErrDenied) {
