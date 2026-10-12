@@ -821,10 +821,10 @@ index 0000000..819a0ef
 +    }
 +}
 diff --git a/Emulator/src/test/java/com/eu/habbo/habbohotel/gameclients/GameClientManagerContractTest.java b/Emulator/src/test/java/com/eu/habbo/habbohotel/gameclients/GameClientManagerContractTest.java
-index 71c312b..d8dd39d 100644
+index 71c312b..3bd116a 100644
 --- a/Emulator/src/test/java/com/eu/habbo/habbohotel/gameclients/GameClientManagerContractTest.java
 +++ b/Emulator/src/test/java/com/eu/habbo/habbohotel/gameclients/GameClientManagerContractTest.java
-@@ -46,4 +46,29 @@ class GameClientManagerContractTest {
+@@ -46,4 +46,67 @@ class GameClientManagerContractTest {
          manager.releaseAuthenticatedSession(7, client);
          assertEquals(0, manager.getAuthenticatedSessionCount(7));
      }
@@ -853,6 +853,44 @@ index 71c312b..d8dd39d 100644
 +            channelA.close(); channelB.close(); field.set(null, previous);
 +        }
 +    }
++
++    @Test
++    void actualLateDisposePreservesReplacement() throws Exception {
++        var field = Emulator.class.getDeclaredField("crypto");
++        field.setAccessible(true);
++        Object previous = field.get(null);
++        field.set(null, new CryptoConfig(false, "", "", ""));
++        var ca = new io.netty.channel.embedded.EmbeddedChannel(io.netty.channel.DefaultChannelId.newInstance());
++        var cb = new io.netty.channel.embedded.EmbeddedChannel(io.netty.channel.DefaultChannelId.newInstance());
++        try {
++            var manager = new GameClientManager();
++            var a = new GameClient(ca); var b = new GameClient(cb);
++            var habbo = org.mockito.Mockito.mock(com.eu.habbo.habbohotel.users.Habbo.class);
++            var info = org.mockito.Mockito.mock(com.eu.habbo.habbohotel.users.HabboInfo.class);
++            org.mockito.Mockito.when(habbo.getHabboInfo()).thenReturn(info);
++            org.mockito.Mockito.when(info.getId()).thenReturn(7);
++            org.mockito.Mockito.when(habbo.getClient()).thenReturn(b);
++            org.mockito.Mockito.when(habbo.isOnline()).thenReturn(true);
++            a.setHabbo(habbo); b.setHabbo(habbo);
++            ca.attr(com.eu.habbo.networking.gameserver.GameServerAttributes.CLIENT).set(a);
++            cb.attr(com.eu.habbo.networking.gameserver.GameServerAttributes.CLIENT).set(b);
++            org.junit.jupiter.api.Assertions.assertNotEquals(ca.id(), cb.id());
++            manager.getSessions().put(ca.id(), a); manager.getSessions().put(cb.id(), b);
++            manager.claimAuthenticatedSession(7, a); manager.claimAuthenticatedSession(7, b);
++            manager.forceDisposeClient(a); manager.forceDisposeClient(a);
++            assertEquals(b, manager.getAuthenticatedClient(7));
++            assertEquals(b, manager.getSessions().get(cb.id()));
++            assertEquals(null, manager.getSessions().get(ca.id()));
++            assertEquals(habbo, b.getHabbo()); assertEquals(null, a.getHabbo());
++            assertTrue(cb.isOpen()); org.junit.jupiter.api.Assertions.assertFalse(ca.isOpen());
++            org.mockito.Mockito.verify(habbo, org.mockito.Mockito.never()).disconnect();
++            org.mockito.Mockito.verify(habbo, org.mockito.Mockito.never()).setClient(org.mockito.ArgumentMatchers.any());
++            org.mockito.Mockito.verify(info, org.mockito.Mockito.never()).setOnline(false);
++        } finally {
++            ca.finishAndReleaseAll(); cb.finishAndReleaseAll(); field.set(null, previous);
++        }
++    }
++
  }
 diff --git a/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java b/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java
 new file mode 100644
