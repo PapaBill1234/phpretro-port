@@ -1,18 +1,54 @@
 diff --git a/Emulator/src/main/java/com/eu/habbo/Emulator.java b/Emulator/src/main/java/com/eu/habbo/Emulator.java
-index a59bbe1..959770d 100644
+index a59bbe1..388c409 100644
 --- a/Emulator/src/main/java/com/eu/habbo/Emulator.java
 +++ b/Emulator/src/main/java/com/eu/habbo/Emulator.java
-@@ -194,6 +194,10 @@ public final class Emulator {
-                 return;
-             }
-
-+            if (Emulator.getConfig().getBoolean("debug_sso", false)) {
-+                throw new IllegalStateException("debug_sso is forbidden: strict one-use SSO is required");
-+            }
+@@ -189,6 +189,7 @@ public final class Emulator {
+             long startTime = System.nanoTime();
+ 
+             Emulator.runtime = Runtime.getRuntime();
 +
-             LOGGER.info("Polaris has successfully loaded.");
-             LOGGER.info(
-                     "System launched in: {}ms. Using {} threads!",
+             if (!bootstrap.start(migrationOptions, integrityAuditOptions)) {
+                 Emulator.polarisRuntime.shutdown();
+                 return;
+diff --git a/Emulator/src/main/java/com/eu/habbo/PolarisBootstrap.java b/Emulator/src/main/java/com/eu/habbo/PolarisBootstrap.java
+index ca5e690..7bf9c96 100644
+--- a/Emulator/src/main/java/com/eu/habbo/PolarisBootstrap.java
++++ b/Emulator/src/main/java/com/eu/habbo/PolarisBootstrap.java
+@@ -121,7 +121,25 @@ final class PolarisBootstrap {
+         DatabaseIndexAuditor.auditAtStartup(database.getDataSource());
+         runtime.installDatabaseLogger(new DatabaseLogger());
+         configuration.loaded = true;
+-        configuration.loadFromDatabase();
++        runSsoPreflightAndContinue(configuration, configuration::loadFromDatabase, () -> {
++            initializeRuntimeAfterDatabaseConfiguration(configuration);
++            return true;
++        });
++        return true;
++    }
++
++    static boolean runSsoPreflightAndContinue(
++            ConfigurationManager configuration,
++            Runnable loadDatabaseConfiguration,
++            StartupPhases.Action continueStartup) throws Exception {
++        loadDatabaseConfiguration.run();
++        if (configuration.getBoolean("debug_sso", false)) {
++            throw new IllegalStateException("debug_sso is forbidden: strict one-use SSO is required");
++        }
++        return continueStartup.run();
++    }
++
++    private void initializeRuntimeAfterDatabaseConfiguration(ConfigurationManager configuration) {
+         configuration.register("runtime.threads", "8");
+         configuration.register("db.persistence.queue.capacity", "0");
+ 
+@@ -145,7 +163,6 @@ final class PolarisBootstrap {
+         RuntimeResilienceRuntime.install(
+                 configuration, runtime.database(), runtime.persistenceExecutor(), runtime.threading());
+         SessionRecoveryRuntime.install(configuration, runtime.database());
+-        return true;
+     }
+ 
+     static int resolveRuntimeThreads(ConfigurationManager configuration) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
 index 3cd5e99..5ffd8d4 100644
 --- a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
@@ -20,7 +56,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -50,10 +50,6 @@ public class SessionResumeManager {
          LOGGER.info("[SessionResume] Parking {} (id={}) for {}s grace period",
                  habbo.getHabboInfo().getUsername(), userId, graceSeconds);
-
+ 
 -        if (ssoTicket != null && !ssoTicket.isEmpty()) {
 -            restoreSsoTicket(userId, ssoTicket);
 -        }
@@ -31,7 +67,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -156,29 +152,6 @@ public class SessionResumeManager {
          // CMS al prossimo /client o azzerato al logout.
      }
-
+ 
 -    private void restoreSsoTicket(int userId, String ssoTicket) {
 -        // Restore the old ticket ONLY if no fresh ticket has been written in the
 -        // meantime. On a hard-refresh the CMS writes a NEW auth_ticket for the same
@@ -61,7 +97,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -211,17 +184,6 @@ public class SessionResumeManager {
          }
      }
-
+ 
 -    private void clearSsoTicket(int userId) {
 -        try (var connection = Emulator.getDatabase().getDataSource().getConnection();
 -             var statement = connection.prepareStatement("UPDATE users SET auth_ticket = ? WHERE id = ? LIMIT 1")) {
@@ -82,7 +118,7 @@ index a03b06a..f66262b 100644
 +++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java
 @@ -113,61 +113,10 @@ public class HabboManager {
      }
-
+ 
      public Habbo loadHabbo(String sso) {
 -        int userId = 0;
 -
@@ -144,14 +180,14 @@ index a03b06a..f66262b 100644
 +        // Consumption commits before identity loading; later load failures never restore SSO.
 +        return loadHabboById(authenticated.getAsInt());
      }
-
+ 
      public Habbo loadHabboById(int userId) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
 new file mode 100644
 index 0000000..5085f86
 --- /dev/null
 +++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,61 @@
 +package com.eu.habbo.habbohotel.users;
 +
 +import com.eu.habbo.Emulator;
@@ -183,6 +219,8 @@ index 0000000..5085f86
 +                    try (ResultSet rs = lock.executeQuery()) {
 +                        if (!rs.next()) { c.rollback(); return OptionalInt.empty(); }
 +                        id = rs.getInt(1);
++                        // Reject ambiguity under legacy case-insensitive ticket collations.
++                        if (rs.next()) { c.rollback(); return OptionalInt.empty(); }
 +                    }
 +                }
 +                int changed;
@@ -218,7 +256,7 @@ index 2e890b8..4ea6abb 100644
 @@ -147,38 +147,28 @@ public class SecureLoginEvent extends MessageHandler {
              // Store SSO ticket on client for grace period tracking
              this.client.setSsoTicket(sso);
-
+ 
 -            GameClient existingClient =
 -                    Emulator.getGameServer().getGameClientManager().findClientBySsoTicket(sso);
 -            if (existingClient != null && existingClient != this.client) {
@@ -265,7 +303,7 @@ index 2e890b8..4ea6abb 100644
 +                    LOGGER.info("Recovered authenticated session for user id={}", recoveredUser.getAsInt());
 +                }
              }
-
+ 
              if (habbo != null) {
 -                isSessionResume = true;
                  LOGGER.info(
@@ -274,7 +312,7 @@ index 2e890b8..4ea6abb 100644
 @@ -205,19 +195,6 @@ public class SecureLoginEvent extends MessageHandler {
                      return;
                  }
-
+ 
 -                Emulator.getGameEnvironment()
 -                        .getHabboManager()
 -                        .consumeSsoTicket(habbo.getHabboInfo().getId());
@@ -289,7 +327,7 @@ index 2e890b8..4ea6abb 100644
 -                    }
 -                }
              }
-
+ 
              if (habbo != null) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 index b9a5a9b..12cbc40 100644
@@ -297,7 +335,7 @@ index b9a5a9b..12cbc40 100644
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 @@ -7,14 +7,14 @@ final class SecureLoginInputGuard {
      }
-
+ 
      static String normalizeSsoTicket(String ticket) {
 -        if (ticket == null) {
 -            return "";
@@ -306,7 +344,7 @@ index b9a5a9b..12cbc40 100644
 -        return ticket.replace(" ", "");
 +        return ticket == null ? "" : ticket;
      }
-
+ 
      static boolean isValidSsoTicket(String ticket) {
 -        return ticket != null && !ticket.isEmpty() && ticket.length() <= MAX_SSO_TICKET_LENGTH;
 +        if (ticket == null || ticket.isEmpty() || ticket.length() > 128) return false;
@@ -316,6 +354,101 @@ index b9a5a9b..12cbc40 100644
 +        return true;
      }
  }
+diff --git a/Emulator/src/test/java/com/eu/habbo/StrictSsoStartupPreflightTest.java b/Emulator/src/test/java/com/eu/habbo/StrictSsoStartupPreflightTest.java
+new file mode 100644
+index 0000000..819a0ef
+--- /dev/null
++++ b/Emulator/src/test/java/com/eu/habbo/StrictSsoStartupPreflightTest.java
+@@ -0,0 +1,89 @@
++package com.eu.habbo;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++import com.eu.habbo.core.ConfigurationManager;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++class StrictSsoStartupPreflightTest {
++
++    @TempDir
++    Path configDirectory;
++
++    @Test
++    void fileFalseWithoutDatabaseOverrideContinuesAfterConfigurationLoad() throws Exception {
++        assertContinues(false, null);
++    }
++
++    @Test
++    void fileTrueWithoutDatabaseOverrideIsRejectedBeforeLaterPhases() throws IOException {
++        assertRejected(true, null);
++    }
++
++    @Test
++    void databaseFalseOverrideAllowsFileFalseAndFileTrue() throws Exception {
++        assertContinues(false, false);
++        assertContinues(true, false);
++    }
++
++    @Test
++    void databaseTrueOverrideRejectsFileFalseAndFileTrueBeforeLaterPhases() throws IOException {
++        assertRejected(false, true);
++        assertRejected(true, true);
++    }
++
++    private void assertContinues(boolean fileValue, Boolean databaseOverride) throws Exception {
++        ConfigurationManager configuration = configuration(fileValue);
++        AtomicInteger databaseLoads = new AtomicInteger();
++        AtomicInteger laterPhases = new AtomicInteger();
++
++        assertDoesNotThrow(() -> PolarisBootstrap.runSsoPreflightAndContinue(
++                configuration,
++                () -> applyDatabaseOverride(configuration, databaseLoads, databaseOverride),
++                () -> {
++                    laterPhases.incrementAndGet();
++                    return true;
++                }));
++
++        assertEquals(1, databaseLoads.get());
++        assertEquals(1, laterPhases.get());
++    }
++
++    private void assertRejected(boolean fileValue, Boolean databaseOverride) throws IOException {
++        ConfigurationManager configuration = configuration(fileValue);
++        AtomicInteger databaseLoads = new AtomicInteger();
++        AtomicInteger laterPhases = new AtomicInteger();
++
++        assertThrows(IllegalStateException.class, () -> PolarisBootstrap.runSsoPreflightAndContinue(
++                configuration,
++                () -> applyDatabaseOverride(configuration, databaseLoads, databaseOverride),
++                () -> {
++                    laterPhases.incrementAndGet();
++                    return true;
++                }));
++
++        assertEquals(1, databaseLoads.get());
++        assertEquals(0, laterPhases.get(), "preflight rejection must stop later startup work");
++    }
++
++    private ConfigurationManager configuration(boolean fileValue) throws IOException {
++        Path file = configDirectory.resolve("config-" + fileValue + "-" + System.nanoTime() + ".ini");
++        Files.writeString(file, "debug_sso=" + fileValue + System.lineSeparator());
++        return new ConfigurationManager(file.toString());
++    }
++
++    private static void applyDatabaseOverride(
++            ConfigurationManager configuration, AtomicInteger databaseLoads, Boolean databaseOverride) {
++        databaseLoads.incrementAndGet();
++        if (databaseOverride != null) {
++            configuration.update("debug_sso", databaseOverride.toString());
++        }
++    }
++}
 diff --git a/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java b/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java
 new file mode 100644
 index 0000000..6b997d9
