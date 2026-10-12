@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"net/url"
 	"strconv"
@@ -25,6 +26,8 @@ var (
 
 const initialClient = "dynamic_agent_client"
 
+var openAIScopes = []string{"openid", "profile", "email", "offline_access", "resource.invoke", "chatgpt.tokens.use.direct"}
+
 type Profile struct {
 	Label, HostID, ClientID, Identity string
 	Active                            bool
@@ -34,9 +37,8 @@ type Pending struct {
 	ExpiresAt           time.Time
 }
 type RawToken struct {
-	Signed   string
-	ClientID string
-	Scopes   []string
+	Signed, ClientID string
+	Scopes           []string
 }
 type VerifiedIdentity struct {
 	Subject, ClientID, Nonce, HostID string
@@ -54,6 +56,7 @@ type Validator interface {
 }
 type Config struct {
 	AuthorizationEndpoint, CallbackURI, HostID string
+	Resource, AgentName                        string
 	RequiredScopes                             []string
 	Exchange                                   Exchange
 	Validator                                  Validator
@@ -74,6 +77,10 @@ type Gateway struct {
 	profiles  map[string]Profile
 }
 
+// NewOpenAIConfig creates the documented Sign in with ChatGPT wire configuration.
+func NewOpenAIConfig(callbackURI, hostID, appName string, exchange Exchange, validator Validator) Config {
+	return Config{AuthorizationEndpoint: "https://auth.openai.com/api/accounts/authorize", CallbackURI: callbackURI, HostID: hostID, Resource: "https://api.openai.com/v1", AgentName: appName, RequiredScopes: append([]string(nil), openAIScopes...), Exchange: exchange, Validator: validator}
+}
 func New(c Config) *Gateway {
 	c.RequiredScopes = append([]string(nil), c.RequiredScopes...)
 	if c.Now == nil {
@@ -85,6 +92,44 @@ func New(c Config) *Gateway {
 	g := &Gateway{cfg: c, pending: map[string]*transaction{}, profiles: map[string]Profile{}}
 	g.configErr = validateConfig(c)
 	return g
+}
+func validHostID(s string) bool {
+	if strings.HasPrefix(s, "urn:uuid:") {
+		v := strings.TrimPrefix(s, "urn:uuid:")
+		b, e := hex.DecodeString(strings.ReplaceAll(v, "-", ""))
+		return e == nil && len(b) == 16 && b[6]>>4 == 4 && b[8]>>6 == 2 && len(v) == 36 && v[8] == '-' && v[13] == '-' && v[18] == '-' && v[23] == '-'
+	}
+	if strings.HasPrefix(s, "urn:ietf:params:oauth:jwk-thumbprint:") {
+		v := strings.TrimPrefix(s, "urn:ietf:params:oauth:jwk-thumbprint:")
+		parts := strings.Split(v, ":")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return false
+		}
+		for _, r := range parts[0] {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				return false
+			}
+		}
+		for _, r := range parts[1] {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				return false
+			}
+		}
+		return true
+	}
+	if strings.HasPrefix(s, "did:key:") {
+		v := strings.TrimPrefix(s, "did:key:")
+		if len(v) < 2 {
+			return false
+		}
+		for _, r := range v {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 func validateConfig(c Config) error {
 	u, e := url.Parse(c.AuthorizationEndpoint)
@@ -102,12 +147,24 @@ func validateConfig(c Config) error {
 	if strings.TrimSpace(c.HostID) == "" {
 		return ErrInvalid
 	}
-	openid, grant := false, false
-	for _, scope := range c.RequiredScopes {
-		if !validScope(scope) {
+	if u.Host == "auth.openai.com" && !validHostID(c.HostID) {
+		return ErrInvalid
+	}
+	if u.Host == "auth.openai.com" && strings.TrimSpace(c.AgentName) == "" {
+		return ErrInvalid
+	}
+	if c.Resource != "" {
+		r, e := url.Parse(c.Resource)
+		if e != nil || r.Scheme != "https" || r.Host == "" || r.User != nil || r.RawQuery != "" || r.Fragment != "" {
 			return ErrInvalid
 		}
-		if scope == "openid" {
+	}
+	openid, grant := false, false
+	for _, s := range c.RequiredScopes {
+		if !validScope(s) {
+			return ErrInvalid
+		}
+		if s == "openid" {
 			openid = true
 		} else {
 			grant = true
@@ -125,24 +182,21 @@ func (g *Gateway) Begin(label string) (Pending, error) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for pendingLabel, t := range g.pending {
-		if t.validating {
-			continue
-		}
-		if !g.cfg.Now().Before(t.expires) {
-			delete(g.pending, pendingLabel)
+	for k, t := range g.pending {
+		if !t.validating && !g.cfg.Now().Before(t.expires) {
+			delete(g.pending, k)
 		}
 	}
-	if t := g.pending[label]; t != nil {
+	if g.pending[label] != nil {
 		return Pending{}, ErrBusy
 	}
-	if _, hasProfile := g.profiles[label]; !hasProfile {
-		labels := make(map[string]struct{}, len(g.pending)+len(g.profiles))
-		for pendingLabel := range g.pending {
-			labels[pendingLabel] = struct{}{}
+	if _, ok := g.profiles[label]; !ok {
+		labels := map[string]bool{}
+		for k := range g.pending {
+			labels[k] = true
 		}
-		for profileLabel := range g.profiles {
-			labels[profileLabel] = struct{}{}
+		for k := range g.profiles {
+			labels[k] = true
 		}
 		if len(labels) >= 2 {
 			return Pending{}, ErrBusy
@@ -177,6 +231,7 @@ func (g *Gateway) Begin(label string) (Pending, error) {
 	g.pending[label] = t
 	u, _ := url.Parse(g.cfg.AuthorizationEndpoint)
 	q := u.Query()
+	q.Del("agent_name_hint")
 	q.Set("response_type", "code")
 	q.Set("state", state)
 	q.Set("nonce", nonce)
@@ -185,6 +240,13 @@ func (g *Gateway) Begin(label string) (Pending, error) {
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
 	q.Set("scope", strings.Join(g.cfg.RequiredScopes, " "))
+	q.Set("ext_agent_host_id", g.cfg.HostID)
+	if g.cfg.Resource != "" {
+		q.Set("resource", g.cfg.Resource)
+	}
+	if !returning {
+		q.Set("agent_name_hint", g.cfg.AgentName)
+	}
 	u.RawQuery = q.Encode()
 	return Pending{Label: label, AuthorizeURL: u.String(), ExpiresAt: exp}, nil
 }
@@ -204,11 +266,27 @@ func (g *Gateway) Callback(label, state, code, returnedClient, redirect, provide
 		g.mu.Unlock()
 		return Profile{}, ErrBusy
 	}
+	if state != t.state || redirect != g.cfg.CallbackURI {
+		g.mu.Unlock()
+		return Profile{}, ErrInvalid
+	}
 	if providerErr != "" {
+		delete(g.pending, label)
 		g.mu.Unlock()
 		return Profile{}, ErrDenied
 	}
-	if state != t.state || code == "" || returnedClient == "" || returnedClient == initialClient || returnedClient != t.clientID && t.returning || redirect != g.cfg.CallbackURI {
+	client := returnedClient
+	if t.returning {
+		if client != "" && client != t.clientID {
+			g.mu.Unlock()
+			return Profile{}, ErrInvalid
+		}
+		client = t.clientID
+	} else if client == "" || client == initialClient {
+		g.mu.Unlock()
+		return Profile{}, ErrInvalid
+	}
+	if code == "" {
 		g.mu.Unlock()
 		return Profile{}, ErrInvalid
 	}
@@ -218,7 +296,6 @@ func (g *Gateway) Callback(label, state, code, returnedClient, redirect, provide
 	}
 	t.validating = true
 	v := t.verifier
-	client := returnedClient
 	expected := Expected{Nonce: t.nonce, ClientID: client, HostID: t.hostID, Subject: t.subject, Returning: t.returning}
 	g.mu.Unlock()
 	raw, e := g.cfg.Exchange.Exchange(code, client, g.cfg.CallbackURI, v)
@@ -257,19 +334,18 @@ func (g *Gateway) Callback(label, state, code, returnedClient, redirect, provide
 	delete(g.pending, label)
 	return p, nil
 }
-func validScope(scope string) bool {
-	if scope == "" {
+func validScope(s string) bool {
+	if s == "" {
 		return false
 	}
-	for i := 0; i < len(scope); i++ {
-		b := scope[i]
+	for i := 0; i < len(s); i++ {
+		b := s[i]
 		if !(b == 0x21 || b >= 0x23 && b <= 0x5b || b >= 0x5d && b <= 0x7e) {
 			return false
 		}
 	}
 	return true
 }
-
 func scopesContain(got, required []string) bool {
 	for _, r := range required {
 		found := false
