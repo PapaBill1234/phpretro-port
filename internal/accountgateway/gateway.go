@@ -37,9 +37,15 @@ type Pending struct {
 	ExpiresAt           time.Time
 }
 type RawToken struct {
-	Signed, ClientID string
-	Scopes           []string
+	Signed      string       `json:"-"`
+	ClientID    string       `json:"-"`
+	Scopes      []string     `json:"-"`
+	Credentials *Credentials `json:"-"`
 }
+
+func (RawToken) String() string   { return "[REDACTED]" }
+func (RawToken) GoString() string { return "[REDACTED]" }
+
 type VerifiedIdentity struct {
 	Subject, ClientID, Nonce, HostID string
 	Scopes                           []string
