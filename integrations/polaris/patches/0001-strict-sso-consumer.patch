@@ -212,10 +212,10 @@ index 0000000..5085f86
 +    }
 +}
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-index 2e890b8..a197a1e 100644
+index 2e890b8..4ea6abb 100644
 --- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-@@ -147,38 +147,23 @@ public class SecureLoginEvent extends MessageHandler {
+@@ -147,38 +147,28 @@ public class SecureLoginEvent extends MessageHandler {
              // Store SSO ticket on client for grace period tracking
              this.client.setSsoTicket(sso);
 
@@ -250,6 +250,11 @@ index 2e890b8..a197a1e 100644
 -                habbo = SessionResumeManager.getInstance().resumeSession(lookupUserId);
 +            if (authenticated.isPresent()) {
 +                int authenticatedId = authenticated.getAsInt();
++                // Only a committed, one-use ticket may displace a matching prior client.
++                GameClient existingClient = Emulator.getGameServer().getGameClientManager().findClientBySsoTicket(sso);
++                if (existingClient != null && existingClient != this.client) {
++                    Emulator.getGameServer().getGameClientManager().disposeClient(existingClient);
++                }
 +                habbo = SessionResumeManager.getInstance().resumeSession(authenticatedId);
 +                if (habbo == null) habbo = Emulator.getGameEnvironment().getHabboManager().loadHabboById(authenticatedId);
 +                else isSessionResume = true;
@@ -266,7 +271,7 @@ index 2e890b8..a197a1e 100644
                  LOGGER.info(
                          "[SessionResume] Resuming session for {} (id={})",
                          habbo.getHabboInfo().getUsername(),
-@@ -205,19 +190,6 @@ public class SecureLoginEvent extends MessageHandler {
+@@ -205,19 +195,6 @@ public class SecureLoginEvent extends MessageHandler {
                      return;
                  }
 
@@ -311,3 +316,26 @@ index b9a5a9b..12cbc40 100644
 +        return true;
      }
  }
+diff --git a/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java b/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java
+new file mode 100644
+index 0000000..6b997d9
+--- /dev/null
++++ b/Emulator/src/test/java/com/eu/habbo/habbohotel/users/SsoTicketConsumerBehaviorTest.java
+@@ -0,0 +1,17 @@
++package com.eu.habbo.habbohotel.users;
++
++import static org.junit.jupiter.api.Assertions.*;
++import org.junit.jupiter.api.Test;
++
++class SsoTicketConsumerBehaviorTest {
++    @Test void rejectsUntrustedTicketFormsBeforeDatabaseAccess() {
++        assertFalse(SsoTicketConsumer.isPrintableAscii(null));
++        assertFalse(SsoTicketConsumer.isPrintableAscii(""));
++        assertFalse(SsoTicketConsumer.isPrintableAscii("ticket with space"));
++        assertFalse(SsoTicketConsumer.isPrintableAscii("ticket\t"));
++        assertFalse(SsoTicketConsumer.isPrintableAscii("é"));
++        assertTrue(SsoTicketConsumer.isPrintableAscii("nitro-valid"));
++        assertTrue(SsoTicketConsumer.isPrintableAscii("x".repeat(128)));
++        assertFalse(SsoTicketConsumer.isPrintableAscii("x".repeat(129)));
++    }
++}
