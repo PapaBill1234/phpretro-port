@@ -148,7 +148,7 @@ index a03b06a..f66262b 100644
      public Habbo loadHabboById(int userId) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
 new file mode 100644
-index 0000000..2aa49d1
+index 0000000..5085f86
 --- /dev/null
 +++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
 @@ -0,0 +1,59 @@
@@ -203,7 +203,7 @@ index 0000000..2aa49d1
 +    }
 +
 +    static boolean isPrintableAscii(String ticket) {
-+        if (ticket == null || ticket.isEmpty() || ticket.length() > 512) return false;
++        if (ticket == null || ticket.isEmpty() || ticket.length() > 128) return false;
 +        for (int i = 0; i < ticket.length(); i++) {
 +            char ch = ticket.charAt(i);
 +            if (ch < 0x21 || ch > 0x7e) return false;
@@ -212,10 +212,10 @@ index 0000000..2aa49d1
 +    }
 +}
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-index 2e890b8..cf3e601 100644
+index 2e890b8..a197a1e 100644
 --- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-@@ -147,34 +147,20 @@ public class SecureLoginEvent extends MessageHandler {
+@@ -147,38 +147,23 @@ public class SecureLoginEvent extends MessageHandler {
              // Store SSO ticket on client for grace period tracking
              this.client.setSsoTicket(sso);
 
@@ -262,7 +262,11 @@ index 2e890b8..cf3e601 100644
              }
 
              if (habbo != null) {
-@@ -205,19 +191,6 @@ public class SecureLoginEvent extends MessageHandler {
+-                isSessionResume = true;
+                 LOGGER.info(
+                         "[SessionResume] Resuming session for {} (id={})",
+                         habbo.getHabboInfo().getUsername(),
+@@ -205,19 +190,6 @@ public class SecureLoginEvent extends MessageHandler {
                      return;
                  }
 
@@ -283,7 +287,7 @@ index 2e890b8..cf3e601 100644
 
              if (habbo != null) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
-index b9a5a9b..7b11460 100644
+index b9a5a9b..12cbc40 100644
 --- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 @@ -7,14 +7,14 @@ final class SecureLoginInputGuard {
@@ -300,7 +304,7 @@ index b9a5a9b..7b11460 100644
 
      static boolean isValidSsoTicket(String ticket) {
 -        return ticket != null && !ticket.isEmpty() && ticket.length() <= MAX_SSO_TICKET_LENGTH;
-+        if (ticket == null || ticket.isEmpty() || ticket.length() > MAX_SSO_TICKET_LENGTH) return false;
++        if (ticket == null || ticket.isEmpty() || ticket.length() > 128) return false;
 +        for (int i = 0; i < ticket.length(); i++) {
 +            if (ticket.charAt(i) < 0x21 || ticket.charAt(i) > 0x7e) return false;
 +        }
