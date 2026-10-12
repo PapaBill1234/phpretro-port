@@ -90,7 +90,32 @@ class ContinuationRunnerTests(unittest.TestCase):
         for key in ("stdout_log", "stderr_log"):
             self.assertEqual(os.stat(record[key]).st_mode & 0o777, 0o600)
 
-    def test_terminate_group_reaps_real_leader_and_grandchild(self):
+    @staticmethod
+    def _proc_state(grandchild):
+        try:
+            stat_text = Path(f"/proc/{grandchild}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return "gone"
+        return stat_text.split(") ", 1)[1].split()[0]
+
+    def test_proc_state_disappearance_only_accepts_gone_process_errors(self):
+        for error in (FileNotFoundError("gone"), ProcessLookupError("gone")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(Path, "read_text", side_effect=error) as read_text:
+                self.assertEqual(self._proc_state(987654321), "gone")
+                read_text.assert_called_once_with()
+
+        for error in (PermissionError("denied"), OSError("I/O failure")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(Path, "read_text", side_effect=error):
+                with self.assertRaises(type(error)):
+                    self._proc_state(987654321)
+
+        with mock.patch.object(Path, "read_text", return_value="malformed"):
+            with self.assertRaises(IndexError):
+                self._proc_state(987654321)
+        with mock.patch.object(Path, "read_text", return_value="123 (worker) S 1 2 3"):
+            self.assertEqual(self._proc_state(987654321), "S")
+
+    def test_terminate_group_stops_real_leader_and_grandchild(self):
         pid_file = self.root / "grandchild.pid"
         code = ("import os,signal,subprocess,time; "
                 "g=subprocess.Popen(['python3','-c',%r]); open(%r,'w').write(str(g.pid)); "
@@ -108,18 +133,12 @@ class ContinuationRunnerTests(unittest.TestCase):
             runner.terminate_group(proc, 0.05)
             self.assertIsNotNone(proc.poll())
             for _ in range(50):
-                try:
-                    state = Path(f"/proc/{grandchild}/stat").read_text().split(") ", 1)[1].split()[0]
-                    if state == "Z":
-                        break
-                except FileNotFoundError:
+                state = self._proc_state(grandchild)
+                if state in ("Z", "gone"):
                     break
                 import time
                 time.sleep(0.02)
-            try:
-                state = Path(f"/proc/{grandchild}/stat").read_text().split(") ", 1)[1].split()[0]
-            except FileNotFoundError:
-                state = "gone"
+            state = self._proc_state(grandchild)
             self.assertIn(state, ("Z", "gone"))
         finally:
             if proc.poll() is None:
