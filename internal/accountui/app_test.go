@@ -165,6 +165,9 @@ func (f *fixture) csrf(t *testing.T) string {
 	if r.StatusCode != 200 {
 		t.Fatal("page", r.StatusCode)
 	}
+	if r.Header.Get("Referrer-Policy") != "same-origin" {
+		t.Fatal("account page policy suppresses form Origin")
+	}
 	body := readBody(t, r)
 	if strings.Contains(body, "access-secret") || strings.Contains(body, "refresh-secret") {
 		t.Fatal("page leaked credentials")
@@ -184,6 +187,10 @@ func (f *fixture) post(t *testing.T, path, label string) *http.Response {
 	r, e := f.browser.Do(req)
 	if e != nil {
 		t.Fatal(e)
+	}
+	if r.Header.Get("Referrer-Policy") != "no-referrer" {
+		r.Body.Close()
+		t.Fatal("POST response referrer leak")
 	}
 	return r
 }
@@ -215,6 +222,10 @@ func (f *fixture) complete(t *testing.T, callback string) *http.Response {
 	r, e := f.browser.Get(callback)
 	if e != nil {
 		t.Fatal(e)
+	}
+	if r.Header.Get("Referrer-Policy") != "no-referrer" {
+		r.Body.Close()
+		t.Fatal("callback referrer leak")
 	}
 	return r
 }
@@ -313,10 +324,33 @@ func TestCallbackCookieDuplicateStateReplayAndReturningIdentity(t *testing.T) {
 		t.Fatal("returning identity replaced")
 	}
 }
+func TestReferrerPolicyByRoute(t *testing.T) {
+	f := newFixture(t)
+	r, e := f.browser.Get(f.ui.URL + "/?notice=selected")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if r.StatusCode != 200 || r.Header.Get("Referrer-Policy") != "same-origin" {
+		t.Fatalf("GET policy: status=%d policy=%q", r.StatusCode, r.Header.Get("Referrer-Policy"))
+	}
+	r.Body.Close()
+	r = f.post(t, "/select", "account-1")
+	if r.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("POST policy: %q", r.Header.Get("Referrer-Policy"))
+	}
+	r.Body.Close()
+	callback := f.authorize(t, "account-1", "one")
+	r = f.complete(t, callback)
+	if r.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("callback policy: %q", r.Header.Get("Referrer-Policy"))
+	}
+	r.Body.Close()
+}
+
 func TestCSRFAndHostFailBeforeProvider(t *testing.T) {
 	f := newFixture(t)
 	csrf := f.csrf(t)
-	for _, origin := range []string{"", "https://evil.example"} {
+	for _, origin := range []string{"", "null", "https://evil.example"} {
 		req, _ := http.NewRequest("POST", f.ui.URL+"/begin", strings.NewReader(url.Values{"label": {"account-1"}, "csrf": {csrf}}.Encode()))
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -629,5 +663,72 @@ func TestRepeatedSignOutPreservesRemoteUncertainty(t *testing.T) {
 	}
 	if f.revokeHits.Load() != 1 {
 		t.Fatal("revoked with an empty or substituted token")
+	}
+}
+
+func TestAccountFormsStillRequireSessionAndCSRF(t *testing.T) {
+	f := newFixture(t)
+	csrf := f.csrf(t)
+	u, _ := url.Parse(f.ui.URL)
+	var cookie *http.Cookie
+	for _, c := range f.browser.Jar.Cookies(u) {
+		if c.Name == cookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("session cookie missing")
+	}
+	cases := []struct{ name, origin, csrf, session string }{
+		{"missing-origin", "", csrf, cookie.Value},
+		{"null-origin", "null", csrf, cookie.Value},
+		{"foreign-origin", "https://evil.example", csrf, cookie.Value},
+		{"missing-csrf", f.ui.URL, "", cookie.Value},
+		{"wrong-csrf", f.ui.URL, "wrong", cookie.Value},
+		{"missing-cookie", f.ui.URL, csrf, ""},
+		{"wrong-cookie", f.ui.URL, csrf, "wrong"},
+	}
+	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, path := range []string{"/begin", "/select", "/logout"} {
+		for _, tc := range cases {
+			t.Run(path+tc.name, func(t *testing.T) {
+				req, _ := http.NewRequest("POST", f.ui.URL+path, strings.NewReader(url.Values{"label": {"account-1"}, "csrf": {tc.csrf}}.Encode()))
+				req.Header.Set("Origin", tc.origin)
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				if tc.session != "" {
+					req.AddCookie(&http.Cookie{Name: cookieName, Value: tc.session})
+				}
+				res, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				res.Body.Close()
+				if res.StatusCode != 403 {
+					t.Fatal("invalid form accepted", res.StatusCode)
+				}
+			})
+		}
+	}
+	f.app.mu.Lock()
+	b := f.app.browsers[cookie.Value]
+	b.expires = time.Now().Add(-time.Second)
+	f.app.browsers[cookie.Value] = b
+	f.app.mu.Unlock()
+	for _, path := range []string{"/begin", "/select", "/logout"} {
+		req, _ := http.NewRequest("POST", f.ui.URL+path, strings.NewReader(url.Values{"label": {"account-1"}, "csrf": {csrf}}.Encode()))
+		req.Header.Set("Origin", f.ui.URL)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 403 {
+			t.Fatal("expired session accepted")
+		}
+	}
+	if f.tokenHits.Load() != 0 || f.revokeHits.Load() != 0 || len(f.store.State().Accounts) != 0 {
+		t.Fatal("rejected form changed provider or account state")
 	}
 }

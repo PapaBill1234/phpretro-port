@@ -161,6 +161,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/" && r.Method == "GET" {
+		w.Header().Set("Referrer-Policy", "same-origin")
 		a.page(w, r)
 		return
 	}
