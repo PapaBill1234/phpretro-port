@@ -613,3 +613,21 @@ func TestCallbackAndSignOutAreOrdered(t *testing.T) {
 		t.Fatal("late callback resurrected sign-out")
 	}
 }
+
+func TestRepeatedSignOutPreservesRemoteUncertainty(t *testing.T) {
+	f := newFixture(t)
+	f.login(t, "account-1", "one")
+	f.mu.Lock()
+	f.revokeStatus = 503
+	f.mu.Unlock()
+	for i := 0; i < 2; i++ {
+		r := f.post(t, "/logout", "account-1")
+		r.Body.Close()
+		if r.Header.Get("Location") != "/?notice=revocation-unconfirmed" || !f.store.State().Accounts[0].RevocationUnconfirmed {
+			t.Fatal("unconfirmed revocation silently became confirmed")
+		}
+	}
+	if f.revokeHits.Load() != 1 {
+		t.Fatal("revoked with an empty or substituted token")
+	}
+}

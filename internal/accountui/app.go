@@ -272,7 +272,10 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Private storage failed. Account operations are blocked.", 503)
 			return
 		}
-		confirmed := old.RefreshToken == "" || a.provider.Revoke(old.RefreshToken, old.ClientID) == nil
+		confirmed := !old.RevocationUnconfirmed
+		if old.RefreshToken != "" {
+			confirmed = a.provider.Revoke(old.RefreshToken, old.ClientID) == nil
+		}
 		clear(&state.Accounts[index])
 		state.Accounts[index].RevocationUnconfirmed = !confirmed
 		if a.save(state) != nil {
