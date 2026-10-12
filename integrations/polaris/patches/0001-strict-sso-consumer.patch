@@ -1,3 +1,18 @@
+diff --git a/Emulator/src/main/java/com/eu/habbo/Emulator.java b/Emulator/src/main/java/com/eu/habbo/Emulator.java
+index a59bbe1..959770d 100644
+--- a/Emulator/src/main/java/com/eu/habbo/Emulator.java
++++ b/Emulator/src/main/java/com/eu/habbo/Emulator.java
+@@ -194,6 +194,10 @@ public final class Emulator {
+                 return;
+             }
+
++            if (Emulator.getConfig().getBoolean("debug_sso", false)) {
++                throw new IllegalStateException("debug_sso is forbidden: strict one-use SSO is required");
++            }
++
+             LOGGER.info("Polaris has successfully loaded.");
+             LOGGER.info(
+                     "System launched in: {}ms. Using {} threads!",
 diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
 index 3cd5e99..5ffd8d4 100644
 --- a/Emulator/src/main/java/com/eu/habbo/habbohotel/gameclients/SessionResumeManager.java
@@ -5,7 +20,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -50,10 +50,6 @@ public class SessionResumeManager {
          LOGGER.info("[SessionResume] Parking {} (id={}) for {}s grace period",
                  habbo.getHabboInfo().getUsername(), userId, graceSeconds);
- 
+
 -        if (ssoTicket != null && !ssoTicket.isEmpty()) {
 -            restoreSsoTicket(userId, ssoTicket);
 -        }
@@ -16,7 +31,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -156,29 +152,6 @@ public class SessionResumeManager {
          // CMS al prossimo /client o azzerato al logout.
      }
- 
+
 -    private void restoreSsoTicket(int userId, String ssoTicket) {
 -        // Restore the old ticket ONLY if no fresh ticket has been written in the
 -        // meantime. On a hard-refresh the CMS writes a NEW auth_ticket for the same
@@ -46,7 +61,7 @@ index 3cd5e99..5ffd8d4 100644
 @@ -211,17 +184,6 @@ public class SessionResumeManager {
          }
      }
- 
+
 -    private void clearSsoTicket(int userId) {
 -        try (var connection = Emulator.getDatabase().getDataSource().getConnection();
 -             var statement = connection.prepareStatement("UPDATE users SET auth_ticket = ? WHERE id = ? LIMIT 1")) {
@@ -67,7 +82,7 @@ index a03b06a..f66262b 100644
 +++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/HabboManager.java
 @@ -113,61 +113,10 @@ public class HabboManager {
      }
- 
+
      public Habbo loadHabbo(String sso) {
 -        int userId = 0;
 -
@@ -129,14 +144,14 @@ index a03b06a..f66262b 100644
 +        // Consumption commits before identity loading; later load failures never restore SSO.
 +        return loadHabboById(authenticated.getAsInt());
      }
- 
+
      public Habbo loadHabboById(int userId) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
 new file mode 100644
-index 0000000..233831d
+index 0000000..2aa49d1
 --- /dev/null
 +++ b/Emulator/src/main/java/com/eu/habbo/habbohotel/users/SsoTicketConsumer.java
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +package com.eu.habbo.habbohotel.users;
 +
 +import com.eu.habbo.Emulator;
@@ -152,10 +167,11 @@ index 0000000..233831d
 +    private SsoTicketConsumer() {}
 +
 +    public static OptionalInt consume(String ticket) {
-+        if (!isPrintableAscii(ticket) || Emulator.getConfig().getBoolean("debug_sso", false)) {
++        if (!isPrintableAscii(ticket)) {
 +            return OptionalInt.empty();
 +        }
 +        byte[] bytes = ticket.getBytes(StandardCharsets.US_ASCII);
++        if (bytes.length < 1 || bytes.length > 128) return OptionalInt.empty();
 +        try (Connection c = Emulator.getDatabase().getDataSource().getConnection()) {
 +            c.setAutoCommit(false);
 +            try {
@@ -196,13 +212,21 @@ index 0000000..233831d
 +    }
 +}
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-index 2e890b8..c7f501d 100644
+index 2e890b8..cf3e601 100644
 --- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginEvent.java
-@@ -155,26 +155,20 @@ public class SecureLoginEvent extends MessageHandler {
-                 Emulator.getGameServer().getGameClientManager().disposeClient(existingClient);
-             }
- 
+@@ -147,34 +147,20 @@ public class SecureLoginEvent extends MessageHandler {
+             // Store SSO ticket on client for grace period tracking
+             this.client.setSsoTicket(sso);
+
+-            GameClient existingClient =
+-                    Emulator.getGameServer().getGameClientManager().findClientBySsoTicket(sso);
+-            if (existingClient != null && existingClient != this.client) {
+-                LOGGER.info(
+-                        "[SessionResume] Found existing client with same SSO ticket — disposing old connection to trigger parking");
+-                Emulator.getGameServer().getGameClientManager().disposeClient(existingClient);
+-            }
+-
 -            int lookupUserId = 0;
 -            try (java.sql.Connection conn =
 -                            Emulator.getDatabase().getDataSource().getConnection();
@@ -236,25 +260,35 @@ index 2e890b8..c7f501d 100644
 +                    LOGGER.info("Recovered authenticated session for user id={}", recoveredUser.getAsInt());
 +                }
              }
- 
+
              if (habbo != null) {
-@@ -205,9 +199,6 @@ public class SecureLoginEvent extends MessageHandler {
+@@ -205,19 +191,6 @@ public class SecureLoginEvent extends MessageHandler {
                      return;
                  }
- 
+
 -                Emulator.getGameEnvironment()
 -                        .getHabboManager()
 -                        .consumeSsoTicket(habbo.getHabboInfo().getId());
-             } else {
-                 HabboManager habboManager = Emulator.getGameEnvironment().getHabboManager();
-                 habbo = habboManager.loadHabbo(sso);
+-            } else {
+-                HabboManager habboManager = Emulator.getGameEnvironment().getHabboManager();
+-                habbo = habboManager.loadHabbo(sso);
+-                if (habbo == null && !recoveryToken.isEmpty()) {
+-                    java.util.OptionalInt recoveredUser = SessionRecoveryRuntime.consume(recoveryToken);
+-                    if (recoveredUser.isPresent()) {
+-                        habbo = habboManager.loadHabboById(recoveredUser.getAsInt());
+-                        LOGGER.info("Recovered authenticated session for user id={}", recoveredUser.getAsInt());
+-                    }
+-                }
+             }
+
+             if (habbo != null) {
 diff --git a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 index b9a5a9b..7b11460 100644
 --- a/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 +++ b/Emulator/src/main/java/com/eu/habbo/messages/incoming/handshake/SecureLoginInputGuard.java
 @@ -7,14 +7,14 @@ final class SecureLoginInputGuard {
      }
- 
+
      static String normalizeSsoTicket(String ticket) {
 -        if (ticket == null) {
 -            return "";
@@ -263,7 +297,7 @@ index b9a5a9b..7b11460 100644
 -        return ticket.replace(" ", "");
 +        return ticket == null ? "" : ticket;
      }
- 
+
      static boolean isValidSsoTicket(String ticket) {
 -        return ticket != null && !ticket.isEmpty() && ticket.length() <= MAX_SSO_TICKET_LENGTH;
 +        if (ticket == null || ticket.isEmpty() || ticket.length() > MAX_SSO_TICKET_LENGTH) return false;
