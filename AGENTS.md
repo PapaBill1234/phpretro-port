@@ -1,6 +1,6 @@
 # Builder contract
 
-Read `docs/gaps.md` and the assigned task brief. Load only the source contract and skill needed for that task. This is a planning repository until application implementation is explicitly recorded.
+Read `docs/gaps.md` and the assigned task brief. Load only the source contract and skill needed for that task. Application slices are recorded in docs/validation.md; the full CMS/game port remains incomplete.
 
 - Stack: Go CMS, React/TypeScript, ts-rust tooling, MariaDB CMS + Polaris databases, Redis; Polaris + Octane/Octane-Renderer integration.
 - Themes consume versioned DTOs and capabilities. No SQL, auth decisions, or SSO issuance in themes.

@@ -100,6 +100,66 @@ class CoordinationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.call("finish", "one", "--owner", "worker", "--commit", "HEAD", "--evidence", ".builder/evidence.md", "--checks", "fixture")
 
+    def test_accepted_dependency_allows_descendant_overlap_and_preserves_record(self):
+        self.add("prior"); self.call("claim", "prior", "--owner", "worker")
+        self.git("checkout", "-b", "auto/prior")
+        (self.root / "domain/a.txt").write_text("prior change")
+        self.git("add", "domain"); self.git("commit", "-m", "prior commit")
+        prior_commit = self.git("rev-parse", "HEAD")
+        (self.root / ".builder/evidence.md").write_text("fixture evidence")
+        self.call("finish", "prior", "--owner", "worker", "--commit", "HEAD", "--evidence", ".builder/evidence.md", "--checks", "fixture")
+        self.call("review", "prior", "--reviewer", "reviewer", "--result", "accepted", "--note", "fixture verified")
+        (self.root / "domain/a.txt").write_text("followup change")
+        self.git("add", "domain"); self.git("commit", "-m", "followup base")
+        self.add("followup", depends=["prior"])
+        self.call("claim", "followup", "--owner", "next-worker")
+        db = board.connect(self.db)
+        prior = db.execute("SELECT status,commit_sha,reviewer,review_note FROM tasks WHERE id='prior'").fetchone()
+        self.assertEqual(tuple(prior), ("accepted", prior_commit, "reviewer", "fixture verified"))
+        self.assertEqual(db.execute("SELECT status FROM tasks WHERE id='followup'").fetchone()[0], "claimed")
+        db.close()
+
+    def test_accepted_dependency_requires_descendant_base(self):
+        self.add("prior"); self.call("claim", "prior", "--owner", "worker")
+        self.git("checkout", "-b", "auto/prior")
+        (self.root / "domain/a.txt").write_text("prior change")
+        self.git("add", "domain"); self.git("commit", "-m", "prior commit")
+        (self.root / ".builder/evidence.md").write_text("fixture evidence")
+        self.call("finish", "prior", "--owner", "worker", "--commit", "HEAD", "--evidence", ".builder/evidence.md", "--checks", "fixture")
+        self.call("review", "prior", "--reviewer", "reviewer", "--result", "accepted", "--note", "fixture verified")
+        prior_commit = self.git("rev-parse", "HEAD")
+        self.git("checkout", "main")
+        self.add("followup", depends=["prior"], scope="domain",)
+        with self.assertRaises(ValueError):
+            self.call("claim", "followup", "--owner", "next-worker")
+        self.assertEqual(self.git("rev-parse", "main"), self.git("rev-parse", "HEAD"))
+        self.assertTrue(prior_commit != self.git("rev-parse", "main"))
+
+    def test_accepted_overlap_without_explicit_dependency_is_rejected(self):
+        self.add("prior"); self.call("claim", "prior", "--owner", "worker")
+        self.git("checkout", "-b", "auto/prior")
+        (self.root / "domain/a.txt").write_text("prior change")
+        self.git("add", "domain"); self.git("commit", "-m", "prior commit")
+        (self.root / ".builder/evidence.md").write_text("fixture evidence")
+        self.call("finish", "prior", "--owner", "worker", "--commit", "HEAD", "--evidence", ".builder/evidence.md", "--checks", "fixture")
+        self.call("review", "prior", "--reviewer", "reviewer", "--result", "accepted", "--note", "fixture verified")
+        self.add("followup")
+        with self.assertRaisesRegex(ValueError, "write scope overlaps task prior"):
+            self.call("claim", "followup", "--owner", "next-worker")
+
+    def test_active_overlaps_are_never_continuations(self):
+        self.add("active"); self.call("claim", "active", "--owner", "worker")
+        self.add("claimed-followup", depends=["active"])
+        with self.assertRaises(ValueError):
+            self.call("claim", "claimed-followup", "--owner", "next-worker")
+        (self.root / "domain/a.txt").write_text("active task change")
+        self.git("add", "domain"); self.git("commit", "-m", "active task commit")
+        (self.root / ".builder/evidence.md").write_text("fixture evidence")
+        self.call("finish", "active", "--owner", "worker", "--commit", "HEAD", "--evidence", ".builder/evidence.md", "--checks", "fixture")
+        self.add("submitted-followup", depends=["active"])
+        with self.assertRaises(ValueError):
+            self.call("claim", "submitted-followup", "--owner", "next-worker")
+
     def test_worker_commit_cannot_claim_main_integration_before_merge(self):
         self.add("one"); self.call("claim", "one", "--owner", "worker")
         self.git("checkout", "-b", "auto/one")

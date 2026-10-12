@@ -12,6 +12,12 @@ export type SiteSettings = {
 export type SiteResult = { status: "available"; settings: SiteSettings } |
   { status: "unavailable"; reason: "network" | "http" | "invalid" };
 
+// A public read started before a confirmed save must not restore an older revision.
+export function mergeSiteResult(current: SiteResult | undefined, incoming: SiteResult): SiteResult {
+  return current?.status === "available" && incoming.status === "available" &&
+    current.settings.settingsRevision > incoming.settings.settingsRevision ? current : incoming;
+}
+
 export function resolveTheme(value: string | undefined): ThemeId {
   return value === "legacy" ? "legacy" : "modern";
 }

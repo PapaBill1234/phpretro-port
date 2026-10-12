@@ -6,8 +6,8 @@ The desired process is implemented in stages. Project instructions/skills and pr
 
 | Role | Verified provider ID target | Work | Default bound |
 |---|---|---|---|
-| Lead | `deepseek-v4.1-flash` | task decomposition, ordinary implementation and checks | one active lead; concise briefs; checkpoint at 18k context target |
-| Workers | `gpt-6-luna` | discovery, docs lookup, mechanical/isolated slices | initially two editing workers; third only for independent read-only work |
+| Lead | `gpt-6.1-sol` | coordination, task decomposition and review; Luna implements suitable slices | one active lead; concise briefs; checkpoint at 18k context target |
+| Workers | `gpt-6-luna` | discovery, docs lookup, mechanical/isolated slices | disjoint owned scopes and isolated worktrees; bounded implementation |
 | Architect/reviewer | `gpt-6.1-sol` | auth/schema contracts, architecture, repeated failure and integration review | invoked at three checkpoints, not every search |
 | Typed triage | Jev through OpenRouter | narrow choice/yes-no/score over supplied facts | one batch per relevant state, bounded excerpts |
 
@@ -25,7 +25,7 @@ The direct Messages endpoint has to pass text, SSE, tool result and actual Claud
 6. The integrator combines reviewed work on an integration branch, resolves conflicts, reviews resolution changes and runs the required combined checks. Only then update main. Workers never push directly to main or force-push shared branches.
 7. Update `gaps.md` and parity evidence with the accepted SHA. Release the claim and dispatch the next task. A partially working slice remains partial.
 
-Use short task branches such as `auto/G03-ticket-consumption`. Worktree creation never copies credentials. Keep private runtime state in `.builder/` (ignored by Git). GitHub issues/PRs may mirror tasks, but avoid one API call per heartbeat.
+Use short task branches such as `codex/G03-ticket-consumption`. Worktree creation never copies credentials. Keep private runtime state in `.builder/` (ignored by Git). GitHub issues/PRs may mirror tasks, but avoid one API call per heartbeat.
 
 ## Brief and return format
 
@@ -62,6 +62,8 @@ For a matched trial hold task/question, main model, settings, starting commit an
 
 The user's 10% rule is interpreted as **10% remaining in the five-hour window** (`usedPercent >= 90` for a 300-minute window). Check before dispatch/review/integration milestones, not just after work. Account limits are shared across chats, so another session can consume reserve. Do not spend artificially until a threshold is reached.
 
-When the reserve is reached: stop new Codex dispatch; checkpoint running workers safely; write a private `.builder/HANDOFF.md` and machine-readable waiting state with repo/base/branch/commits, verified work, active tasks, exact next commands, known blockers and observed reset timestamp. Keep credentials and transcripts out. The app heartbeat checks every two hours; after a verified new window and restored allowance, resume the next bounded unfinished task once. Unknown usage does not imply a reset. Do not consume a reset credit automatically.
+When the reserve is reached: stop new Codex dispatch; checkpoint running workers safely; write a private `.builder/HANDOFF.md` and machine-readable waiting state with repo/base/branch/commits, verified work, active tasks, exact next commands, known blockers and observed reset timestamp. Keep credentials and transcripts out. The current local Codex continuation job checks every30minutes and skips when the quota reserve, readiness or project lock prevents dispatch. After a verified new window and restored allowance, resume the next bounded unfinished task once. Unknown usage does not imply a reset. Do not consume a reset credit automatically.
 
-The heartbeat is an app scheduled follow-up attached to this chat. It needs its host/app available to execute, and it cannot guarantee an instantaneous threshold stop between checks. Active turns check at milestones. An OS cron with guessed token counters would not be authoritative.
+The current continuation cron is a local app job for this workspace and invokes the project runner through SSH. It needs its host/app available to execute, and it cannot guarantee an instantaneous threshold stop between checks. Active turns check at milestones. An OS cron with guessed token counters would not be authoritative.
+
+Current project workflow: native Doctor and prompt-audit completed, all builders retain their shared native histories, and project-only session context is available via /port-context. Follow .claude/project-scope.md and private CURRENT-HANDOFF.md. Accepted revisions may overlap only an explicitly accepted prerequisite whose commit is present in the recorded base; concurrent claimed/submitted scopes remain exclusive. This does not mark a draft branch as merged into main.

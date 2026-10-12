@@ -24,6 +24,7 @@ class LauncherTests(unittest.TestCase):
         (self.root / ".claude").mkdir()
         shutil.copy2(REPO / "config/models.json", self.root / "config/models.json")
         shutil.copy2(REPO / ".claude/settings.json", self.root / ".claude/settings.json")
+        shutil.copy2(REPO / ".claude/project-scope.md", self.root / ".claude/project-scope.md")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -64,7 +65,7 @@ class LauncherTests(unittest.TestCase):
     def test_user_cannot_override_permissions_model_tools_or_settings(self):
         for flag in ("--dangerously-skip-permissions", "--permission-mode=bypassPermissions",
                      "--model=other", "--tools=Bash", "--settings=untrusted.json",
-                     "--mcp-config=untrusted.json", "--setting-sources=user", "--bare"):
+                     "--mcp-config=untrusted.json", "--setting-sources=user", "--bare", "--no-session-persistence"):
             with self.subTest(flag=flag), patch("sys.argv", ["builder", flag]):
                 with self.assertRaises(builder.SetupError):
                     builder.main()
@@ -117,12 +118,41 @@ class LauncherTests(unittest.TestCase):
                 self.assertNotIn(key, env)
         command = observed["command"]
         self.assertEqual(command[command.index("--tools") + 1], "Read,Grep,Glob")
-        self.assertEqual(command[command.index("--permission-mode") + 1], "manual")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "bypassPermissions")
         self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
         self.assertNotIn(synthetic, stderr.getvalue())
         self.assertNotIn(synthetic, " ".join(command))
         self.assertEqual(Path(env["CLAUDE_CONFIG_DIR"]), self.root / ".builder/claude")
         change_directory.assert_called_once_with(self.root)
+
+    def test_worker_path_uses_actual_common_repository_for_linked_checkout(self):
+        import subprocess
+        original, linked = self.root / "original", self.root / "active-auth"
+        subprocess.run(["git", "init", "-q", str(original)], check=True)
+        subprocess.run(["git", "-C", str(original), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
+        subprocess.run(["git", "-C", str(original), "worktree", "add", "-q", "-b", "linked-fixture", str(linked)], check=True)
+        with patch.object(builder, "ROOT", linked):
+            self.assertEqual(builder.worker_path("future-worker"), original / ".claude/worktrees/future-worker")
+
+    def test_backup_uses_sol_default_tools_and_same_private_history(self):
+        observed = {}
+        def capture(binary, command, environment):
+            observed.update(command=command, environment=environment)
+        with patch.object(builder, "ROOT", self.root), patch.object(builder, "native_binary", return_value=Path("/bin/true")), \
+                patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "A6API_API_KEY": "synthetic-only"}, clear=True), \
+                patch("sys.argv", ["builder", "--role", "backup"]), patch.object(builder.os, "execve", side_effect=capture), \
+                patch.object(builder.os, "chdir"), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(builder.main(), 0)
+        command = observed["command"]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
+        self.assertEqual(command[command.index("--agent") + 1], "lead")
+        self.assertEqual(command[command.index("--tools") + 1], "default")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "bypassPermissions")
+        self.assertEqual(command[command.index("--append-system-prompt-file") + 1], str(self.root / ".claude/project-scope.md"))
+        self.assertNotIn("--no-session-persistence", command)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", observed["environment"])
+        self.assertEqual(observed["environment"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-6.1-sol")
+        self.assertEqual(observed["environment"]["CLAUDE_CONFIG_DIR"], str(self.root / ".builder/claude"))
 
 
 if __name__ == "__main__":

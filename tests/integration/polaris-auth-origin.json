@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/duckietm/Polaris-Emulator",
+  "commit": "0101ce955069af1bcf1dd4299b03250679d9b1e1",
+  "path": "Emulator/src/main/resources/db/migration/V20260518000000__base_database.sql",
+  "license": "GPL-3.0-only",
+  "tables": {
+    "users": {
+      "sha256": "fbfd4be93bfcb000e0d3b015c4c5ae68f0b57186b604220951631551673f2edd",
+      "startLine": 30464,
+      "endLine": 30511
+    },
+    "bans": {
+      "sha256": "57fa90b649db86330549dcca76397cdf327273e93f2f800f11dbfbc5d2067d7e",
+      "startLine": 779,
+      "endLine": 794
+    }
+  },
+  "data": "No upstream INSERT statements or default accounts; harness generates synthetic rows."
+}

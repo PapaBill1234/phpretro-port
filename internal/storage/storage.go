@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
@@ -78,7 +81,7 @@ func (s *Store) Site(ctx context.Context) (Site, error) {
 }
 
 func ValidateSite(v Site) error {
-	if v.SiteName == "" || v.SettingsRevision == 0 || (v.ActiveTheme != "modern" && v.ActiveTheme != "legacy") || len(v.EnabledLocales) == 0 {
+	if strings.TrimSpace(v.SiteName) == "" || len(v.SiteName) > 100 || !utf8.ValidString(v.SiteName) || strings.IndexFunc(v.SiteName, unicode.IsControl) >= 0 || v.SettingsRevision == 0 || v.SettingsRevision > 9007199254740991 || (v.ActiveTheme != "modern" && v.ActiveTheme != "legacy") || len(v.EnabledLocales) == 0 || len(v.EnabledLocales) > 2 {
 		return errors.New("invalid site settings")
 	}
 	found, seen := false, map[string]bool{}

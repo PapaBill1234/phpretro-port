@@ -1,6 +1,6 @@
 # Polaris / Octane integration contract
 
-Status: proposed implementation contract. Source inspection performed 2026-10-11; no emulator build or integration tests have run. Pin these revisions before development:
+Status: proposed full game integration contract. The existing-account bridge/MFA slice has real MariaDB/Redis tests recorded in auth-integration.md; no full emulator build or game handshake tests have run. Source inspection performed 2026-10-11. Pin these revisions before development:
 
 | Dependency | Revision | Role |
 |---|---|---|
@@ -25,7 +25,7 @@ CMS owns website sessions, staff MFA and CMS authorization. Polaris owns in-game
 
 ## Go boundary
 
-Only `internal/integrations/polaris` may access the bridge database pool or emulator control API. API handlers, themes and domain services receive typed ports, never SQL or emulator secrets.
+The current `internal/polaris` package alone accesses the bridge pool; future control/API operations must remain behind the same typed adapter boundary. API handlers, themes and domain services receive typed ports, never SQL or emulator secrets.
 
 ```go
 // Illustrative boundary: no implementation or final generated API implied.
@@ -42,9 +42,9 @@ type PolarisPort interface {
 }
 ```
 
-Freeze adapter grants and DTOs before implementation. Credentials are verified by the Go adapter against the existing Polaris bcrypt contract; raw hashes never leave that module. The adapter must honor account/IP bans and maintenance eligibility, matching the native paths before issuing a website session or game ticket. Registration must create one game identity, its required defaults, and a CMS mapping with an idempotency record. Use a real transaction where both databases share a connection/principal that permits it, or a durable provisioning workflow with explicit recovery; do not call two independent commits an atomic transaction. Do not assume defaults from one SQL dump without a real pinned-emulator registration fixture. Start the pilot with fixture accounts; provisioning ships after that fixture passes. Go runtime must not apply Polaris schema migrations.
+Freeze adapter grants and DTOs before implementation. Credentials are verified by the Go adapter against the existing Polaris bcrypt contract; raw hashes never leave that module. The current website session checks account/IP/known-machine bans. Maintenance eligibility is an additional game-launch requirement before issuing a game ticket and is not yet implemented; website authentication does not claim full native game-login parity. Registration must create one game identity, its required defaults, and a CMS mapping with an idempotency record. Use a real transaction where both databases share a connection/principal that permits it, or a durable provisioning workflow with explicit recovery; do not call two independent commits an atomic transaction. Do not assume defaults from one SQL dump without a real pinned-emulator registration fixture. Start the pilot with fixture accounts; provisioning ships after that fixture passes. Go runtime must not apply Polaris schema migrations.
 
-CMS session logout clears the CMS session and invokes the emulator revocation/logout path required to clear tickets, revoke Polaris HTTP tokens, and disconnect the client. Password/security changes revoke both systems' sessions. Clear only the matching ticket when revoking a particular launch; administrative revoke-all is a separate action. Do not modify Polaris-owned tables outside adapter operations documented and tested here.
+The current logout clears only the CMS session, because this slice issues no emulator credentials. When game launch is implemented, logout must also invoke the emulator revocation/logout path required to clear tickets, revoke Polaris HTTP tokens, and disconnect the client. Password/security changes revoke both systems' sessions. Clear only the matching ticket when revoking a particular launch; administrative revoke-all is a separate action. Do not modify Polaris-owned tables outside adapter operations documented and tested here.
 
 ## Exact schema and credential compatibility
 

@@ -16,6 +16,8 @@ jobs:
         run: python3 scripts/repo-check.py
       - name: Builder protocol and coordination tests
         run: python3 -m unittest discover -s tests/ops -v
+      - name: Integration fixture safety and provenance
+        run: python3 -m unittest discover -s tests/integration -p 'test_*.py' -v
   go:
     runs-on: ubuntu-latest
     steps:
@@ -52,3 +54,28 @@ jobs:
         working-directory: packages/cms-contracts
       - run: npm ci --ignore-scripts --no-audit --no-fund && npm run check && npm run build
         working-directory: apps/web
+  auth-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Provision an isolated synthetic auth stack
+        run: |
+          python3 scripts/dev-setup.py
+          python3 - <<'PY'
+          from pathlib import Path
+          with Path('.env').open('a') as config:
+              config.write('COMPOSE_PROJECT_NAME=phpretro-auth-dev\nWEB_PORT=8790\nCMS_PUBLIC_ORIGIN=http://127.0.0.1:8790\nCMS_COOKIE_SECURE=false\n')
+          PY
+          docker compose up --build -d --wait
+      - name: Real MariaDB and Redis authentication contracts
+        run: |
+          python3 tests/integration/auth_e2e.py --prepare-schema
+          python3 tests/integration/auth_e2e.py --execute
+      - name: Stop only this job's synthetic stack
+        if: always()
+        run: docker compose down

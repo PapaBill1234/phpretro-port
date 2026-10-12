@@ -5,12 +5,13 @@
   "verified_at": "2026-10-11",
   "native_claude_version": "2.1.287",
   "aliases": {
-    "sonnet": "deepseek-v4.1-flash",
+    "sonnet": "gpt-6.1-sol",
     "haiku": "gpt-6-luna",
     "opus": "gpt-6.1-sol"
   },
   "roles": {
-    "lead": {"alias": "sonnet", "model": "deepseek-v4.1-flash", "effort": "high", "agent": "lead", "tools": "Read,Grep,Glob,Edit,Write,Bash,Agent,Skill,SendMessage,ListAgents"},
+    "lead": {"alias": "sonnet", "model": "gpt-6.1-sol", "effort": "high", "agent": "lead", "tools": "default"},
+    "backup": {"alias": "opus", "model": "gpt-6.1-sol", "effort": "high", "agent": "lead", "tools": "default"},
     "worker": {"alias": "haiku", "model": "gpt-6-luna", "effort": "medium", "agent": "worker", "tools": "Read,Grep,Glob,Edit,Write,Bash,Skill,SendMessage,ListAgents"},
     "reviewer": {"alias": "opus", "model": "gpt-6.1-sol", "effort": "high", "agent": "reviewer", "tools": "Read,Grep,Glob"}
   },
@@ -33,6 +34,7 @@
     "judge_mcp_lead_worker": "passed",
     "native_doctor_installation": "passed",
     "interactive_doctor_prompt_audit": "pending",
-    "provider_billing_rates": "unknown"
+    "provider_billing_rates": "unknown",
+    "interactive_handoff_configuration": "preflight_only_no_inference"
   }
 }

@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import { loadSite, parseSiteSettings, resolveSiteLocale, resolveTheme } from "../src/site.js";
+import { loadSite, mergeSiteResult, parseSiteSettings, resolveSiteLocale, resolveTheme } from "../src/site.js";
 import { messages } from "../src/locales.js";
 
 const settings = { version: "site.v1", siteName: "Synthetic site", activeTheme: "legacy", defaultLocale: "nl", enabledLocales: ["en", "nl"], settingsRevision: 1, health: "ok" };
+
+test("late public reads cannot undo a newer confirmed settings revision, while service failures stay visible", () => {
+  const latest = { status: "available" as const, settings: parseSiteSettings({ ...settings, settingsRevision: 8 }) };
+  const stale = { status: "available" as const, settings: parseSiteSettings({ ...settings, settingsRevision: 7 }) };
+  assert.equal(mergeSiteResult(latest, stale), latest);
+  assert.equal(mergeSiteResult(stale, latest), latest);
+  assert.equal(mergeSiteResult(undefined, stale), stale);
+  assert.deepEqual(mergeSiteResult(latest, { status: "unavailable", reason: "network" }), { status: "unavailable", reason: "network" });
+});
 
 test("API settings select the configured theme and language with deterministic fallbacks", () => {
   const parsed = parseSiteSettings(settings);

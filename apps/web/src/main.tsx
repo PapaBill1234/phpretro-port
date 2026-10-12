@@ -3,7 +3,9 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { siteShell } from "@phpretro-port/cms-contracts";
 import { messages } from "./locales.js";
-import { loadSite, resolveSiteLocale, resolveTheme, type LocaleId, type SiteResult, type ThemeId } from "./site.js";
+import { createAuthController } from "./auth.js";
+import { AccountPanel } from "./AccountPanel.js";
+import { loadSite, mergeSiteResult, resolveSiteLocale, resolveTheme, type LocaleId, type SiteResult, type ThemeId } from "./site.js";
 import "./styles.css";
 
 function Neighborhood({ label }: { label: string }) {
@@ -23,6 +25,7 @@ function App() {
   const [attempt, setAttempt] = useState(0);
   const [previewTheme, setPreviewTheme] = useState<ThemeId>();
   const [previewLocale, setPreviewLocale] = useState<LocaleId>();
+  const [auth] = useState(() => createAuthController());
   const settings = result?.status === "available" ? result.settings : undefined;
   const theme = previewTheme ?? resolveTheme(settings?.activeTheme);
   const locale = resolveSiteLocale(previewLocale, settings);
@@ -35,10 +38,11 @@ function App() {
     let active = true;
     setResult(undefined);
     const timeout = setTimeout(() => controller.abort(), 5000);
-    void loadSite(fetch, controller.signal).then((next) => { if (active) setResult(next); }).finally(() => clearTimeout(timeout));
+    void loadSite(fetch, controller.signal).then((next) => { if (active) setResult((current) => mergeSiteResult(current, next)); }).finally(() => clearTimeout(timeout));
     return () => { active = false; clearTimeout(timeout); controller.abort(); };
   }, [attempt]);
   useEffect(() => { document.documentElement.lang = locale; document.title = shell.siteTitle; }, [locale, shell.siteTitle]);
+  useEffect(() => { void auth.refreshSession(); }, [auth]);
 
   return <div className={`site theme-${theme}`}>
     <a className="skip-link" href="#main">{t.explore}</a>
@@ -49,10 +53,11 @@ function App() {
         {(!settings || settings.enabledLocales.includes("en")) && <option value="en">English</option>}
         {(!settings || settings.enabledLocales.includes("nl")) && <option value="nl">Nederlands</option>}
       </select></label>
+      {(previewTheme || previewLocale) && <button className="preview-reset" onClick={() => { setPreviewTheme(undefined); setPreviewLocale(undefined); }}>{t.resetPreview}</button>}
     </div></div>
     <header className="site-header"><div className="container header-inner">
       <a className="brand" href="/" aria-label={shell.siteTitle}><span className="brand-mark" aria-hidden="true">P</span><span>{shell.siteTitle}<small>COMMUNITY HOTEL</small></span></a>
-      <nav aria-label={locale === "nl" ? "Hoofdnavigatie" : "Main navigation"}>{shell.navigation.map((item) => <a key={item.href} href={item.href}>{item.label}</a>)}</nav>
+      <nav aria-label={locale === "nl" ? "Hoofdnavigatie" : "Main navigation"}>{shell.navigation.map((item) => <a key={item.href} href={item.href}>{item.label}</a>)}<a href="#account">{t.account}</a></nav>
       <span className="build-badge">{t.preview}</span>
     </div></header>
     <main id="main">
@@ -66,6 +71,7 @@ function App() {
           <div className="service-message service-error" role="alert"><span>{t.offline}</span><button onClick={() => setAttempt((value) => value + 1)}>{t.retry}</button></div> :
           <p className={`service-message ${settings?.health === "degraded" ? "service-degraded" : "service-ok"}`} role="status"><span className="status-dot" />{settings?.health === "degraded" ? t.degraded : t.connected}</p>}
       </div>
+      <AccountPanel controller={auth} t={t} onSaved={(saved) => setResult({ status: "available", settings: saved })} />
       <section id="features" className="features container"><div className="section-intro"><span className="overline">{t.explore}</span><h2>{t.foundation}</h2></div><div className="feature-grid">
         {[[t.card1,t.text1,"conversation"],[t.card2,t.text2,"room"],[t.card3,t.text3,"blocks"]].map(([title,text,icon]) => <article className="feature-card" key={icon}><div className={`feature-symbol symbol-${icon}`} aria-hidden="true"><i /><i /><i /></div><h3>{title}</h3><p>{text}</p></article>)}
       </div></section>

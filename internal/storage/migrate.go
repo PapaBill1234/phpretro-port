@@ -35,13 +35,16 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	if _, err := conn.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS cms_schema_migrations (version INT UNSIGNED NOT NULL PRIMARY KEY, checksum CHAR(64) NOT NULL, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"); err != nil {
 		return err
 	}
-	sum := sha256.Sum256([]byte(migrations.SiteSettingsSQL))
-	checksum := hex.EncodeToString(sum[:])
+	checksums := map[int]string{}
+	for _, migration := range migrations.All() {
+		sum := sha256.Sum256([]byte(migration.SQL))
+		checksums[migration.Version] = hex.EncodeToString(sum[:])
+	}
 	rows, err := conn.QueryContext(ctx, "SELECT version, checksum FROM cms_schema_migrations")
 	if err != nil {
 		return err
 	}
-	applied := false
+	applied := map[int]bool{}
 	for rows.Next() {
 		var version int
 		var recorded string
@@ -49,37 +52,47 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 			rows.Close()
 			return err
 		}
-		if version != 1 || recorded != checksum {
+		if expected, known := checksums[version]; !known || recorded != expected {
 			rows.Close()
 			return errors.New("migration version or checksum mismatch")
 		}
-		applied = true
+		applied[version] = true
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
 		return err
 	}
-	if applied {
-		return nil
+	for _, migration := range migrations.All() {
+		if applied[migration.Version] {
+			continue
+		}
+		parts := strings.Split(migration.SQL, "-- seed-transaction\n")
+		if len(parts) > 2 {
+			return errors.New("invalid embedded migration")
+		}
+		for _, statement := range strings.Split(parts[0], "-- next-statement\n") {
+			if _, err := conn.ExecContext(ctx, strings.TrimSpace(statement)); err != nil {
+				return err
+			}
+		}
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if len(parts) == 2 {
+			if _, err = tx.ExecContext(ctx, strings.TrimSpace(parts[1])); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO cms_schema_migrations (version,checksum) VALUES (?,?)", migration.Version, checksums[migration.Version]); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
 	}
-	parts := strings.Split(migrations.SiteSettingsSQL, "-- seed-transaction\n")
-	if len(parts) != 2 {
-		return errors.New("invalid embedded migration")
-	}
-	if _, err := conn.ExecContext(ctx, strings.TrimSpace(parts[0])); err != nil {
-		return err
-	}
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, strings.TrimSpace(parts[1])); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO cms_schema_migrations (version, checksum) VALUES (1, ?)", checksum); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
