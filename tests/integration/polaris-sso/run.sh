@@ -23,7 +23,7 @@ export JAVA_HOME
 timeout 300s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -DskipTests -DskipITs -Dcheckstyle.skip compile test-compile dependency:build-classpath -Dmdep.outputFile="$work/classpath"
 cp="$work/source/Emulator/target/classes:$work/source/Emulator/target/test-classes:$(<"$work/classpath")"
 timeout 120s "$JAVA_HOME/bin/javac" -cp "$cp" -d "$work/source/Emulator/target/test-classes" "$work/source/Emulator/src/test/java/com/eu/habbo/database/StrictConsumerMariaDbProbe.java" "$work/source/Emulator/src/test/java/com/eu/habbo/database/DuplicateTicketMariaDbRegression.java"
-timeout 300s timeout 180s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -Dtest=SsoTicketConsumerBehaviorTest,StrictSsoStartupPreflightTest,GameClientManagerContractTest test
+timeout 300s timeout 180s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -Dtest=SsoTicketConsumerBehaviorTest,StrictSsoStartupPreflightTest,GameClientManagerContractTest,SessionEndpointsRetirementTest test
 fixture_password="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
 docker run --rm -d --name "$name" -e "MARIADB_ROOT_PASSWORD=$fixture_password" -p 127.0.0.1::3306 "${MARIADB_IMAGE:-mariadb:10.11}" --skip-name-resolve >/dev/null
 port="$(docker port "$name" 3306/tcp | awk -F: '{print $NF}')"
