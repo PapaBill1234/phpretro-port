@@ -176,6 +176,19 @@ func TestJWTValidatorSignatureAndParserBoundaries(t *testing.T) {
 	parts[2] = base64.RawURLEncoding.EncodeToString([]byte("invalid-signature"))
 	raw.Signed = strings.Join(parts, ".")
 	assertDeniedJWT(t, f.validator, raw, expected)
+	// An attacker key with the trusted key ID still fails cryptographic verification.
+	attacker, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := jwt.NewWithClaims(jwt.SigningMethodRS256, f.claims())
+	forged.Header["kid"] = "trusted"
+	raw.Signed, err = forged.SignedString(attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDeniedJWT(t, f.validator, raw, expected)
+
 	// These are actual correctly constructed alternative-algorithm tokens, not signing errors.
 	hs := jwt.NewWithClaims(jwt.SigningMethodHS256, f.claims())
 	hs.Header["kid"] = "trusted"
@@ -216,7 +229,12 @@ func TestJWTValidatorSignatureAndParserBoundaries(t *testing.T) {
 		raw.Signed = signedJSON(t, f, header, string(base))
 		assertDeniedJWT(t, f.validator, raw, expected)
 	}
-	raw.Signed = strings.Repeat("a", maxJWT+1)
+	oversizedClaims := f.claims()
+	oversizedClaims["padding"] = strings.Repeat("a", maxJWT)
+	raw = f.raw(t, oversizedClaims)
+	if len(raw.Signed) <= maxJWT {
+		t.Fatal("oversized token fixture too small")
+	}
 	assertDeniedJWT(t, f.validator, raw, expected)
 	raw = f.raw(t, f.claims())
 	parts = strings.Split(raw.Signed, ".")
@@ -237,7 +255,7 @@ func TestJWKSRejectsUnsafeOrAmbiguousKeys(t *testing.T) {
 	}{
 		{"wrong-type", "kty", "EC"},
 		{"empty-alg", "alg", ""}, {"null-use", "use", nil},
-		{"excessive-modulus", "n", base64.RawURLEncoding.EncodeToString(append([]byte{1}, make([]byte, 1024)...))}, {"wrong-alg", "alg", "HS256"}, {"wrong-use", "use", "enc"},
+		{"excessive-modulus", "n", base64.RawURLEncoding.EncodeToString(append(append([]byte{1}, make([]byte, 1023)...), 1))}, {"wrong-alg", "alg", "HS256"}, {"wrong-use", "use", "enc"},
 		{"weak-modulus", "n", base64.RawURLEncoding.EncodeToString([]byte{17})},
 		{"malformed-modulus", "n", "!"}, {"empty-exponent", "e", ""}, {"even-exponent", "e", base64.RawURLEncoding.EncodeToString([]byte{4})},
 		{"zero-leading-exponent", "e", base64.RawURLEncoding.EncodeToString([]byte{0, 3})},
@@ -266,7 +284,13 @@ func TestJWKSRejectsUnsafeOrAmbiguousKeys(t *testing.T) {
 		[]byte(`{"Keys":[` + string(jwk) + `]}`),
 		[]byte(`{"keys":[]}`), []byte("null"), []byte(`{"keys":[null]}`),
 		[]byte(`{"keys":[` + strings.TrimSuffix(string(jwk), "}") + `,"kid":"other"}]}`),
-		[]byte(strings.Repeat(" ", maxJWKS+1)),
+		append([]byte(nil), func() []byte {
+			var document map[string]any
+			json.Unmarshal(good, &document)
+			document["padding"] = strings.Repeat("a", maxJWKS)
+			result, _ := json.Marshal(document)
+			return result
+		}()...),
 	} {
 		if _, e := NewJWTValidator("https://issuer.example", b, nil); e == nil {
 			t.Fatal("ambiguous/bounded JWKS accepted")
