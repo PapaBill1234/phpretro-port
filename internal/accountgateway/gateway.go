@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +63,8 @@ type Config struct {
 	AuthorizationEndpoint, CallbackURI, HostID string
 	Resource, AgentName                        string
 	RequiredScopes                             []string
+	Commit                                     func(Profile, RawToken) error
+	Hint                                       func(string) string
 	Exchange                                   Exchange
 	Validator                                  Validator
 	Now                                        func() time.Time
@@ -142,12 +143,7 @@ func validateConfig(c Config) error {
 	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return ErrInvalid
 	}
-	cb, e := url.Parse(c.CallbackURI)
-	if e != nil || cb.Scheme != "http" || cb.Hostname() != "127.0.0.1" || cb.User != nil || cb.RawQuery != "" || cb.Fragment != "" || cb.Path != "/auth/callback" {
-		return ErrInvalid
-	}
-	p, e := strconv.Atoi(cb.Port())
-	if e != nil || p < 1 || p > 65535 {
+	if !validCallback(c.CallbackURI) {
 		return ErrInvalid
 	}
 	if strings.TrimSpace(c.HostID) == "" {
@@ -238,6 +234,7 @@ func (g *Gateway) Begin(label string) (Pending, error) {
 	u, _ := url.Parse(g.cfg.AuthorizationEndpoint)
 	q := u.Query()
 	q.Del("agent_name_hint")
+	q.Del("id_token_hint")
 	q.Set("response_type", "code")
 	q.Set("state", state)
 	q.Set("nonce", nonce)
@@ -252,6 +249,10 @@ func (g *Gateway) Begin(label string) (Pending, error) {
 	}
 	if !returning {
 		q.Set("agent_name_hint", g.cfg.AgentName)
+	} else if g.cfg.Hint != nil {
+		if hint := g.cfg.Hint(label); hint != "" {
+			q.Set("id_token_hint", hint)
+		}
 	}
 	u.RawQuery = q.Encode()
 	return Pending{Label: label, AuthorizeURL: u.String(), ExpiresAt: exp}, nil
@@ -336,6 +337,12 @@ func (g *Gateway) Callback(label, state, code, returnedClient, redirect, provide
 	}
 	old := g.profiles[label]
 	p := Profile{Label: label, HostID: t.hostID, ClientID: id.ClientID, Identity: id.Subject, Active: old.Active}
+	if g.cfg.Commit != nil {
+		if err := g.cfg.Commit(p, raw); err != nil {
+			delete(g.pending, label)
+			return Profile{}, ErrUnavailable
+		}
+	}
 	g.profiles[label] = p
 	delete(g.pending, label)
 	return p, nil
@@ -394,4 +401,35 @@ func token(n int) (string, error) {
 		return "", e
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// Cancel fences late callback results before they can be published.
+func (g *Gateway) Cancel(label string) { g.mu.Lock(); defer g.mu.Unlock(); delete(g.pending, label) }
+
+// RestoreProfiles restores registration metadata, never historical transaction proof.
+func (g *Gateway) RestoreProfiles(profiles []Profile) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.profiles) != 0 || len(g.pending) != 0 || len(profiles) > 2 {
+		return ErrInvalid
+	}
+	restored := map[string]Profile{}
+	active := 0
+	for _, p := range profiles {
+		if p.Label == "" || len(p.Label) > 256 || p.HostID != g.cfg.HostID || p.ClientID == "" || p.ClientID == initialClient || p.Identity == "" {
+			return ErrInvalid
+		}
+		if _, ok := restored[p.Label]; ok {
+			return ErrInvalid
+		}
+		if p.Active {
+			active++
+		}
+		restored[p.Label] = p
+	}
+	if active > 1 {
+		return ErrInvalid
+	}
+	g.profiles = restored
+	return nil
 }

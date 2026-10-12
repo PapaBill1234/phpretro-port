@@ -1,0 +1,9 @@
+# Local account vault
+
+`internal/accountvault` stores at most two OAuth account records in an AES-256-GCM encrypted `state.bin`, with a separate random 32-byte `vault.key` and an exclusive lifetime `vault.lock`. Open it with an absolute path to a private directory; the vault creates only the final directory (0700) and its files (0600). Existing path components must be real directories, not symlinks. The process lock is advisory and nonblocking: a second opener fails rather than attempting PID-based recovery.
+
+The encrypted plaintext carries schema version 1 and a stable `urn:uuid:` host ID. Saves validate account labels, credentials, scopes, pending logout state and active-account selection before atomically replacing the ciphertext. Account/state JSON and Go formatting are redacted; never add credential-bearing diagnostics. The package rejects malformed, duplicate/case-aliased, unknown or trailing JSON fields and does not recover partial/corrupt ciphertext.
+
+A `NeedsSignIn` record must have no credential strings; a pending `logout` record may retain tokens for retry but cannot be active. Expired tokens may remain stored; callers must prevent using expired accounts. This package does not implement OAuth login, refresh-token rotation, token revocation, or UI selection/expiry checks, and is not by itself proof of complete account authentication behavior.
+
+Corrected acceptance contract: signed-out accounts retain issued client/subject mapping while tokens are cleared. After any write failure the vault refuses more saves until closed/reopened. A failure before rename preserves prior disk state; a failure after rename or directory fsync has an uncertain durability outcome and may leave the candidate on disk. The runtime blocks all credential use and requires recovery. Existing state without its key, or existing key without state, is rejected without silently replacing the host identity.
