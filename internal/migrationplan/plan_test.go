@@ -48,3 +48,30 @@ func contains(a []string, s string) bool {
 	}
 	return false
 }
+
+func TestParseRejectsCaseAliases(t *testing.T) {
+	cases := []string{
+		`{"version":999,"Version":1}`,
+		`{"Version":1,"version":1}`,
+		`{"version":1,"legacy_users":[{"id":1,"ID":2}]}`,
+		`{"version":1,"legacy_users":[{"ID":2,"id":1}]}`,
+		`{"version":1,"legacy_users":[{"id":1,"username":"a","proposed_target_id":2,"Proposed_target_id":3}]}`,
+		`{"version":1,"target_users":[{"id":1,"Username":"x"}]}`,
+		`{"version":1,"relationships":[{"kind":"friend","source_id":1,"Target_id":2}]}`,
+		`{"version":1,"domains":[{"name":"x","Supported":true}]}`,
+		`{"version":1,"schema":{"target":"mariadb","Target":"mysql"}}`,
+		`{"version":1,"schema":{"collation":"x","Collation_verified":true}}`,
+		`{"version":1,"Version":2}`,
+	}
+	for _, input := range cases {
+		if _, err := Parse(strings.NewReader(input)); err == nil || err.Error() != "invalid_input" {
+			t.Errorf("Parse(%s) error=%v, want invalid_input", input, err)
+		}
+	}
+}
+func TestParseAcceptsCanonicalObjectKeys(t *testing.T) {
+	input := `{"version":1,"legacy_users":[{"id":1,"username":"A","proposed_target_id":42}],"target_users":[{"id":42,"username":"A"}],"relationships":[{"kind":"friend","source_id":1,"target_id":42}],"domains":[{"name":"group","supported":true}],"schema":{"target":"mariadb","collation":"example","collation_verified":true}}`
+	if _, err := Parse(strings.NewReader(input)); err != nil {
+		t.Fatalf("canonical keys rejected: %v", err)
+	}
+}

@@ -91,6 +91,9 @@ func Parse(r io.Reader) (Input, error) {
 	if d.Decode(&extra) != io.EOF {
 		return Input{}, fmt.Errorf("trailing_json")
 	}
+	if e := validateExactKeys(b); e != nil {
+		return Input{}, e
+	}
 	var in Input
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -105,6 +108,68 @@ func Parse(r io.Reader) (Input, error) {
 	}
 	return in, nil
 }
+func validateExactKeys(b []byte) error {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(b, &root) != nil {
+		return fmt.Errorf("invalid_input")
+	}
+	if err := exactKeys(root, "version", "legacy_users", "target_users", "relationships", "domains", "schema"); err != nil {
+		return err
+	}
+	checkRows := func(raw json.RawMessage, allowed ...string) error {
+		if len(raw) == 0 || string(raw) == "null" {
+			return nil
+		}
+		var rows []json.RawMessage
+		if json.Unmarshal(raw, &rows) != nil {
+			return nil
+		}
+		for _, row := range rows {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(row, &object) != nil {
+				continue
+			}
+			if err := exactKeys(object, allowed...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := checkRows(root["legacy_users"], "id", "username", "proposed_target_id"); err != nil {
+		return err
+	}
+	if err := checkRows(root["target_users"], "id", "username"); err != nil {
+		return err
+	}
+	if err := checkRows(root["relationships"], "kind", "source_id", "target_id"); err != nil {
+		return err
+	}
+	if err := checkRows(root["domains"], "name", "supported"); err != nil {
+		return err
+	}
+	if raw := root["schema"]; len(raw) != 0 && string(raw) != "null" {
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(raw, &schema) == nil {
+			if err := exactKeys(schema, "target", "collation", "collation_verified"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func exactKeys(object map[string]json.RawMessage, allowed ...string) error {
+	set := make(map[string]bool, len(allowed))
+	for _, key := range allowed {
+		set[key] = true
+	}
+	for key := range object {
+		if !set[key] {
+			return fmt.Errorf("invalid_input")
+		}
+	}
+	return nil
+}
+
 func walk(d *json.Decoder, depth int) error {
 	if depth > MaxDepth {
 		return fmt.Errorf("nesting_limit")
