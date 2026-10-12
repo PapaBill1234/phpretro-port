@@ -1,3 +1,7 @@
+## G06.1 process-cleanup race — 2026-10-12
+
+The cleanup regression check uses the real leader/grandchild launch and unchanged production `terminate_group`. Test-local `/proc/<pid>/stat` observation maps only `FileNotFoundError`/`ProcessLookupError` to `gone`; other I/O/permission errors and malformed contents propagate, and non-zombie live states remain rejected. Accepted `Z`/`gone` means not running; it does not prove the grandchild was reaped. Focused, complete ops-suite and predetermined repeated real-cleanup test results are recorded in the worker handoff after execution. This does not enable the game or resolve full-port/budget limits.
+
 # Checkpoint validation — 2026-10-11
 
 This is a runnable development foundation, not the completed CMS/game port.
