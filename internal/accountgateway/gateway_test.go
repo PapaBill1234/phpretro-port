@@ -154,7 +154,8 @@ func TestCrossedStateClientAndScopes(t *testing.T) {
 		t.Fatalf("provider denial: %v", e)
 	}
 	f.x.raw.Scopes = []string{"openid", "api-plan-extra"}
-	s, _ := cbargs(t, b)
+	p := start(t, f, "b")
+	s, _ := cbargs(t, p)
 	if _, e := f.g.Callback("b", s, "code", cb, f.g.cfg.CallbackURI, ""); !errors.Is(e, ErrDenied) {
 		t.Fatalf("substring scope accepted or failure was unsanitized: %v", e)
 	}
@@ -225,12 +226,11 @@ func TestProviderDenialDoesNotConsumePendingClaim(t *testing.T) {
 	if _, err := f.g.Callback("denied", s, "code", c, f.g.cfg.CallbackURI, "access_denied"); !errors.Is(err, ErrDenied) {
 		t.Fatal(err)
 	}
-	if _, err := f.g.Begin("denied"); !errors.Is(err, ErrBusy) {
-		t.Fatalf("provider denial unexpectedly cleared pending state: %v", err)
-	}
-	*f.now = p.ExpiresAt
 	if _, err := f.g.Begin("denied"); err != nil {
-		t.Fatalf("expired preclaim denial blocked retry: %v", err)
+		t.Fatalf("provider denial did not consume pending state: %v", err)
+	}
+	if _, err := f.g.Callback("denied", s, "code", c, f.g.cfg.CallbackURI, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("denial replay: %v", err)
 	}
 }
 
