@@ -7,9 +7,18 @@ PIN=0101ce955069af1bcf1dd4299b03250679d9b1e1
 PATCH="$(pwd)/integrations/polaris/patches/0001-strict-sso-consumer.patch"
 [[ -x "$JAVA_HOME/bin/java" && -x "$MAVEN_BIN" && -f "$PATCH" ]] || { echo 'Java 25, Maven, or canonical patch missing' >&2; exit 2; }
 git -C "$POLARIS_SOURCE" cat-file -e "$PIN^{commit}"
+evidence_dir="${G03_EVIDENCE_DIR:-}"
+if [[ -n "$evidence_dir" ]]; then
+  evidence_dir="$(realpath -m "$evidence_dir")"
+  builder_dir="$(realpath .builder)"
+  [[ "$evidence_dir" == "$builder_dir/"* ]] || { echo 'Evidence must stay in this worktree private .builder directory' >&2; exit 2; }
+  mkdir -p "$evidence_dir"
+  chmod 700 "$evidence_dir"
+fi
 work="$(mktemp -d "$(pwd)/.builder/polaris-sso.XXXXXX")"
+container_id=""
 name="phpretro-sso-${RANDOM}-$$"
-cleanup(){ docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"; }
+cleanup(){ if [[ -n "$container_id" ]]; then timeout 10s docker rm -f "$container_id" >/dev/null 2>&1 || true; fi; rm -rf "$work"; }
 stop(){ trap - EXIT INT TERM; cleanup; exit 130; }
 trap cleanup EXIT
 trap stop INT TERM
@@ -19,19 +28,27 @@ git -C "$work/source" apply --check "$PATCH"
 git -C "$work/source" apply "$PATCH"
 cp tests/integration/polaris-sso/StrictConsumerMariaDbProbe.java "$work/source/Emulator/src/test/java/com/eu/habbo/database/"
 cp tests/integration/polaris-sso/DuplicateTicketMariaDbRegression.java "$work/source/Emulator/src/test/java/com/eu/habbo/database/"
+cp tests/integration/polaris-sso/RecoveryMariaDbProbe.java "$work/source/Emulator/src/test/java/com/eu/habbo/session/"
 export JAVA_HOME
 timeout 300s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -DskipTests -DskipITs -Dcheckstyle.skip compile test-compile dependency:build-classpath -Dmdep.outputFile="$work/classpath"
 cp="$work/source/Emulator/target/classes:$work/source/Emulator/target/test-classes:$(<"$work/classpath")"
 timeout 120s "$JAVA_HOME/bin/javac" -cp "$cp" -d "$work/source/Emulator/target/test-classes" "$work/source/Emulator/src/test/java/com/eu/habbo/database/StrictConsumerMariaDbProbe.java" "$work/source/Emulator/src/test/java/com/eu/habbo/database/DuplicateTicketMariaDbRegression.java"
-timeout 300s timeout 180s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -Dtest=SsoTicketConsumerBehaviorTest,StrictSsoStartupPreflightTest,GameClientManagerContractTest,SessionEndpointsRetirementTest test
+timeout 180s "$MAVEN_BIN" -q -f "$work/source/Emulator/pom.xml" -Dtest=SsoTicketConsumerBehaviorTest,StrictSsoStartupPreflightTest,GameClientManagerContractTest,SessionEndpointsRetirementTest,SessionRecoveryServiceTest test
+if [[ -n "$evidence_dir" ]]; then
+  cp -R "$work/source/Emulator/target/surefire-reports" "$evidence_dir/"
+  find "$evidence_dir/surefire-reports" -type f -exec chmod 600 {} +
+fi
 fixture_password="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
-docker run --rm -d --name "$name" -e "MARIADB_ROOT_PASSWORD=$fixture_password" -p 127.0.0.1::3306 "${MARIADB_IMAGE:-mariadb:10.11}" --skip-name-resolve >/dev/null
-port="$(docker port "$name" 3306/tcp | awk -F: '{print $NF}')"
-for i in $(seq 1 60); do docker exec "$name" mariadb-admin --protocol=tcp -uroot -p"$fixture_password" ping --silent >/dev/null 2>&1 && break; sleep 1; done
-docker exec "$name" mariadb-admin --protocol=tcp -uroot -p"$fixture_password" ping --silent >/dev/null
-docker exec "$name" mariadb --protocol=tcp -uroot -p"$fixture_password" -e "CREATE DATABASE strict_probe; CREATE DATABASE duplicate_probe;"
+container_id="$(timeout 30s docker run --rm -d --name "$name" --label "phpretro.fixture=$name" -e "MARIADB_ROOT_PASSWORD=$fixture_password" -p 127.0.0.1::3306 "${MARIADB_IMAGE:-mariadb:10.11}" --skip-name-resolve)"
+port="$(timeout 10s docker port "$container_id" 3306/tcp | awk -F: '{print $NF}')"
+for i in $(seq 1 60); do timeout 5s docker exec "$container_id" mariadb-admin --protocol=tcp -uroot -p"$fixture_password" ping --silent >/dev/null 2>&1 && break; sleep 1; done
+timeout 5s docker exec "$container_id" mariadb-admin --protocol=tcp -uroot -p"$fixture_password" ping --silent >/dev/null
+timeout 5s docker exec "$container_id" mariadb --protocol=tcp -uroot -p"$fixture_password" -e "CREATE DATABASE strict_probe; CREATE DATABASE duplicate_probe; CREATE DATABASE recovery_probe;"
 export G03_TEST_PASSWORD="$fixture_password"
 export G03_TEST_DSN="jdbc:mariadb://127.0.0.1:${port}/strict_probe"
 timeout 120s "$JAVA_HOME/bin/java" -cp "$cp" com.eu.habbo.database.StrictConsumerMariaDbProbe
 export G03_TEST_DSN="jdbc:mariadb://127.0.0.1:${port}/duplicate_probe"
 timeout 120s "$JAVA_HOME/bin/java" -cp "$cp" com.eu.habbo.database.DuplicateTicketMariaDbRegression
+
+export G03_TEST_DSN="jdbc:mariadb://127.0.0.1:${port}/recovery_probe"
+timeout 120s "$JAVA_HOME/bin/java" -cp "$cp" com.eu.habbo.session.RecoveryMariaDbProbe "$work/source/Emulator/src/main/resources/db/migration/V20260816130000__session_recovery_tickets.sql"

@@ -476,6 +476,255 @@ index 94bbb1f..236914f 100644
      }
  
      static void handleRefresh(ChannelHandlerContext ctx, FullHttpRequest req, JsonObject body, String ip) {
+diff --git a/Emulator/src/main/java/com/eu/habbo/session/JdbcRecoveryTicketStore.java b/Emulator/src/main/java/com/eu/habbo/session/JdbcRecoveryTicketStore.java
+index b0b4282..c0845af 100644
+--- a/Emulator/src/main/java/com/eu/habbo/session/JdbcRecoveryTicketStore.java
++++ b/Emulator/src/main/java/com/eu/habbo/session/JdbcRecoveryTicketStore.java
+@@ -1,5 +1,6 @@
+ package com.eu.habbo.session;
+ 
++import com.zaxxer.hikari.HikariDataSource;
+ import java.sql.Connection;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+@@ -8,15 +9,16 @@ import java.sql.Timestamp;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Map;
++import java.util.Objects;
+ import java.util.OptionalInt;
+-import javax.sql.DataSource;
+ 
+ final class JdbcRecoveryTicketStore implements RecoveryTicketStore {
+     private static final int CHECKPOINT_BATCH_SIZE = 500;
+-    private final DataSource dataSource;
++    private final HikariDataSource dataSource;
+ 
+-    JdbcRecoveryTicketStore(DataSource dataSource) {
+-        this.dataSource = dataSource;
++    JdbcRecoveryTicketStore(HikariDataSource dataSource) {
++        this.dataSource = Objects.requireNonNull(dataSource);
+     }
+ 
+     @Override
+@@ -37,36 +39,38 @@ final class JdbcRecoveryTicketStore implements RecoveryTicketStore {
+     }
+ 
+     @Override
+-    public void activate(Iterable<Integer> userIds, Instant expiresAt) {
+-        List<Integer> ids = new ArrayList<>();
+-        userIds.forEach(ids::add);
+-        if (ids.isEmpty()) {
+-            return;
+-        }
++    public void activate(Map<Integer, byte[]> generations, Instant expiresAt) {
++        List<Map.Entry<Integer, byte[]>> entries = new ArrayList<>(generations.entrySet());
++        if (entries.isEmpty()) return;
+         try (Connection connection = dataSource.getConnection()) {
++            boolean previousAutoCommit = connection.getAutoCommit();
+             connection.setAutoCommit(false);
++            boolean resolved = false;
+             try {
+-                for (int offset = 0; offset < ids.size(); offset += CHECKPOINT_BATCH_SIZE) {
+-                    List<Integer> batch = ids.subList(offset, Math.min(ids.size(), offset + CHECKPOINT_BATCH_SIZE));
+-                    String placeholders = String.join(",", java.util.Collections.nCopies(batch.size(), "?"));
++                for (int offset = 0; offset < entries.size(); offset += CHECKPOINT_BATCH_SIZE) {
++                    List<Map.Entry<Integer, byte[]>> batch =
++                            entries.subList(offset, Math.min(entries.size(), offset + CHECKPOINT_BATCH_SIZE));
++                    String predicates = String.join(" OR ",
++                            java.util.Collections.nCopies(batch.size(), "(user_id = ? AND token_hash = ?)"));
+                     String sql = "UPDATE session_recovery_tickets SET recoverable_until = ? "
+-                            + "WHERE consumed_at IS NULL AND recoverable_until IS NULL AND user_id IN ("
+-                            + placeholders
+-                            + ")";
++                            + "WHERE consumed_at IS NULL AND recoverable_until IS NULL AND (" + predicates + ")";
+                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                         statement.setTimestamp(1, Timestamp.from(expiresAt));
+-                        for (int index = 0; index < batch.size(); index++) {
+-                            statement.setInt(index + 2, batch.get(index));
++                        int parameter = 2;
++                        for (Map.Entry<Integer, byte[]> entry : batch) {
++                            statement.setInt(parameter++, entry.getKey());
++                            statement.setBytes(parameter++, entry.getValue());
+                         }
+                         statement.executeUpdate();
+                     }
+                 }
+                 connection.commit();
++                resolved = true;
+             } catch (SQLException exception) {
+-                connection.rollback();
++                resolved = rollbackOrDiscard(connection, exception);
+                 throw exception;
+             } finally {
+-                connection.setAutoCommit(true);
++                if (resolved && !connection.isClosed()) connection.setAutoCommit(previousAutoCommit);
+             }
+         } catch (SQLException exception) {
+             throw new SessionRecoveryException("Could not checkpoint recovery tickets", exception);
+@@ -76,11 +80,14 @@ final class JdbcRecoveryTicketStore implements RecoveryTicketStore {
+     @Override
+     public OptionalInt consume(byte[] tokenHash, Instant now) {
+         try (Connection connection = dataSource.getConnection()) {
++            boolean previousAutoCommit = connection.getAutoCommit();
+             connection.setAutoCommit(false);
++            boolean resolved = false;
+             try {
+                 int userId = selectForUpdate(connection, tokenHash, now);
+                 if (userId == 0) {
+                     connection.rollback();
++                    resolved = true;
+                     return OptionalInt.empty();
+                 }
+                 try (PreparedStatement statement = connection.prepareStatement(
+@@ -89,25 +96,53 @@ final class JdbcRecoveryTicketStore implements RecoveryTicketStore {
+                     statement.setInt(2, userId);
+                     if (statement.executeUpdate() != 1) {
+                         connection.rollback();
++                        resolved = true;
+                         return OptionalInt.empty();
+                     }
+                 }
+                 connection.commit();
++                resolved = true;
+                 return OptionalInt.of(userId);
+             } catch (SQLException exception) {
+-                connection.rollback();
++                resolved = rollbackOrDiscard(connection, exception);
+                 throw exception;
+             } finally {
+-                connection.setAutoCommit(true);
++                if (resolved && !connection.isClosed()) connection.setAutoCommit(previousAutoCommit);
+             }
+         } catch (SQLException exception) {
+             throw new SessionRecoveryException("Could not consume a recovery ticket", exception);
+         }
+     }
+ 
++    private boolean rollbackOrDiscard(Connection connection, SQLException original) {
++        try {
++            connection.rollback();
++            return true;
++        } catch (SQLException | RuntimeException rollbackFailure) {
++            suppress(original, rollbackFailure);
++            try {
++                connection.abort(Runnable::run);
++            } catch (SQLException | RuntimeException abortFailure) {
++                suppress(original, abortFailure);
++            } finally {
++                // Eviction is independent of abort success; unresolved work must never be reset or pooled.
++                try {
++                    dataSource.evictConnection(connection);
++                } catch (RuntimeException evictionFailure) {
++                    suppress(original, evictionFailure);
++                }
++            }
++            return false;
++        }
++    }
++
++    private static void suppress(SQLException original, Throwable cleanupFailure) {
++        if (original != cleanupFailure) original.addSuppressed(cleanupFailure);
++    }
++
+     private static int selectForUpdate(Connection connection, byte[] tokenHash, Instant now) throws SQLException {
+         try (PreparedStatement statement = connection.prepareStatement("SELECT user_id FROM session_recovery_tickets "
+-                + "WHERE token_hash = ? AND consumed_at IS NULL AND recoverable_until >= ? FOR UPDATE")) {
++                + "WHERE token_hash = ? AND consumed_at IS NULL AND recoverable_until > ? FOR UPDATE")) {
+             statement.setBytes(1, tokenHash);
+             statement.setTimestamp(2, Timestamp.from(now));
+             try (ResultSet result = statement.executeQuery()) {
+diff --git a/Emulator/src/main/java/com/eu/habbo/session/RecoveryTicketStore.java b/Emulator/src/main/java/com/eu/habbo/session/RecoveryTicketStore.java
+index 6b4dfb7..dfb7d05 100644
+--- a/Emulator/src/main/java/com/eu/habbo/session/RecoveryTicketStore.java
++++ b/Emulator/src/main/java/com/eu/habbo/session/RecoveryTicketStore.java
+@@ -1,12 +1,13 @@
+ package com.eu.habbo.session;
+ 
+ import java.time.Instant;
++import java.util.Map;
+ import java.util.OptionalInt;
+ 
+ interface RecoveryTicketStore {
+     void replace(int userId, byte[] tokenHash, Instant issuedAt);
+ 
+-    void activate(Iterable<Integer> userIds, Instant expiresAt);
++    void activate(Map<Integer, byte[]> generations, Instant expiresAt);
+ 
+     OptionalInt consume(byte[] tokenHash, Instant now);
+ }
+diff --git a/Emulator/src/main/java/com/eu/habbo/session/SessionRecoveryService.java b/Emulator/src/main/java/com/eu/habbo/session/SessionRecoveryService.java
+index 8a3dcbd..07a3031 100644
+--- a/Emulator/src/main/java/com/eu/habbo/session/SessionRecoveryService.java
++++ b/Emulator/src/main/java/com/eu/habbo/session/SessionRecoveryService.java
+@@ -6,11 +6,12 @@ import java.security.SecureRandom;
+ import java.time.Clock;
+ import java.time.Duration;
+ import java.util.Base64;
+-import java.util.HashSet;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.Map;
+ import java.util.Objects;
+ import java.util.OptionalInt;
+-import java.util.Set;
+-import java.util.concurrent.ConcurrentHashMap;
+ 
+ public final class SessionRecoveryService {
+     private static final int TOKEN_BYTES = 32;
+@@ -19,7 +20,8 @@ public final class SessionRecoveryService {
+     private final Clock clock;
+     private final SecureRandom random;
+     private final Duration recoveryWindow;
+-    private final Set<Integer> issuedUsers = ConcurrentHashMap.newKeySet();
++    private final Object issuanceLock = new Object();
++    private final Map<Integer, byte[]> issuedGenerations = new HashMap<>();
+ 
+     SessionRecoveryService(RecoveryTicketStore store, Clock clock, SecureRandom random, Duration recoveryWindow) {
+         this.store = Objects.requireNonNull(store);
+@@ -35,20 +37,32 @@ public final class SessionRecoveryService {
+         byte[] token = new byte[TOKEN_BYTES];
+         random.nextBytes(token);
+         String encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(token);
+-        store.replace(userId, digest(encoded), clock.instant());
+-        issuedUsers.add(userId);
++        byte[] tokenHash = digest(encoded);
++        synchronized (issuanceLock) {
++            store.replace(userId, tokenHash, clock.instant());
++            issuedGenerations.put(userId, tokenHash.clone());
++        }
+         return encoded;
+     }
+ 
+     public void checkpoint(Iterable<Integer> userIds) {
+-        Set<Integer> eligibleUsers = new HashSet<>();
+-        for (int userId : userIds) {
+-            if (issuedUsers.contains(userId)) {
+-                eligibleUsers.add(userId);
++        Map<Integer, byte[]> eligibleGenerations = new LinkedHashMap<>();
++        synchronized (issuanceLock) {
++            for (int userId : userIds) {
++                byte[] generation = issuedGenerations.get(userId);
++                if (generation != null) {
++                    eligibleGenerations.put(userId, generation.clone());
++                }
++            }
++        }
++        store.activate(eligibleGenerations, clock.instant().plus(recoveryWindow));
++        synchronized (issuanceLock) {
++            for (Map.Entry<Integer, byte[]> entry : eligibleGenerations.entrySet()) {
++                if (Arrays.equals(issuedGenerations.get(entry.getKey()), entry.getValue())) {
++                    issuedGenerations.remove(entry.getKey());
++                }
+             }
+         }
+-        store.activate(eligibleUsers, clock.instant().plus(recoveryWindow));
+-        issuedUsers.removeAll(eligibleUsers);
+     }
+ 
+     public OptionalInt consume(String token) {
 diff --git a/Emulator/src/test/java/com/eu/habbo/StrictSsoStartupPreflightTest.java b/Emulator/src/test/java/com/eu/habbo/StrictSsoStartupPreflightTest.java
 new file mode 100644
 index 0000000..819a0ef
@@ -777,3 +1026,56 @@ index 0000000..73bd9b4
 +        }
 +    }
 +}
+diff --git a/Emulator/src/test/java/com/eu/habbo/session/SessionRecoveryServiceTest.java b/Emulator/src/test/java/com/eu/habbo/session/SessionRecoveryServiceTest.java
+index 369ed42..981f6ef 100644
+--- a/Emulator/src/test/java/com/eu/habbo/session/SessionRecoveryServiceTest.java
++++ b/Emulator/src/test/java/com/eu/habbo/session/SessionRecoveryServiceTest.java
+@@ -64,28 +64,39 @@ class SessionRecoveryServiceTest {
+ 
+     private static final class FakeStore implements RecoveryTicketStore {
+         private final Map<Integer, byte[]> hashByUser = new HashMap<>();
+-        private byte[] activeHash;
+-        private boolean consumed;
++        private final Map<Integer, Instant> expiryByUser = new HashMap<>();
++        private final java.util.Set<Integer> consumedUsers = new java.util.HashSet<>();
+         private final java.util.Set<Integer> activatedUsers = new java.util.HashSet<>();
+ 
+         @Override
+         public void replace(int userId, byte[] tokenHash, Instant issuedAt) {
+             hashByUser.put(userId, tokenHash.clone());
++            expiryByUser.remove(userId);
++            consumedUsers.remove(userId);
+         }
+ 
+         @Override
+-        public void activate(Iterable<Integer> userIds, Instant expiresAt) {
+-            for (int userId : userIds) {
+-                activatedUsers.add(userId);
+-                activeHash = hashByUser.get(userId);
++        public void activate(Map<Integer, byte[]> generations, Instant expiresAt) {
++            for (Map.Entry<Integer, byte[]> entry : generations.entrySet()) {
++                int id = entry.getKey();
++                if (Arrays.equals(hashByUser.get(id), entry.getValue())
++                        && !consumedUsers.contains(id) && !expiryByUser.containsKey(id)) {
++                    activatedUsers.add(id);
++                    expiryByUser.put(id, expiresAt);
++                }
+             }
+         }
+ 
+         @Override
+         public OptionalInt consume(byte[] tokenHash, Instant now) {
+-            if (!consumed && activeHash != null && Arrays.equals(activeHash, tokenHash)) {
+-                consumed = true;
+-                return OptionalInt.of(42);
++            for (Map.Entry<Integer, byte[]> entry : hashByUser.entrySet()) {
++                int id = entry.getKey();
++                Instant expiry = expiryByUser.get(id);
++                if (!consumedUsers.contains(id) && expiry != null && now.isBefore(expiry)
++                        && Arrays.equals(entry.getValue(), tokenHash)) {
++                    consumedUsers.add(id);
++                    return OptionalInt.of(id);
++                }
+             }
+             return OptionalInt.empty();
+         }
