@@ -827,7 +827,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_terminate_pid_group_never_kills_replaced_pid(self):
         signals = []
-        identities = ["111", "222"]  # leader start-tick changes after TERM
+        identities = ["111", "111", "222"]  # stable snapshot, changes after TERM
         def fake_identity(pid):
             return identities.pop(0) if identities else "222"
         with mock.patch.object(dash, "pid_identity", side_effect=fake_identity), \
@@ -844,7 +844,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_terminate_pid_group_reclaims_known_orphan_after_leader_reaped(self):
         events = []
-        leader = {"seq": ["555", None]}       # matches, then reaped
+        leader = {"seq": ["555", "555", None]}  # stable snapshot, then reaped
         orphan = {"seq": ["777", "777", "777"]}
         def fake_identity(pid):
             if pid == 5000:
@@ -865,6 +865,15 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn(("group", signal.SIGKILL), events)  # reaped leader: no group KILL
         self.assertIn(("pid", 6000, signal.SIGKILL), events)  # verified orphan reclaimed
         self.assertNotIn(("pid", 5000, signal.SIGKILL), events)
+
+    def test_terminate_pid_group_discards_snapshot_after_leader_replacement(self):
+        with mock.patch.object(dash, "pid_identity", side_effect=["111", "222"]), \
+                mock.patch.object(dash, "_group_members", return_value={4321: "222", 5500: "333"}), \
+                mock.patch.object(dash, "_killpg") as group_signal, \
+                mock.patch.object(dash, "_kill_verified") as member_signal:
+            self.assertFalse(dash.terminate_pid_group(4321, "111", 3.0))
+        group_signal.assert_not_called()
+        member_signal.assert_not_called()
 
     def test_terminate_pid_group_reclaims_real_descendants(self):
         pid_file = self.root / "gc.pid"

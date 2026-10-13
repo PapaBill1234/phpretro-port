@@ -410,6 +410,10 @@ def terminate_pid_group(pid, expected_start, term_grace: float) -> bool:
     if not _identity_matches(pid, expected_start):
         return False
     known = _group_members(pid)
+    # The /proc scan may outlive the original leader. Discard the snapshot if
+    # that PID was reaped/reused; none of those members can be trusted as ours.
+    if not _identity_matches(pid, expected_start):
+        return False
     known[pid] = str(expected_start)
     _killpg(pid, signal.SIGTERM)
     deadline = time.time() + term_grace
