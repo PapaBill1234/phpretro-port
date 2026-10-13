@@ -22,6 +22,31 @@ REPO_PIN = "a" * 40
 BUN_VERSION = "1.4.2"
 NODE_VERSION = "v24.15.0"
 
+# Regression fixture for the generated DeepSeek chat-compat module. Run under
+# the available Bun/Node runtimes when present; it never hits the network.
+COMPAT_FIXTURE = r'''
+import assert from 'node:assert/strict';
+import {compatibleFetch} from './deepseek-chat-compat.mjs';
+const calls=[]; const response=new Response('data: chunk\n\n');
+const original=(...args)=>{calls.push(args);return Promise.resolve(response)};
+const send=compatibleFetch(original);const signal=new AbortController().signal;
+const init={method:'POST',body:JSON.stringify({model:'deepseek-flash',tool_choice:'required',messages:[]}),headers:{authorization:'Bearer fixture','content-length':'1'},signal};
+assert.equal(await send('https://api.deepseek.com/v1/chat/completions',init),response);
+let t=calls.at(-1)[1];assert.deepEqual(JSON.parse(t.body).thinking,{type:'disabled'});assert.equal(JSON.parse(t.body).reasoning_effort,'none');assert.equal(JSON.parse(t.body).tool_choice,'required');assert.equal(t.signal,signal);assert.equal(t.headers.get('authorization'),'Bearer fixture');assert.equal(t.headers.has('content-length'),false);assert.equal(init.headers['content-length'],'1');
+for(const [u,next] of [['https://example.com/v1/chat/completions',init],['http://api.deepseek.com/v1/chat/completions',init],['https://api.deepseek.com:444/v1/chat/completions',init],['https://api.deepseek.com/v1/chat/completions?x=1',init],['https://api.deepseek.com/v1/embeddings',init],['https://api.deepseek.com/v1/chat/completions',{...init,method:'GET'}],['https://api.deepseek.com/v1/chat/completions',{...init,body:'invalid'}],['https://api.deepseek.com/v1/chat/completions',{...init,body:JSON.stringify({model:'other'})}]]) {await send(u,next);assert.equal(calls.at(-1)[1],next);}
+const error=new Error('fixture failure');await assert.rejects(compatibleFetch(()=>Promise.reject(error))('https://api.deepseek.com/v1/chat/completions',init),e=>e===error);
+for(const body of ['null','[]','{}']) {const next={...init,body};await send('https://api.deepseek.com/v1/chat/completions',next);assert.equal(calls.at(-1)[1],next);}
+const url=new URL('https://api.deepseek.com:443/chat/completions');await send(url,init);assert.equal(JSON.parse(calls.at(-1)[1].body).thinking.type,'disabled');
+const request=new Request(url,{method:'POST',headers:{authorization:'Bearer inherited'},body:'untouched'});
+await send(request,{method:'POST',body:init.body,redirect:'manual',signal});assert.equal(calls.at(-1)[1].headers.get('authorization'),'Bearer inherited');assert.equal(calls.at(-1)[1].redirect,'manual');assert.equal(request.bodyUsed,false);
+const override={method:'GET',body:init.body};await send(request,override);assert.equal(calls.at(-1)[1],override);
+const syncError=new Error('sync');assert.throws(()=>compatibleFetch(()=>{throw syncError})(url,init),e=>e===syncError);
+let connected=false;const native=()=>Promise.resolve(response);native.preconnect=()=>{connected=true};compatibleFetch(native).preconnect();assert.equal(connected,true);
+assert.equal(response.bodyUsed,false);assert.equal(await response.text(),'data: chunk\n\n');
+const abort=new AbortController();const aborted=new DOMException('aborted','AbortError');const abortSend=compatibleFetch((input,next)=>new Promise((resolve,reject)=>next.signal.addEventListener('abort',()=>reject(aborted))));const pending=abortSend(url,{...init,signal:abort.signal});abort.abort();await assert.rejects(pending,e=>e===aborted);
+console.log('PASS');
+'''
+
 
 def free_port():
     with socket.socket() as sock:
@@ -433,6 +458,125 @@ class DashboardTests(unittest.TestCase):
         for text in ["DEEPSEEK_API_KEY=one\nDEEPSEEK_API_KEY=two", "DEEPSEEK_API_KEY='unterminated"]:
             with self.assertRaises(dash.DashboardError):dash.parse_dotenv(text)
         self.assertEqual(dash.parse_dotenv("export DEEPSEEK_API_KEY='safe value' # comment")["DEEPSEEK_API_KEY"], "safe value")
+
+    # -- deepseek chat-compat transport ------------------------------------
+    def test_generated_compat_module_matches_embedded_source(self):
+        path = dash.write_compat_module(self.state)
+        self.assertEqual(path.read_bytes(), dash.COMPAT_MODULE_SOURCE.encode())
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(dash.write_compat_module(self.state).read_bytes(),
+                         dash.COMPAT_MODULE_SOURCE.encode())  # idempotent preserve
+
+    def test_write_compat_module_refuses_symlink_and_foreign_bytes(self):
+        target = self.root / "outside.mjs"
+        target.write_text("foreign")
+        link = self.state / dash.COMPAT_MODULE_NAME
+        link.symlink_to(target)
+        with self.assertRaises(dash.DashboardError):
+            dash.write_compat_module(self.state)
+        link.unlink()
+        tampered = self.state / dash.COMPAT_MODULE_NAME
+        tampered.write_text("// tampered compat source\n")
+        os.chmod(tampered, 0o600)
+        with self.assertRaises(dash.DashboardError):
+            dash.write_compat_module(self.state)
+        # a byte-matching copy is preserved and its mode tightened to 0600
+        tampered.write_bytes(dash.COMPAT_MODULE_SOURCE.encode())
+        os.chmod(tampered, 0o644)
+        self.assertEqual(dash.write_compat_module(self.state).read_bytes(),
+                         dash.COMPAT_MODULE_SOURCE.encode())
+        self.assertEqual(os.stat(tampered).st_mode & 0o777, 0o600)
+
+    def test_compat_module_is_preloaded_into_api_only(self):
+        compat = dash.write_compat_module(self.state)
+        api, ui = dash.child_commands(self.source, compat)
+        api, ui = list(api), list(ui)
+        self.assertIn("--preload", api)
+        preload = api[api.index("--preload") + 1]
+        self.assertTrue(Path(preload).is_absolute())
+        self.assertEqual(Path(preload).resolve(), compat.resolve())
+        self.assertLess(api.index("--preload"), api.index("packages/app/src/entry.ts"))
+        self.assertNotIn("--preload", ui)
+        self.assertNotIn(str(compat.resolve()), " ".join(ui))
+        profile = self.root / "prof"
+        profile.mkdir()
+        secrets = {"api_token": "t", "vault_passphrase": "p",
+                   "deepseek_key": KEY, "profile": profile}
+        _, ui_env = dash.build_env(self.source, secrets)
+        self.assertFalse(any(str(compat.resolve()) in value for value in ui_env.values()))
+
+    def test_check_reports_compat_module_state(self):
+        self._gate()
+        self._secrets()
+        with self._patch_source(), mock.patch("builtins.print") as output:
+            self.assertEqual(dash.cmd_check(self.root, self.source), 0)
+        self.assertIn('"compat_module": "absent"', output.call_args.args[0])
+        tampered = self.state / dash.COMPAT_MODULE_NAME
+        tampered.write_text("// tampered\n")
+        os.chmod(tampered, 0o600)
+        with self._patch_source(), mock.patch("builtins.print") as output:
+            self.assertEqual(dash.cmd_check(self.root, self.source), 2)
+        self.assertIn("differs from the reviewed source", output.call_args.args[0])
+
+    def test_check_detects_saved_incompatible_routing_without_dumping(self):
+        self._gate()
+        self._secrets()
+        profile = self.state / "upstream-state"
+        profile.mkdir(mode=0o700, exist_ok=True)
+        marker = "ROUTING-PRIVATE-MARKER"
+        (profile / "eliza.json").write_text(json.dumps(
+            {"models": {"provider": "deepseek"}, "note": marker}))
+        os.chmod(profile / "eliza.json", 0o600)
+        with self._patch_source(), mock.patch("builtins.print") as output:
+            code = dash.cmd_check(self.root, self.source)
+        payload = output.call_args.args[0]
+        self.assertEqual(code, 2)
+        self.assertIn("non-direct DeepSeek route", payload)
+        self.assertNotIn(marker, payload)
+        self.assertIn('"routing": "incompatible"', payload)
+
+    def test_direct_openai_route_is_compatible(self):
+        profile = self.state / "upstream-state"
+        profile.mkdir(mode=0o700, exist_ok=True)
+        for config in ({"provider": "openai"},
+                       {"models": {"provider": "openai-compatible", "model": "deepseek-flash"}}):
+            (profile / "eliza.json").write_text(json.dumps(config))
+            os.chmod(profile / "eliza.json", 0o600)
+            self.assertFalse(dash.detect_incompatible_routing(self.state))
+        for config in ({"provider": "deepseek"},
+                       {"models": {"model": "deepseek/deepseek-flash"}}):
+            (profile / "eliza.json").write_text(json.dumps(config))
+            os.chmod(profile / "eliza.json", 0o600)
+            self.assertTrue(dash.detect_incompatible_routing(self.state))
+
+    def test_start_blocks_incompatible_routing_without_dispatch(self):
+        self._secrets()
+        self._gate()
+        profile = self.state / "upstream-state"
+        profile.mkdir(mode=0o700, exist_ok=True)
+        (profile / "eliza.json").write_text(json.dumps({"catalog": "deepseek"}))
+        os.chmod(profile / "eliza.json", 0o600)
+        with self._patch_source(), mock.patch.object(dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print"):
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+
+    def test_generated_module_passes_runtime_fixture(self):
+        runtimes = [(name, str(dash.CONFIG_SOURCE[name])) for name in ("bun", "node")
+                    if Path(dash.CONFIG_SOURCE[name]).is_file()]
+        if not runtimes:
+            self.skipTest("no Bun/Node runtime available")
+        dash.write_compat_module(self.state)
+        fixture = self.state / "compat-fixture.mjs"
+        fixture.write_text(COMPAT_FIXTURE)
+        for name, runtime in runtimes:
+            with self.subTest(runtime=name):
+                result = subprocess.run([runtime, str(fixture)], cwd=str(self.state),
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("PASS", result.stdout)
 
 
 if __name__ == "__main__":

@@ -32,9 +32,12 @@ functions instead.
 
 - `check` — validates the source pin/runtimes/prereqs, runs a **fresh**
   coding-window gate check, tests that the loopback ports are bindable, reports
-  lock state and onboarding state. It never launches a child and never performs
-  model inference.
+  lock state, onboarding state, the local compat-module state and the saved
+  model-routing compatibility. It never launches a child, never performs model
+  inference, and never dumps or mutates the saved config.
 - `start` — foreground supervisor. Acquires the non-blocking lock (a duplicate
+- `start` — foreground supervisor. Acquires the non-blocking lock (a duplicate
+  startup reports `busy` and does not dispatch), re-checks the gate, then starts
   startup reports `busy` and does not dispatch), re-checks the gate, then starts
   the API and UI children in their own process groups. It stops at the coding
   window cutoff (five seconds early), on SIGTERM/SIGINT, or when a child exits,

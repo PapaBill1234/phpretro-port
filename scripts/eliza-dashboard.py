@@ -18,6 +18,12 @@ Security notes:
     without installing anything;
   * the fresh coding-window gate (project ``scripts/coding-window.py``) is
     required and fails closed when absent;
+  * the reviewed DeepSeek chat-compat module is embedded verbatim and written
+    0600 under the private state dir; an existing copy is preserved only when
+    its bytes match, and symlinks/foreign files are refused. It is added to the
+    Bun API argv via ``--preload`` only, never to the UI;
+  * ``check`` detects a saved config that selects a non-direct DeepSeek route
+    without printing or mutating that config;
   * child groups receive bounded TERM then KILL, including descendants, and a
     partial startup is always cleaned;
   * ``stop`` verifies the stored PID start-ticks before signalling so a reused
@@ -77,6 +83,44 @@ CONFIG_SOURCE = {
 }
 
 SECRET_FILES = ("api.token", "vault.passphrase")
+
+# Reviewed temporary deployment transport (independently approved by native Sol
+# after exact-contract tests). Embedded verbatim from the private reference so
+# this launcher is repeatable. It forces DeepSeek chat completions onto the
+# OpenAI-compatible transport with thinking disabled; it is preloaded ONLY into
+# the Bun API child process, never the UI.
+COMPAT_MODULE_NAME = "deepseek-chat-compat.mjs"
+COMPAT_MODULE_SOURCE = '''// Private deployment compatibility for pinned upstream; no request logging.
+export function compatibleFetch(original) {
+  const wrapped = function(input, init) {
+    let url;
+    try { url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url); }
+    catch { return original(input, init); }
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    if (url.protocol !== 'https:' || url.hostname !== 'api.deepseek.com' || url.port || url.username || url.password || url.search ||
+        !['/v1/chat/completions', '/chat/completions'].includes(url.pathname) || method !== 'POST' || typeof init?.body !== 'string') return original(input, init);
+    let body;
+    try { body = JSON.parse(init.body); } catch { return original(input, init); }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.model !== 'deepseek-flash') return original(input, init);
+    body = {...body, thinking: {type: 'disabled'}, reasoning_effort: 'none'};
+    const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.delete('content-length');
+    return original(input, {...init, headers, body: JSON.stringify(body)});
+  };
+  Object.assign(wrapped, original);
+  if (typeof original.preconnect === 'function') wrapped.preconnect = original.preconnect.bind(original);
+  return wrapped;
+}
+globalThis.fetch = compatibleFetch(globalThis.fetch);
+'''
+
+# The correct route is the OpenAI-compatible direct transport at
+# api.deepseek.com. A saved config that selects a native DeepSeek provider or a
+# provider-qualified "deepseek/..." model bypasses the preloaded fetch shim.
+NATIVE_PROVIDER_IDENTIFIERS = {"deepseek", "deepseek-native", "deepseek_native"}
+PROVIDER_ROUTING_KEYS = {"provider", "providerid", "provider_id", "providername",
+                         "provider_name", "catalog", "adapter", "sdk", "route"}
+
 
 
 class DashboardError(RuntimeError):
@@ -457,14 +501,97 @@ def build_env(source, secrets):
     return api_env, dict(base)
 
 
-def child_commands(source):
+def child_commands(source, compat_path=None):
     src = Path(source["path"])
-    api = [str(source["bun"]), "--no-install", "--conditions=eliza-source",
-           "packages/app/src/entry.ts", "start"]
+    api = [str(source["bun"]), "--no-install", "--conditions=eliza-source"]
+    if compat_path is not None:
+        api += ["--preload", str(Path(compat_path).resolve())]
+    api += ["packages/app/src/entry.ts", "start"]
     ui = [str(source["node"]), "--conditions=eliza-source", "--import", "tsx",
           str(src / "node_modules/vite/bin/vite.js"), "--configLoader", "bundle",
           "--host", API_HOST, "--port", str(UI_PORT), "--strictPort"]
     return api, ui
+
+
+def write_compat_module(state) -> Path:
+    """Create the reviewed compat module under the private state dir at 0600.
+
+    An existing module is preserved byte-for-byte only when it already matches
+    the embedded reviewed source; a symlink, a foreign/unreadable file or a file
+    whose bytes differ is refused.
+    """
+    path = Path(state) / COMPAT_MODULE_NAME
+    expected = COMPAT_MODULE_SOURCE.encode()
+    try:
+        existing = read_private_text(path, require_mode=None)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if existing.encode() != expected:
+            raise DashboardError("deepseek compat module differs from the reviewed source")
+        os.chmod(path, 0o600)
+        return path
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise DashboardError("deepseek compat module could not be created safely") from None
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(expected)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
+    return path
+
+
+def compat_module_state(state) -> str:
+    path = Path(state) / COMPAT_MODULE_NAME
+    if path.is_symlink():
+        return "unsafe"
+    try:
+        existing = read_private_text(path, require_mode=None)
+    except FileNotFoundError:
+        return "absent"
+    except DashboardError:
+        return "unsafe"
+    return "match" if existing.encode() == COMPAT_MODULE_SOURCE.encode() else "conflict"
+
+
+def _routing_conflict(node) -> bool:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if str(key).strip().lower() in PROVIDER_ROUTING_KEYS and \
+                        token.split("/")[0].split(":")[0] in NATIVE_PROVIDER_IDENTIFIERS:
+                    return True
+                if token.startswith("deepseek/") or token.startswith("deepseek:"):
+                    return True
+            if _routing_conflict(value):
+                return True
+    elif isinstance(node, list):
+        return any(_routing_conflict(item) for item in node)
+    return False
+
+
+def detect_incompatible_routing(state) -> bool:
+    """Report (never print or mutate) whether saved config selects a non-direct route."""
+    path = Path(state) / "upstream-state" / "eliza.json"
+    try:
+        text = read_private_text(path, require_mode=None)
+    except (FileNotFoundError, DashboardError):
+        return False
+    try:
+        config = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    return _routing_conflict(config)
 
 
 def read_runtime(state):
@@ -520,6 +647,17 @@ def cmd_check(root, source=CONFIG_SOURCE) -> int:
         problems.append("private setup files are missing")
     if unsafe:
         problems.append("a private secret file is unsafe: " + ", ".join(unsafe))
+    compat_state = compat_module_state(state)
+    detail["compat_module"] = compat_state
+    if compat_state == "conflict":
+        problems.append("local deepseek compat module differs from the reviewed source")
+    elif compat_state == "unsafe":
+        problems.append("local deepseek compat module path is unsafe")
+    if detect_incompatible_routing(state):
+        detail["routing"] = "incompatible"
+        problems.append("saved config selects a non-direct DeepSeek route")
+    else:
+        detail["routing"] = "compatible"
     detail["onboarding"] = "pending" if missing else "ready"
     print(json.dumps({"command": "check", "ok": not problems, "problems": problems,
                       "detail": detail}))
@@ -614,6 +752,9 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
             for port in (API_PORT, UI_PORT):
                 port_free(port)
             secrets = load_secrets(root, state)
+            compat_path = write_compat_module(state)
+            if detect_incompatible_routing(state):
+                raise DashboardError("saved config selects a non-direct DeepSeek route")
         except DashboardError as exc:
             print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
             return 2
@@ -624,7 +765,7 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
 
         cutoff = datetime.fromisoformat(window["stop_at"]).timestamp()
         api_env, ui_env = build_env(source, secrets)
-        api_cmd, ui_cmd = child_commands(source)
+        api_cmd, ui_cmd = child_commands(source, compat_path)
         src = Path(source["path"])
         plan = [("api", api_cmd, src / source["api_cwd"], api_env),
                 ("ui", ui_cmd, src / source["ui_cwd"], ui_env)]
@@ -713,7 +854,7 @@ def cmd_stop(root) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("check", help="validate source, gate, ports, lock and secrets without launching")
+    sub.add_parser("check", help="validate source, gate, ports, lock, secrets, compat module and routing without launching")
     sub.add_parser("start", help="supervise the api and ui child groups in the foreground")
     sub.add_parser("status", help="report onboarding/runtime truth without model inference")
     sub.add_parser("stop", help="stop identity-verified child groups and the supervisor")
