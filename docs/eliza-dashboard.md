@@ -88,3 +88,5 @@ validation, missing gate, denied gate, unsafe secret/symlink rejection, UI
 environment isolation, lock busy in a separate process, busy loopback port,
 partial-startup cleanup, real leader/grandchild group termination, and PID-reuse
 safe `stop`. Tests never run the live dashboard or model inference.
+
+Readiness requires both identity-verified child processes and an authenticated loopback agent status with state running, canRespond true and startup phase ready. A listening/live process alone is starting. Records missing PID start ticks cannot authorize stop. No actual model inference is performed by the status probe.

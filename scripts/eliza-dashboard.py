@@ -35,11 +35,13 @@ import os
 from pathlib import Path
 import signal
 import socket
+import shlex
 import stat
 import subprocess
 import sys
 import time
 import uuid
+import urllib.request
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,15 +146,25 @@ def parse_dotenv(text: str) -> dict:
     data = {}
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition("=")
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
         key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        if key:
-            data[key] = value
+        if not key:
+            continue
+        if key in data:
+            raise DashboardError("duplicate DeepSeek credential assignment")
+        try:
+            parts = shlex.split(value, comments=True, posix=True)
+        except ValueError:
+            raise DashboardError("invalid DeepSeek credential assignment") from None
+        if len(parts) != 1 or not parts[0]:
+            raise DashboardError("invalid DeepSeek credential assignment")
+        data[key] = parts[0]
     return data
 
 
@@ -261,7 +273,7 @@ def terminate_pid_group(pid, expected_start, term_grace: float) -> bool:
     """Signal a recorded process group only when its identity still matches."""
     pid = int(pid)
     current = pid_identity(pid)
-    if current is None or (expected_start is not None and str(current) != str(expected_start)):
+    if expected_start is None or current is None or str(current) != str(expected_start):
         return False
     _killpg(pid, signal.SIGTERM)
     deadline = time.time() + term_grace
@@ -275,7 +287,7 @@ def signal_pid(pid, expected_start, sig) -> bool:
     """Send a single signal to an identity-verified PID (no group/broad kill)."""
     pid = int(pid)
     current = pid_identity(pid)
-    if current is None or (expected_start is not None and str(current) != str(expected_start)):
+    if expected_start is None or current is None or str(current) != str(expected_start):
         return False
     try:
         os.kill(pid, sig)
@@ -312,8 +324,8 @@ def validate_source(source=CONFIG_SOURCE) -> dict:
         raise DashboardError("registered config source is unavailable")
     try:
         pin = subprocess.check_output(
-            ["git", "-C", str(src), "rev-parse", "HEAD"], text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
+            ["git", "-C", str(src), "rev-parse", "HEAD"], text=True, timeout=10).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         raise DashboardError("registered config source is not a git checkout") from None
     if pin != source["pin"]:
         raise DashboardError("registered config source git pin mismatch")
@@ -321,9 +333,9 @@ def validate_source(source=CONFIG_SOURCE) -> dict:
         if not (src / rel).is_file():
             raise DashboardError(f"registered config source is missing {label}")
     try:
-        bun = subprocess.check_output([str(source["bun"]), "--version"], text=True).strip()
-        node = subprocess.check_output([str(source["node"]), "--version"], text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
+        bun = subprocess.check_output([str(source["bun"]), "--version"], text=True, timeout=10).strip()
+        node = subprocess.check_output([str(source["node"]), "--version"], text=True, timeout=10).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         raise DashboardError("a registered runtime binary is unavailable") from None
     if bun != source["bun_version"]:
         raise DashboardError("bun runtime version mismatch")
@@ -382,15 +394,24 @@ def load_secrets(root, state) -> dict:
         values[name.replace(".", "_")] = read_private_text(Path(state) / name).strip()
     if not values["api_token"]:
         raise DashboardError("API token is empty")
-    if not values["vault_passphrase"]:
-        raise DashboardError("vault passphrase is empty")
+    if len(values["vault_passphrase"]) < 12:
+        raise DashboardError("vault passphrase must contain at least 12 characters")
+    secret_dir = Path(root) / DOTENV_RELATIVE.parent
+    info = secret_dir.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise DashboardError("credential directory is unsafe")
     dotenv = parse_dotenv(read_private_text(Path(root) / DOTENV_RELATIVE))
     key = dotenv.get("DEEPSEEK_API_KEY")
     if not key:
         raise DashboardError("DeepSeek credential is unavailable")
     values["deepseek_key"] = key
     profile = Path(state) / "upstream-state"
+    if profile.is_symlink():
+        raise DashboardError("runtime profile is unsafe")
     profile.mkdir(mode=0o700, exist_ok=True)
+    info = profile.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise DashboardError("runtime profile is unsafe")
     os.chmod(profile, 0o700)
     values["profile"] = profile
     return values
@@ -493,12 +514,42 @@ def cmd_check(root, source=CONFIG_SOURCE) -> int:
     unsafe = [name for name in SECRET_FILES if secret_state(Path(state) / name) == "unsafe"]
     if secret_state(Path(root) / DOTENV_RELATIVE) == "missing":
         missing.append(str(DOTENV_RELATIVE))
+    if secret_state(Path(root) / DOTENV_RELATIVE) == "unsafe":
+        unsafe.append(str(DOTENV_RELATIVE))
+    if missing:
+        problems.append("private setup files are missing")
     if unsafe:
         problems.append("a private secret file is unsafe: " + ", ".join(unsafe))
     detail["onboarding"] = "pending" if missing else "ready"
     print(json.dumps({"command": "check", "ok": not problems, "problems": problems,
                       "detail": detail}))
     return 0 if not problems else 2
+
+
+def probe_agent(state):
+    """Bounded authenticated loopback probe; expose only readiness fields."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    try:
+        token = read_private_text(Path(state) / "api.token").strip()
+        request = urllib.request.Request(f"http://127.0.0.1:{API_PORT}/api/status",
+                                        headers={"Authorization": "Bearer " + token})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(request, timeout=2) as response:
+            payload = response.read(65537)
+        if len(payload) > 65536:
+            return None
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            return None
+        startup = data.get("startup")
+        startup = startup if isinstance(startup, dict) else {}
+        ready = data.get("state") == "running" and data.get("canRespond") is True and startup.get("phase") == "ready"
+        return {"status": "runtime-ready" if ready else "awaiting-agent",
+                "ready": ready, "canRespond": data.get("canRespond") is True}
+    except (OSError, ValueError, DashboardError):
+        return None
 
 
 def cmd_status(root) -> int:
@@ -526,9 +577,13 @@ def cmd_status(root) -> int:
                     str(pid_identity(pid)) == str(runtime.get(f"{name}Start")):
                 running.append(name)
         if running:
-            report.update({"status": "runtime-ready", "ready": True,
+            report.update({"status": "starting", "ready": False,
                            "phase": runtime.get("phase"), "running": running,
                            "stopAt": runtime.get("stopAt")})
+            if len(running) == 2:
+                health = probe_agent(state)
+                if health:
+                    report.update(health)
         else:
             report.update({"status": "stopped", "phase": runtime.get("phase")})
     print(json.dumps(report))

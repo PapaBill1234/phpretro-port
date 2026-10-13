@@ -97,12 +97,12 @@ class DashboardTests(unittest.TestCase):
         (scripts / "coding-window.py").write_text(body)
 
     def _secrets(self, mode=0o600):
-        for name, value in (("api.token", "apitok"), ("vault.passphrase", "vaultpw")):
+        for name, value in (("api.token", "apitok"), ("vault.passphrase", "vaultpw-at-least-12")):
             path = self.state / name
             path.write_text(value)
             os.chmod(path, mode)
         envdir = self.root / "secrets"
-        envdir.mkdir(exist_ok=True)
+        envdir.mkdir(mode=0o700, exist_ok=True)
         env = envdir / "deepseek.env"
         env.write_text(f"# comment\nDEEPSEEK_API_KEY={KEY}\nOTHER=ignored\n")
         os.chmod(env, mode)
@@ -250,7 +250,7 @@ class DashboardTests(unittest.TestCase):
                    "uiPid": os.getpid(), "uiStart": dash.pid_identity(os.getpid()),
                    "phase": "running", "stopAt": "2999-01-01T00:00:00+00:00"}
         dash.atomic_json(self.state / "runtime.json", runtime)
-        with mock.patch("builtins.print") as output:
+        with mock.patch.object(dash, "probe_agent", return_value={"status": "runtime-ready", "ready": True, "canRespond": True}), mock.patch("builtins.print") as output:
             self.assertEqual(dash.cmd_status(self.root), 0)
         self.assertIn("runtime-ready", output.call_args.args[0])
 
@@ -365,6 +365,74 @@ class DashboardTests(unittest.TestCase):
         with mock.patch("builtins.print") as output:
             self.assertEqual(dash.cmd_stop(self.root), 0)
         self.assertIn("no-runtime", output.call_args.args[0])
+
+    def test_stop_missing_identity_spares_actual_process(self):
+        child = subprocess.Popen(["python3", "-c", "import time;time.sleep(30)"], start_new_session=True)
+        try:
+            dash.atomic_json(self.state / "runtime.json", {"apiPid": child.pid})
+            with mock.patch("builtins.print"):
+                dash.cmd_stop(self.root)
+            self.assertIsNone(child.poll())
+        finally:
+            child.kill(); child.wait()
+
+    def test_profile_symlink_is_rejected_before_chmod(self):
+        self._secrets()
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o755)
+        (self.state / "upstream-state").symlink_to(outside)
+        with self.assertRaises(dash.DashboardError):
+            dash.load_secrets(self.root, self.state)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+
+    def test_live_processes_alone_do_not_prove_agent_ready(self):
+        self._secrets()
+        dash.atomic_json(self.state / "runtime.json", {"apiPid": os.getpid(), "uiPid": os.getpid(),
+                          "apiStart": dash.pid_identity(os.getpid()), "uiStart": dash.pid_identity(os.getpid()), "phase": "running"})
+        with mock.patch.object(dash, "probe_agent", return_value=None), mock.patch("builtins.print") as output:
+            dash.cmd_status(self.root)
+        self.assertFalse(json.loads(output.call_args.args[0])["ready"])
+
+    def test_one_live_child_is_never_runtime_ready(self):
+        self._secrets()
+        dash.atomic_json(self.state / "runtime.json", {"apiPid": os.getpid(), "apiStart": dash.pid_identity(os.getpid()), "phase": "running"})
+        with mock.patch.object(dash, "probe_agent") as probe, mock.patch("builtins.print") as output:
+            dash.cmd_status(self.root)
+        probe.assert_not_called()
+        self.assertFalse(json.loads(output.call_args.args[0])["ready"])
+
+    def test_agent_probe_actual_http_requires_ready_and_redacts_extra_fields(self):
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+        self._secrets()
+        bodies = [
+            {"state": "running", "canRespond": False, "startup": {"phase": "ready"}},
+            {"state": "running", "canRespond": True, "startup": {"phase": "booting"}},
+            {"state": "running", "canRespond": True, "startup": {"phase": "ready"}, "private": SECRET},
+        ]
+        auth = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                auth.append(self.headers.get("Authorization"))
+                self.send_response(200); self.end_headers()
+                self.wfile.write(json.dumps(bodies.pop(0)).encode())
+        server = HTTPServer(("127.0.0.1", dash.API_PORT), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True);thread.start()
+        try:
+            self.assertFalse(dash.probe_agent(self.state)["ready"])
+            self.assertFalse(dash.probe_agent(self.state)["ready"])
+            result = dash.probe_agent(self.state)
+            self.assertTrue(result["ready"])
+            self.assertNotIn(SECRET, json.dumps(result))
+            self.assertEqual(auth, ["Bearer apitok"] * 3)
+        finally:
+            server.shutdown();thread.join();server.server_close()
+
+    def test_dotenv_duplicate_or_malformed_key_is_rejected(self):
+        for text in ["DEEPSEEK_API_KEY=one\nDEEPSEEK_API_KEY=two", "DEEPSEEK_API_KEY='unterminated"]:
+            with self.assertRaises(dash.DashboardError):dash.parse_dotenv(text)
+        self.assertEqual(dash.parse_dotenv("export DEEPSEEK_API_KEY='safe value' # comment")["DEEPSEEK_API_KEY"], "safe value")
 
 
 if __name__ == "__main__":
