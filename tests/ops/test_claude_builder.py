@@ -18,12 +18,17 @@ spec.loader.exec_module(builder)
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
+        self.window = patch.object(builder.window_policy, 'require_allowed', return_value={'allowed': True, 'stop_at': '2099-01-01T00:00:00+00:00'})
+        self.window.start(); self.addCleanup(self.window.stop)
+        self.native = patch.object(builder, 'subscription_codex_binary', return_value='/fixture/native-codex')
+        self.native.start(); self.addCleanup(self.native.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         (self.root / "config").mkdir()
         (self.root / ".claude").mkdir()
         (self.root / "scripts").mkdir()
         (self.root / "scripts/deepseek-slots.py").write_text("# integration-owned fixture")
+        shutil.copy2(REPO / "scripts/coding-window.py", self.root / "scripts/coding-window.py")
         shutil.copy2(REPO / "scripts/codex-bridge.py", self.root / "scripts/codex-bridge.py")
         shutil.copy2(REPO / "config/models.json", self.root / "config/models.json")
         shutil.copy2(REPO / ".claude/settings.json", self.root / ".claude/settings.json")
@@ -124,9 +129,11 @@ class LauncherTests(unittest.TestCase):
         for role in ("lead", "backup", "reviewer"):
             observed = {}
             def capture(binary, command, environment): observed.update(command=command, environment=environment)
-            with patch.object(builder, "ROOT", self.root), patch.object(builder, "codex_readiness"), patch.dict(os.environ, {"PATH":"/usr/bin", "OPENAI_API_KEY":"private", "A6API_API_KEY":"old"}, clear=True), patch("sys.argv", ["builder", "--role", role]), patch.object(builder.os, "execvpe", side_effect=capture):
+            with patch.object(builder, "ROOT", self.root), patch.object(builder, "codex_readiness"), patch.dict(os.environ, {"PATH":"/usr/bin", "OPENAI_API_KEY":"private", "A6API_API_KEY":"old"}, clear=True), patch("sys.argv", ["builder", "--role", role]), patch.object(builder.os, "execve", side_effect=capture):
                 self.assertEqual(builder.main(), 0)
-            self.assertEqual(observed["command"][2], "gpt-6.1-sol")
+            self.assertEqual(observed["command"][observed["command"].index('--model')+1], "gpt-6.1-sol")
+            self.assertIn('/fixture/native-codex', observed['command'])
+            self.assertEqual(observed["command"][1:4], [str(self.root/'scripts/coding-window.py'), 'run', '--'])
             self.assertIn("read-only" if role=="reviewer" else "workspace-write", observed["command"])
             self.assertNotIn("OPENAI_API_KEY", observed["environment"])
             self.assertNotIn("A6API_API_KEY", observed["environment"])

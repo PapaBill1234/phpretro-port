@@ -62,6 +62,7 @@ for line in sys.stdin:
 
 class BridgeTests(unittest.TestCase):
  def setUp(self):
+  self.window=patch.object(bridge.window_policy,'require_allowed',return_value={'allowed':True,'stop_at':'2099-01-01T00:00:00+00:00'});self.window.start();self.addCleanup(self.window.stop)
   self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name);self.state=self.root/'state'
   self.fake=self.root/'fake.py';self.fake.write_text(FAKE)
   self.record=self.root/'calls.jsonl';self.prompt=self.root/'prompt.md';self.prompt.write_text('Review the fixture source.')
@@ -71,6 +72,10 @@ class BridgeTests(unittest.TestCase):
  def run_fake(self,scenario='completed',args=None):
   return bridge.execute(args or self.args(),[sys.executable,str(self.fake),scenario,str(self.record)])
  def rows(self):return [json.loads(s) for s in self.record.read_text().splitlines()]
+ def test_off_peak_pause_happens_before_rpc_or_model_dispatch(self):
+  with patch.object(bridge.window_policy,'require_allowed',side_effect=ValueError('closed')):
+   with self.assertRaises(bridge.BridgeError) as error:self.run_fake()
+  self.assertEqual(error.exception.code,'off_peak_paused');self.assertFalse(self.record.exists())
  def test_real_process_handshake_completion_and_private_thread_resume(self):
   first=self.run_fake();second=self.run_fake()
   self.assertEqual(first['status'],'completed');self.assertEqual(second['assistant_text'],'Source review complete.')
@@ -136,6 +141,26 @@ class BridgeTests(unittest.TestCase):
   with patch.dict(os.environ,{'OPENAI_API_KEY':'private','ACCESS_TOKEN':'private','A6API_API_KEY':'old','ANTHROPIC_AUTH_TOKEN':'private','CODEX_HOME':'/private/selected'}):
    env=bridge.child_environment();self.assertEqual(env['CODEX_HOME'],'/private/selected')
    self.assertFalse(any(k.endswith(('API_KEY','TOKEN')) for k in env))
+ def test_native_empty_mcp_profile_does_not_create_transportless_servers(self):
+  # Use the ELF explicitly: the operator's PATH wrapper chooses its own account
+  # profile. This fixture must never read or replace that private profile.
+  native=Path('/home/ubuntu/phpretro-codex/cli/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+  if not native.is_file() or not os.access(native,os.X_OK):
+   self.skipTest('Installed native Codex is unavailable for offline config validation.')
+  home=self.root/'native-home';home.mkdir(mode=0o700)
+  config=home/'codex';config.mkdir(mode=0o700)
+  env=bridge.child_environment();env.update(HOME=str(home),CODEX_HOME=str(config))
+  command=bridge.codex_command(str(native))
+  result=subprocess.run(command,input=b'',stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                        cwd=self.root,env=env,timeout=5)
+  self.assertEqual(result.returncode,0,'Native rejected the bridge empty MCP profile.')
+  # Installed config validation rejects even disabled entries without a
+  # transport; a control proves the regression fixture exercises that failure.
+  invalid=command+['-c','mcp_servers.jev.enabled=false']
+  rejected=subprocess.run(invalid,input=b'',stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                          cwd=self.root,env=env,timeout=5)
+  self.assertNotEqual(rejected.returncode,0,'Native did not reject the transportless control.')
+  self.assertIn(b'invalid transport',rejected.stderr,'Native control failed for another reason.')
  def test_limits_actual_windows_daily_unknown_bool_stale_and_reserve(self):
   raw={'ordinaryUsageAllowed':True,'rateLimits':{'spendControlReached':False,'primary':{'usedPercent':5,'windowDurationMins':300,'resetsAt':200}}}
   result=bridge.normalize_limits(raw,100);self.assertTrue(result['dispatch_allowed']);self.assertFalse(result['daily_available'])

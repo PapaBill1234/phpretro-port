@@ -21,6 +21,8 @@ import urllib.error
 from decimal import Decimal, InvalidOperation
 
 import importlib.util
+_window_spec = importlib.util.spec_from_file_location('coding_window', Path(__file__).resolve().parent / 'coding-window.py')
+window_policy = importlib.util.module_from_spec(_window_spec); _window_spec.loader.exec_module(window_policy)
 
 _history_spec = importlib.util.spec_from_file_location("builder_history", Path(__file__).resolve().parent / "builder-history.py")
 history_registry = importlib.util.module_from_spec(_history_spec)
@@ -176,8 +178,15 @@ def codex_role(role, options, extra):
         print(json.dumps(summary, indent=2)); return 0
     codex_readiness()
     env = {k:v for k,v in os.environ.items() if k in ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "LOGNAME", "SHELL", "CODEX_HOME")}
-    command = ["codex", "--model", "gpt-6.1-sol", "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"', "--sandbox", "read-only" if options.role == "reviewer" else "workspace-write", "--ask-for-approval", "on-request", "--cd", str(ROOT)]
-    os.execvpe("codex", command, env); return 0
+    command = [subscription_codex_binary(), "--model", "gpt-6.1-sol", "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"', "--sandbox", "read-only" if options.role == "reviewer" else "workspace-write", "--ask-for-approval", "on-request", "--cd", str(ROOT)]
+    gate = [sys.executable, str(ROOT / 'scripts/coding-window.py'), 'run', '--', *command]
+    os.execve(sys.executable, gate, env); return 0
+
+
+def subscription_codex_binary():
+    spec = importlib.util.spec_from_file_location('codex_bridge', ROOT / 'scripts/codex-bridge.py')
+    native = importlib.util.module_from_spec(spec); spec.loader.exec_module(native)
+    return native.resolve_codex_binary()
 
 
 def main() -> int:
@@ -236,6 +245,7 @@ def main() -> int:
     if options.check:
         print(json.dumps(summary, indent=2))
         return 0
+    window_policy.require_allowed()
     funding_ready(key)
     if options.role == "worker":
         # Reviewed settings pin worktree.baseRef=head; record the task base.

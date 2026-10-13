@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -18,8 +19,11 @@ import sys
 import threading
 import time
 import uuid
+import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location('coding_window', ROOT / 'scripts/coding-window.py')
+window_policy = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(window_policy)
 MODEL = 'gpt-6.1-sol'
 SCHEMA = 'phpretro.codex.bridge.v1'
 MAX_LINE = 1024 * 1024
@@ -34,11 +38,24 @@ def child_environment():
     allowed = {'HOME','PATH','LANG','LC_ALL','TERM','TMPDIR','USER','LOGNAME','SHELL','CODEX_HOME'}
     return {k:v for k,v in os.environ.items() if k in allowed}
 
+def resolve_codex_binary(binary='codex'):
+    if binary != 'codex':
+        return binary  # Explicit trusted executable; never a command string.
+    selected = shutil.which(binary)
+    if selected:
+        return selected
+    # Project's existing native installation, also available to noninteractive SSH.
+    installed = Path('/home/ubuntu/phpretro-codex/cli/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return str(installed)
+    raise BridgeError('codex_unavailable', 'Native Codex executable is unavailable; install/configure it explicitly.')
+
 def codex_command(binary='codex'):
-    return [binary, 'app-server', '--listen', 'stdio://', '-c', 'model_provider="openai"',
+    return [resolve_codex_binary(binary), 'app-server', '--listen', 'stdio://', '-c', 'model_provider="openai"',
             '-c', 'forced_login_method="chatgpt"', '-c', 'model="'+MODEL+'"',
             '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"',
-            '-c', 'mcp_servers={}', '-c', 'features.multi_agent=false',
+            '-c', 'mcp_servers={}',
+            '-c', 'features.multi_agent=false',
             '-c', 'features.hooks=false']
 
 def safe_json(path, limit=65536):
@@ -309,6 +326,12 @@ def execute(args,command=None):
             result['limits'].update(dispatch_allowed=False,reason='cached_report')
             return result
         if args.command=='help':
+            try:
+                window=window_policy.require_allowed()
+                remaining=window_policy.dt.datetime.fromisoformat(window['stop_at']).timestamp()-time.time()-5
+                if remaining<=0:raise ValueError('Off-peak deadline reached')
+                args.timeout=min(args.timeout,remaining)
+            except ValueError:raise BridgeError('off_peak_paused','Sol coding help is paused outside the buffered DeepSeek off-peak window.') from None
             if not args.task_id or not args.prompt_file:raise BridgeError('arguments','Help requires task-id and prompt-file.')
             if args.reason=='retry':
                 if not args.failures_file:raise BridgeError('failure_ledger','Retry requires a trusted private failures-file.')

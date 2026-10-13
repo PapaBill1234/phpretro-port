@@ -1,6 +1,6 @@
 # Known gaps against the requested PHPRetro port
 
-Last reviewed/updated: 2026-10-11. Target: pinned PHPRetro feature behavior, Polaris/Octane compatibility, and the current Habbo public-site layout recreated with original assets. This structure is inspired by [PhotoCraft's gaps ledger](https://github.com/storytold/photocraft/blob/52e130d481c9017b6ec8321784776b33b04ad2c4/docs/gaps.md); project facts and estimates are specific to this port.
+Last reviewed/updated: 2026-10-13. Target: pinned PHPRetro feature behavior, Polaris/Octane compatibility, and the current Habbo public-site layout recreated with original assets. This structure is inspired by [PhotoCraft's gaps ledger](https://github.com/storytold/photocraft/blob/52e130d481c9017b6ec8321784776b33b04ad2c4/docs/gaps.md); project facts and estimates are specific to this port.
 
 This is the work queue. Every entry has one owner/claim in the durable task store, evidence and an exit condition. Implementation coverage is **not yet measured**. A planning document is not a closed application feature. Priority is release risk and user impact, then dependency order. Estimates remain uncalibrated until a real vertical slice is complete.
 
@@ -10,8 +10,8 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 | G02 | Polaris identity/password/schema adapter | P0 / alpha | Partial: real identity adapter verified | registration/reset and full emulator migration |
 | G03 | SSO expiry, one-use/races, Octane launch/reconnect | P0 / alpha | Upstream discrepancy; port missing | real emulator expiry/replay/concurrency tests |
 | G04 | Authentication, staff MFA/RBAC, CSRF and revocation | P0 / alpha | Partial: existing-account login, staff MFA and settings authorization verified | reset/registration and remaining module permissions |
-| G05 | a6api/Claude Code transport and model-role compatibility | P0 / builder | Partial: native roles/tools/Jev, scoped Doctor and saved histories verified | enforced provider budgets and account-specific cloud features |
-| G06 | Coordinated worker claims, reviewed integration and budget enforcement | P0 / builder | Partial: atomic task board and guarded local continuation; price limiter missing | crash/resume and automated integration checks; pricing enforcement |
+| G05 | Direct DeepSeek workers and Codex subscription coordinator | P0 / builder | Partial: direct routes and separate native Sol readiness/help verified | full Eliza main-model handler; enforced provider budgets and account-specific cloud features |
+| G06 | Eliza orchestration, reviewed worker integration and budget enforcement | P0 / builder | Partial: real companion runtime/SQL/ACP fixture boundary; pinned full app checked separately | reviewed full-app plugin/dashboard integration; live worker/queue acceptance and pricing enforcement |
 | G07 | Original/authorized assets for CMS and Octane | P0 / public release | Missing | provenance catalogue plus replaced embedded/client resources |
 | G08 | Structural theme ABI and third-party theme adapters | P1 / beta | Specified, missing | both themes and a sample imported theme use same DTOs |
 | G09 | Housekeeping locale controls/content/catalogue fallback | P1 / beta | Partial: audited enabled/default en/nl controls | content/catalogue fallback, plural and RTL fixtures |
@@ -35,6 +35,10 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 - **G12:** Bundled SWFs are website widgets; the old hotel embed is an external Director DCR. See [Flash modernization](flash-modernization.md).
 - **G17:** Old installer drops CMS tables and can truncate game users. New migration starts read-only and runs only on explicit disposable/rehearsal targets until validated.
 - **G19:** `/doctor` is not an all-session savings report. Jev calls have been used for evidence triage; no savings are claimed without matched comparisons.
+
+## G05/G06 Eliza boundary checkpoint — 2026-10-13
+
+Eliza-first work currently pauses further CMS/theme/game-port implementation. The root companion uses actual published Eliza runtime/SQL/orchestrator packages with controlled ACP and bridge fixtures. The full upstream CLI/API/UI is pinned separately as a submodule at `28fef47c9d9d3acc7792be0fdaa3070020293cc5`; source installation, first-run browser rendering and later owner-login/DeepSeek chat checks passed in a separate reference checkout. This is not proof of a reproducible full-app launch from the root integration or a configured Sol main-chat handler. Project plugin/dashboard fixes and live worker/queue acceptance remain pending. See [integration evidence and launch boundary](eliza-integration.md). No full-port percentage or 100% completion is claimed.
 
 ## Entry update format
 
