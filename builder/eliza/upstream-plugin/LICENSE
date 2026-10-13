@@ -1,0 +1,9 @@
+SPDX-License-Identifier: GPL-3.0-only
+
+This package (@phpretro/plugin-project-companion) is part of the PHPRetro builder
+and is licensed GPL-3.0-only, matching the companion builder package it talks to.
+
+It links against the upstream elizaOS host packages (@elizaos/agent, @elizaos/core,
+@elizaos/host) pinned at commit 28fef47c9d9d3acc7792be0fdaa3070020293cc5, which are
+licensed MIT. No upstream source file is copied or modified by this package; the
+host APIs are consumed as peer dependencies.

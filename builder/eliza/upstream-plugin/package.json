@@ -1,0 +1,31 @@
+{
+  "name": "@phpretro/plugin-project-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only, owner-gated project companion view for the pinned elizaOS host. Projects bounded builder state from the fixed local companion; never mutates, dispatches, or calls a model.",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "main": "./src/index.js",
+  "exports": {
+    ".": {
+      "eliza-source": "./src/index.js",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "files": ["src", "views", "dist", "README.md"],
+  "scripts": {
+    "build:view": "node scripts/build-view.mjs",
+    "test": "NODE_OPTIONS=--conditions=eliza-source tsx --test tests/unit.test.js tests/integration.test.js"
+  },
+  "peerDependencies": {
+    "@elizaos/agent": "*",
+    "@elizaos/core": "*",
+    "@elizaos/host": "*"
+  },
+  "peerDependenciesMeta": {
+    "@elizaos/agent": { "optional": true },
+    "@elizaos/core": { "optional": true },
+    "@elizaos/host": { "optional": true }
+  }
+}
