@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -18,6 +20,8 @@ spec.loader.exec_module(dash)
 
 SECRET = "SUPERSECRETVALUE-1234567890"
 KEY = "sk-test-deepseek-key"
+DIRECT_CONFIG = {"agents": {"defaults": {"model": {"primary": "openai/deepseek-flash"}}}}
+DIRECT_ROUTE = {"serviceRouting": {"llmText": {"backend": "openai", "transport": "direct", "primaryModel": "deepseek-flash"}}}
 REPO_PIN = "a" * 40
 BUN_VERSION = "1.4.2"
 NODE_VERSION = "v24.15.0"
@@ -539,8 +543,8 @@ class DashboardTests(unittest.TestCase):
     def test_direct_openai_route_is_compatible(self):
         profile = self.state / "upstream-state"
         profile.mkdir(mode=0o700, exist_ok=True)
-        for config in ({"provider": "openai"},
-                       {"models": {"provider": "openai-compatible", "model": "deepseek-flash"}}):
+        for config in (DIRECT_CONFIG,
+                       DIRECT_ROUTE):
             (profile / "eliza.json").write_text(json.dumps(config))
             os.chmod(profile / "eliza.json", 0o600)
             self.assertFalse(dash.detect_incompatible_routing(self.state))
@@ -577,6 +581,322 @@ class DashboardTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertIn("PASS", result.stdout)
+
+    # -- reviewed-defect regressions ---------------------------------------
+    def test_bounded_grace_clamps_to_cutoff(self):
+        now = time.time()
+        self.assertEqual(dash.bounded_grace(3.0, None), 3.0)
+        self.assertEqual(dash.bounded_grace(3.0, now + 100), 3.0)
+        self.assertAlmostEqual(dash.bounded_grace(3.0, now + 1.0), 1.0, delta=0.3)
+        self.assertEqual(dash.bounded_grace(3.0, now - 5.0), 0.0)
+
+    def test_open_private_log_rejects_fifo_without_reader_promptly(self):
+        fifo = self.state / "api.log"
+        os.mkfifo(fifo, 0o640)
+        self.assertTrue(stat.S_ISFIFO(os.stat(fifo).st_mode))
+        started = time.monotonic()
+        with self.assertRaises(dash.DashboardError):
+            dash.open_private_log(fifo)
+        self.assertLess(time.monotonic() - started, 5.0)
+        # mode of the unsafe FIFO is never changed
+        self.assertEqual(os.stat(fifo).st_mode & 0o777, 0o640)
+        # and the rejection cannot hang: bounded subprocess watch-dog
+        code = ("import importlib.util,sys\n"
+                "spec=importlib.util.spec_from_file_location('d',%r)\n"
+                "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+                "from pathlib import Path\n"
+                "try:\n"
+                "    m.open_private_log(Path(%r));sys.exit(9)\n"
+                "except m.DashboardError:\n"
+                "    sys.exit(0)\n" % (str(SCRIPT), str(fifo)))
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.stat(fifo).st_mode & 0o777, 0o640)
+
+    def test_routing_fails_closed_for_invalid_or_unsafe_config(self):
+        profile = self.state / "upstream-state"
+        profile.mkdir(mode=0o700, exist_ok=True)
+        cfg = profile / "eliza.json"
+        # absence is the only legitimate first-run compatible case
+        self.assertFalse(dash.detect_incompatible_routing(self.state))
+        # empty / non-object / malformed existing configs fail closed
+        for body in ("{}", "null", "[]", '""', "123", "{not json"):
+            cfg.write_text(body)
+            os.chmod(cfg, 0o600)
+            self.assertTrue(dash.detect_incompatible_routing(self.state), body)
+        # an object with no selection at all also fails closed
+        cfg.write_text(json.dumps({"note": "x"}))
+        os.chmod(cfg, 0o600)
+        self.assertTrue(dash.detect_incompatible_routing(self.state))
+        # unsafe: non-private mode, symlink, directory, unreadable existing file
+        cfg.write_text(json.dumps(DIRECT_CONFIG))
+        os.chmod(cfg, 0o644)
+        self.assertTrue(dash.detect_incompatible_routing(self.state))
+        os.chmod(cfg, 0o600)
+        target = self.root / "outside.json"
+        target.write_text(json.dumps(DIRECT_CONFIG))
+        cfg.unlink(); cfg.symlink_to(target)
+        self.assertTrue(dash.detect_incompatible_routing(self.state))
+        cfg.unlink(); cfg.mkdir()
+        self.assertTrue(dash.detect_incompatible_routing(self.state))
+        cfg.rmdir(); cfg.write_text(json.dumps(DIRECT_CONFIG))
+        os.chmod(cfg, 0o000)
+        try:
+            self.assertTrue(dash.detect_incompatible_routing(self.state))
+        finally:
+            os.chmod(cfg, 0o600)
+        # native DeepSeek and unknown selections fail closed
+        for body in ({"serviceRouting": {"llmText": {"backend": "openai", "transport": "direct", "primaryModel": []}}},
+                     {"provider": "openai"}, {"models": {"provider": "openai", "model": "deepseek-flash"}},
+                     {"plugins": {"entries": {"unused": {"config": {"provider": "openai"}}}}},
+                     {"provider": "deepseek"},
+                     {"models": {"model": "deepseek/deepseek-flash"}},
+                     {"provider": "some-unknown-provider"}):
+            cfg.write_text(json.dumps(body))
+            os.chmod(cfg, 0o600)
+            self.assertTrue(dash.detect_incompatible_routing(self.state), body)
+        # an explicit supported direct selection is compatible
+        for body in (DIRECT_CONFIG,
+                     DIRECT_ROUTE):
+            cfg.write_text(json.dumps(body))
+            os.chmod(cfg, 0o600)
+            self.assertFalse(dash.detect_incompatible_routing(self.state), body)
+
+    def test_start_rechecks_gate_after_slow_validation(self):
+        self._secrets()
+        self._gate()
+        calls = {"n": 0}
+        def fake_window(root):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"allowed": True, "stop_at": "2999-01-01T00:00:00+00:00"}
+            raise dash.DashboardError("coding window is closed")
+        with self._patch_source(), \
+                mock.patch.object(dash, "require_window", side_effect=fake_window), \
+                mock.patch.object(dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+        self.assertGreaterEqual(calls["n"], 2)  # gate re-checked after validation
+        self.assertIn('"status": "blocked"', output.call_args.args[0])
+
+    def test_start_preserves_original_cutoff_over_later_gate_window(self):
+        self._secrets()
+        self._gate()
+        early = "2998-01-01T00:00:00+00:00"
+        late = "2999-01-01T00:00:00+00:00"
+        seq = [{"allowed": True, "stop_at": early}, {"allowed": True, "stop_at": late}]
+        def fake_window(root):
+            return seq.pop(0) if seq else {"allowed": True, "stop_at": late}
+        class ExitedChild:
+            pid = 71000
+            returncode = 0
+            def poll(self):
+                return 0
+            def wait(self, timeout=None):
+                return 0
+        with self._patch_source(), \
+                mock.patch.object(dash, "require_window", side_effect=fake_window), \
+                mock.patch.object(dash.subprocess, "Popen", return_value=ExitedChild()), \
+                mock.patch.object(dash.os, "killpg", side_effect=lambda pid, sig: None), \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(code, 0)
+        record = json.loads((self.state / "runtime.json").read_text())
+        self.assertEqual(record["stopAt"], early)  # later window cannot extend it
+        self.assertIn(early, output.call_args.args[0])
+
+    def test_start_second_spawn_blocked_when_clock_crosses_cutoff(self):
+        from datetime import datetime
+        self._secrets()
+        stop_at = "2970-01-01T00:00:00+00:00"
+        self._gate(stop_at=stop_at)
+        cutoff = datetime.fromisoformat(stop_at).timestamp()
+        clock = {"t": cutoff - 50.0}
+        spawned = []
+        class RunningChild:
+            pid = 72000
+            returncode = None
+            def poll(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+        def popen(argv, **kwargs):
+            spawned.append(argv)
+            clock["t"] = cutoff - 2.0  # cross into the 5s no-launch margin
+            return RunningChild()
+        captured = {}
+        real_cleanup = dash.cleanup_children
+        def spy(children, term_grace=3.0):
+            captured["grace"] = term_grace
+            captured["now"] = clock["t"]
+            return real_cleanup(children, term_grace)
+        with self._patch_source(), \
+                mock.patch.object(dash.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(dash.time, "time", lambda: clock["t"]), \
+                mock.patch.object(dash.time, "sleep",
+                                  lambda sec: clock.__setitem__("t", clock["t"] + sec)), \
+                mock.patch.object(dash, "cleanup_children", side_effect=spy), \
+                mock.patch.object(dash.os, "killpg", side_effect=lambda pid, sig: None), \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(spawned), 1)  # only the first child launched
+        self.assertIn('"status": "blocked"', output.call_args.args[0])
+        # cleanup deadline never extends past the original cutoff
+        self.assertLessEqual(captured["now"] + captured["grace"], cutoff + 1e-6)
+        self.assertLess(captured["grace"], 3.0)
+
+    def test_start_exception_cleanup_bounded_by_cutoff(self):
+        from datetime import datetime
+        self._secrets()
+        stop_at = "2971-01-01T00:00:00+00:00"
+        self._gate(stop_at=stop_at)
+        cutoff = datetime.fromisoformat(stop_at).timestamp()
+        clock = {"t": cutoff - 10.0}
+        captured = {}
+        real_cleanup = dash.cleanup_children
+        def spy(children, term_grace=3.0):
+            captured["grace"] = term_grace
+            captured["now"] = clock["t"]
+            return real_cleanup(children, term_grace)
+        with self._patch_source(), \
+                mock.patch.object(dash.subprocess, "Popen",
+                                  side_effect=OSError("spawn failed")), \
+                mock.patch.object(dash.time, "time", lambda: clock["t"]), \
+                mock.patch.object(dash, "cleanup_children", side_effect=spy), \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(code, 2)
+        self.assertIn('"status": "failed"', output.call_args.args[0])
+        record = json.loads((self.state / "runtime.json").read_text())
+        self.assertEqual(record["phase"], "partial-startup-failed")
+        self.assertLessEqual(captured["now"] + captured["grace"], cutoff + 1e-6)
+
+    def test_start_signal_cannot_allow_second_spawn(self):
+        self._secrets()
+        self._gate()
+        spawned = []
+        class RunningChild:
+            pid = 73000
+            returncode = None
+            def poll(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+        def popen(argv, **kwargs):
+            spawned.append(argv)
+            # deliver a stop request right after the first launch
+            os.kill(os.getpid(), signal.SIGTERM)
+            return RunningChild()
+        with self._patch_source(), \
+                mock.patch.object(dash.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(dash.os, "killpg", side_effect=lambda pid, sig: None), \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, self.source)
+        self.assertEqual(len(spawned), 1)
+        self.assertIn('"status": "blocked"', output.call_args.args[0])
+
+    def test_stop_cleanup_bounded_by_recorded_cutoff(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)"],
+            start_new_session=True)
+        try:
+            runtime = {"apiPid": child.pid, "apiStart": dash.pid_identity(child.pid),
+                       "phase": "running", "stopAt": "2000-01-01T00:00:00+00:00"}
+            dash.atomic_json(self.state / "runtime.json", runtime)
+            captured = {}
+            real = dash.terminate_pid_group
+            def spy(pid, expected, grace):
+                captured["grace"] = grace
+                return real(pid, expected, grace)
+            with mock.patch.object(dash, "terminate_pid_group", side_effect=spy), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(dash.cmd_stop(self.root), 0)
+            # cutoff already long past -> bounded grace collapses to 0 (immediate KILL)
+            self.assertEqual(captured["grace"], 0.0)
+            child.wait(timeout=10)
+            self.assertIsNotNone(child.poll())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    def test_terminate_pid_group_never_kills_replaced_pid(self):
+        signals = []
+        identities = ["111", "222"]  # leader start-tick changes after TERM
+        def fake_identity(pid):
+            return identities.pop(0) if identities else "222"
+        with mock.patch.object(dash, "pid_identity", side_effect=fake_identity), \
+                mock.patch.object(dash, "_group_members", return_value={}), \
+                mock.patch.object(dash.os, "killpg",
+                                  side_effect=lambda pid, sig: signals.append(sig)), \
+                mock.patch.object(dash.os, "kill",
+                                  side_effect=lambda pid, sig: signals.append((pid, sig))), \
+                mock.patch.object(dash.time, "time", return_value=0):
+            self.assertTrue(dash.terminate_pid_group(4321, "111", 3.0))
+        self.assertIn(signal.SIGTERM, signals)
+        self.assertNotIn(signal.SIGKILL, signals)  # replacement PID is never KILLed
+        self.assertNotIn((4321, signal.SIGKILL), signals)
+
+    def test_terminate_pid_group_reclaims_known_orphan_after_leader_reaped(self):
+        events = []
+        leader = {"seq": ["555", None]}       # matches, then reaped
+        orphan = {"seq": ["777", "777", "777"]}
+        def fake_identity(pid):
+            if pid == 5000:
+                return leader["seq"].pop(0) if leader["seq"] else None
+            if pid == 6000:
+                return orphan["seq"].pop(0) if orphan["seq"] else "777"
+            return None
+        members = {5000: "555", 6000: "777"}
+        with mock.patch.object(dash, "pid_identity", side_effect=fake_identity), \
+                mock.patch.object(dash, "_group_members", return_value=dict(members)), \
+                mock.patch.object(dash.os, "killpg",
+                                  side_effect=lambda pid, sig: events.append(("group", sig))), \
+                mock.patch.object(dash.os, "kill",
+                                  side_effect=lambda pid, sig: events.append(("pid", pid, sig))), \
+                mock.patch.object(dash.time, "time", return_value=0):
+            self.assertTrue(dash.terminate_pid_group(5000, "555", 3.0))
+        self.assertIn(("group", signal.SIGTERM), events)
+        self.assertNotIn(("group", signal.SIGKILL), events)  # reaped leader: no group KILL
+        self.assertIn(("pid", 6000, signal.SIGKILL), events)  # verified orphan reclaimed
+        self.assertNotIn(("pid", 5000, signal.SIGKILL), events)
+
+    def test_terminate_pid_group_reclaims_real_descendants(self):
+        pid_file = self.root / "gc.pid"
+        leader_code = ("import subprocess,signal,time;"
+                       "g=subprocess.Popen(['python3','-c',%r]);open(%r,'w').write(str(g.pid));"
+                       "time.sleep(0.1)"
+                       % ("import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)",
+                          str(pid_file)))
+        proc = subprocess.Popen(["python3", "-c", leader_code], start_new_session=True)
+        try:
+            for _ in range(150):
+                if pid_file.exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue(pid_file.exists())
+            grandchild = int(pid_file.read_text())
+            start = dash.pid_identity(proc.pid)
+            reaper = threading.Thread(target=proc.wait)
+            reaper.start()
+            self.assertTrue(dash.terminate_pid_group(proc.pid, start, 0.5))
+            reaper.join(timeout=2)
+            self.assertFalse(reaper.is_alive())
+            self.assertIsNone(dash.pid_identity(proc.pid))
+            for _ in range(200):
+                if proc_state(grandchild) in ("Z", "gone"):
+                    break
+                time.sleep(0.02)
+            self.assertIn(proc_state(grandchild), ("Z", "gone"))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 if __name__ == "__main__":

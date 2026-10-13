@@ -23,11 +23,19 @@ Security notes:
     its bytes match, and symlinks/foreign files are refused. It is added to the
     Bun API argv via ``--preload`` only, never to the UI;
   * ``check`` detects a saved config that selects a non-direct DeepSeek route
-    without printing or mutating that config;
-  * child groups receive bounded TERM then KILL, including descendants, and a
-    partial startup is always cleaned;
-  * ``stop`` verifies the stored PID start-ticks before signalling so a reused
-    PID is never killed, and never uses a broad pkill.
+    without printing or mutating that config, failing closed on an existing
+    config that is unsafe/unreadable/malformed/non-object, carries no explicit
+    supported direct selection, selects a native DeepSeek route or an unknown
+    provider; only a genuinely absent first-run config is compatible;
+  * child groups receive TERM then KILL bounded by the coding cutoff, including
+    descendants, and a partial startup is always cleaned exactly once;
+  * ``start`` re-checks the coding gate after slow validation and immediately
+    before each launch, never launches within five seconds of the original
+    validated cutoff, and keeps that original cutoff for every cleanup deadline;
+  * ``stop`` verifies the stored PID start-ticks immediately before every
+    signal so a reused leader PID is never killed, reclaims verified original
+    descendants after the leader is reaped, bounds its deadlines by the recorded
+    cutoff, and never uses a broad pkill.
 """
 
 from __future__ import annotations
@@ -115,11 +123,19 @@ globalThis.fetch = compatibleFetch(globalThis.fetch);
 '''
 
 # The correct route is the OpenAI-compatible direct transport at
-# api.deepseek.com. A saved config that selects a native DeepSeek provider or a
-# provider-qualified "deepseek/..." model bypasses the preloaded fetch shim.
+# api.deepseek.com, driven by the preserved OPENAI_*_MODEL environment. A saved
+# config that selects a native DeepSeek provider or a provider-qualified
+# "deepseek/..." model bypasses the preloaded fetch shim. Only an explicit
+# supported direct selection is compatible; an absent selection (an empty or
+# non-selection object), an unknown provider and native providers all fail
+# closed. The only legitimate compatible case without this proof is a genuinely
+# absent first-run config.
 NATIVE_PROVIDER_IDENTIFIERS = {"deepseek", "deepseek-native", "deepseek_native"}
+DIRECT_PROVIDER_IDENTIFIERS = {"openai", "openai-compatible", "openai_compatible",
+                               "openai-compat", "openai_compat"}
 PROVIDER_ROUTING_KEYS = {"provider", "providerid", "provider_id", "providername",
                          "provider_name", "catalog", "adapter", "sdk", "route"}
+MODEL_KEYS = {"model", "modelid", "model_id", "modelname", "model_name"}
 
 
 
@@ -230,12 +246,23 @@ def atomic_json(path, data) -> None:
 
 def open_private_log(path):
     path = Path(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+    # O_NONBLOCK is essential: opening a FIFO O_WRONLY with no reader blocks
+    # before the post-open type check. Non-blocking open returns promptly so a
+    # FIFO/unsafe target is rejected instead of hanging. The mode is never
+    # changed for a non-regular file.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     0o600)
+    except OSError:
+        raise DashboardError(f"{path.name} is not a safe regular file") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise DashboardError(f"{path.name} is not a safe regular file")
+        os.fchmod(fd, 0o600)
+    except BaseException:
         os.close(fd)
-        raise DashboardError(f"{path.name} is not a safe regular file")
-    os.fchmod(fd, 0o600)
+        raise
     return os.fdopen(fd, "ab", buffering=0)
 
 
@@ -291,6 +318,21 @@ def pid_identity(pid):
         return None
 
 
+def _identity_matches(pid, expected_start) -> bool:
+    """True only when the live start-tick still equals the recorded identity."""
+    if expected_start is None:
+        return False
+    current = pid_identity(pid)
+    return current is not None and str(current) == str(expected_start)
+
+
+def bounded_grace(term_grace: float, cutoff) -> float:
+    """Clamp a cleanup grace so no wait extends past the known coding cutoff."""
+    if cutoff is None:
+        return term_grace
+    return max(0.0, min(term_grace, cutoff - time.time()))
+
+
 def _killpg(pid, sig):
     try:
         os.killpg(pid, sig)
@@ -313,17 +355,72 @@ def terminate_group(process, term_grace: float) -> None:
         pass
 
 
+def _group_members(pgid) -> dict:
+    """Map pid -> starttime for live members of process group ``pgid``."""
+    members = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            text = Path(f"/proc/{name}/stat").read_text()
+        except OSError:
+            continue
+        close = text.rfind(")")
+        if close < 0:
+            continue
+        fields = text[close + 2:].split()
+        if len(fields) < 20:
+            continue
+        try:
+            pgrp = int(fields[2])
+        except ValueError:
+            continue
+        if pgrp == int(pgid):
+            members[int(name)] = fields[19]
+    return members
+
+
+def _kill_verified(member_pid, member_start, sig) -> None:
+    """Signal one PID only when its start-tick identity is unchanged."""
+    if not _identity_matches(member_pid, member_start):
+        return
+    try:
+        os.kill(int(member_pid), sig)
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
+
+
 def terminate_pid_group(pid, expected_start, term_grace: float) -> bool:
-    """Signal a recorded process group only when its identity still matches."""
+    """Signal a recorded process group only while its leader identity matches.
+
+    The start-tick identity is re-verified immediately before *every* signal,
+    including the final KILL, so a leader PID that exited and was reused for a
+    different process is never signalled. The identities of the original group
+    members are captured before signalling so known original descendants remain
+    reclaimable (by identity-checked single signals) even if the leader is
+    reaped; a group-wide KILL is only ever sent while the original leader
+    identity still holds.
+    """
     pid = int(pid)
-    current = pid_identity(pid)
-    if expected_start is None or current is None or str(current) != str(expected_start):
+    if not _identity_matches(pid, expected_start):
         return False
+    known = _group_members(pid)
+    known[pid] = str(expected_start)
     _killpg(pid, signal.SIGTERM)
     deadline = time.time() + term_grace
-    while time.time() < deadline and pid_identity(pid) is not None:
+    while time.time() < deadline and _identity_matches(pid, expected_start):
         time.sleep(0.05)
-    _killpg(pid, signal.SIGKILL)
+    if _identity_matches(pid, expected_start):
+        _killpg(pid, signal.SIGKILL)
+    for member_pid, member_start in known.items():
+        if member_pid == pid:
+            continue
+        _kill_verified(member_pid, member_start, signal.SIGKILL)
     return True
 
 
@@ -563,35 +660,81 @@ def compat_module_state(state) -> str:
     return "match" if existing.encode() == COMPAT_MODULE_SOURCE.encode() else "conflict"
 
 
-def _routing_conflict(node) -> bool:
+def _routing_scan(node, flags) -> None:
+    """Walk a config tree recording direct/native/unknown selection signals."""
     if isinstance(node, dict):
         for key, value in node.items():
+            name = str(key).strip().lower()
             if isinstance(value, str):
                 token = value.strip().lower()
-                if str(key).strip().lower() in PROVIDER_ROUTING_KEYS and \
-                        token.split("/")[0].split(":")[0] in NATIVE_PROVIDER_IDENTIFIERS:
-                    return True
-                if token.startswith("deepseek/") or token.startswith("deepseek:"):
-                    return True
-            if _routing_conflict(value):
-                return True
+                base = token.split("/")[0].split(":")[0]
+                if name in PROVIDER_ROUTING_KEYS:
+                    if base in NATIVE_PROVIDER_IDENTIFIERS:
+                        flags["native"] = True
+                    elif base in DIRECT_PROVIDER_IDENTIFIERS:
+                        flags["direct"] = True
+                    elif token:
+                        flags["unknown"] = True
+                if name in MODEL_KEYS:
+                    if token.startswith("deepseek/") or token.startswith("deepseek:"):
+                        flags["native"] = True
+                    elif token == DEEPSEEK_MODEL:
+                        flags["direct"] = True
+            _routing_scan(value, flags)
     elif isinstance(node, list):
-        return any(_routing_conflict(item) for item in node)
-    return False
+        for item in node:
+            _routing_scan(item, flags)
+
+
+def _explicit_direct_selection(config) -> bool:
+    """Pinned model-resolution.ts: primary hint or direct llmText route.
+
+    Merely finding an OpenAI label elsewhere in a config is not selection.
+    This accepts the reviewed Flash route only; other profiles require review.
+    """
+    def record(value):
+        return value if isinstance(value, dict) else {}
+    route = record(record(config.get("serviceRouting")).get("llmText"))
+    allowed = {DEEPSEEK_MODEL, "openai/" + DEEPSEEK_MODEL}
+    if route:
+        return (route.get("backend") == "openai" and route.get("transport") == "direct"
+                and isinstance(route.get("primaryModel"), str) and route["primaryModel"] in allowed
+                and all(not key.endswith("Model") or (isinstance(value, str) and value in allowed)
+                        for key, value in route.items()))
+    model = record(record(record(config.get("agents")).get("defaults")).get("model"))
+    return (model.get("primary") == "openai/" + DEEPSEEK_MODEL
+            and isinstance(model.get("fallbacks", []), list)
+            and all(value == "openai/" + DEEPSEEK_MODEL for value in model.get("fallbacks", [])))
 
 
 def detect_incompatible_routing(state) -> bool:
-    """Report (never print or mutate) whether saved config selects a non-direct route."""
+    """Report (never print or mutate) whether saved config selects a non-direct route.
+
+    Fail closed: only a genuinely absent config (legitimate first-run) is
+    compatible. An existing config that is unsafe/unreadable/a symlink, that is
+    malformed JSON, whose root is not a JSON object, that carries no explicit
+    supported direct selection (an empty/non-selection object), that selects a
+    native DeepSeek route or an unknown provider is treated as incompatible so
+    an unverifiable route can never silently pass.
+    """
     path = Path(state) / "upstream-state" / "eliza.json"
     try:
-        text = read_private_text(path, require_mode=None)
-    except (FileNotFoundError, DashboardError):
-        return False
+        text = read_private_text(path, require_mode=0o600)
+    except FileNotFoundError:
+        return False  # legitimate first-run: no saved config yet
+    except (DashboardError, OSError):
+        return True  # existing but unsafe/unreadable -> fail closed
     try:
         config = json.loads(text)
     except (ValueError, TypeError):
-        return False
-    return _routing_conflict(config)
+        return True  # malformed JSON -> fail closed
+    if not isinstance(config, dict) or not config:
+        return True  # non-object or empty object root -> no verifiable selection
+    flags = {"native": False, "direct": False, "unknown": False}
+    _routing_scan(config, flags)
+    if flags["native"] or flags["unknown"]:
+        return True  # native/unknown selection -> fail closed
+    return not _explicit_direct_selection(config)  # require actual upstream selection fields
 
 
 def read_runtime(state):
@@ -747,6 +890,9 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         except DashboardError as exc:
             print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
             return 2
+        # Preserve the cutoff validated by the first gate check: a later re-check
+        # must never extend the deadline.
+        original_stop_at = window.get("stop_at")
         try:
             validate_source(source)
             for port in (API_PORT, UI_PORT):
@@ -763,7 +909,19 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
                               "reason": "a loopback port is busy"}))
             return 2
 
-        cutoff = datetime.fromisoformat(window["stop_at"]).timestamp()
+        # Fresh gate check after the slow prerequisite work, before any launch.
+        try:
+            require_window(root)
+        except DashboardError as exc:
+            print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
+            return 2
+        try:
+            cutoff = datetime.fromisoformat(str(original_stop_at)).timestamp()
+        except (TypeError, ValueError):
+            print(json.dumps({"command": "start", "status": "blocked",
+                              "reason": "coding window cutoff is invalid"}))
+            return 2
+
         api_env, ui_env = build_env(source, secrets)
         api_cmd, ui_cmd = child_commands(source, compat_path)
         src = Path(source["path"])
@@ -779,45 +937,75 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         old = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGINT)}
         children = []
         early = None
+        abort_reason = None
+        failure = None
         try:
             for name, argv, cwd, env in plan:
+                # A stopping signal must not allow another spawn.
+                if stopping:
+                    abort_reason = "stop requested before launch"
+                    break
+                # Re-check the gate and the cutoff immediately before each spawn.
+                try:
+                    require_window(root)
+                except DashboardError:
+                    abort_reason = "coding window closed before launch"
+                    break
+                if time.time() >= cutoff - 5:
+                    abort_reason = "coding window cutoff reached before launch"
+                    break
                 log = open_private_log(state / f"{name}.log")
-                child = subprocess.Popen(argv, cwd=str(cwd), env=env,
-                                         stdin=subprocess.DEVNULL, stdout=log,
-                                         stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    child = subprocess.Popen(argv, cwd=str(cwd), env=env,
+                                             stdin=subprocess.DEVNULL, stdout=log,
+                                             stderr=subprocess.STDOUT, start_new_session=True)
+                except BaseException:
+                    log.close()
+                    raise
                 children.append((name, child, log))
-            data = {"supervisorPid": os.getpid(), "supervisorStart": pid_identity(os.getpid()),
-                    "stopAt": window.get("stop_at"), "sourcePin": source["pin"],
-                    "phase": "running", "inferenceRequested": False,
-                    "apiPort": API_PORT, "uiPort": UI_PORT}
-            for name, proc, _ in children:
-                data[f"{name}Pid"] = proc.pid
-                data[f"{name}Start"] = pid_identity(proc.pid)
-            atomic_json(state / "runtime.json", data)
-            while not stopping and time.time() < cutoff - 5 and \
-                    all(p.poll() is None for _, p, _ in children):
-                time.sleep(0.2)
-            if not stopping and time.time() < cutoff - 5:
-                early = next((p.returncode for _, p, _ in children if p.poll() is not None), None)
-        except BaseException:
-            cleanup_children(children)
+            if abort_reason is None:
+                data = {"supervisorPid": os.getpid(), "supervisorStart": pid_identity(os.getpid()),
+                        "stopAt": original_stop_at, "sourcePin": source["pin"],
+                        "phase": "running", "inferenceRequested": False,
+                        "apiPort": API_PORT, "uiPort": UI_PORT}
+                for name, proc, _ in children:
+                    data[f"{name}Pid"] = proc.pid
+                    data[f"{name}Start"] = pid_identity(proc.pid)
+                atomic_json(state / "runtime.json", data)
+                while not stopping and time.time() < cutoff - 5 and \
+                        all(p.poll() is None for _, p, _ in children):
+                    time.sleep(0.2)
+                if not stopping and time.time() < cutoff - 5:
+                    early = next((p.returncode for _, p, _ in children if p.poll() is not None), None)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            for sig, handler in old.items():
+                signal.signal(sig, handler)
+            # Cleanup runs exactly once, always bounded by the original cutoff.
+            cleanup_children(children, bounded_grace(3.0, cutoff))
+        if failure is not None:
             record = dict(read_runtime(state) or {})
             record["phase"] = "partial-startup-failed"
             atomic_json(state / "runtime.json", record)
             print(json.dumps({"command": "start", "status": "failed",
                               "reason": "child launch failed"}))
             return 2
-        finally:
-            for sig, handler in old.items():
-                signal.signal(sig, handler)
-            cleanup_children(children)
+        if abort_reason is not None:
+            record = dict(read_runtime(state) or {})
+            record["phase"] = "stopped"
+            record["endedAt"] = utc_now()
+            atomic_json(state / "runtime.json", record)
+            print(json.dumps({"command": "start", "status": "blocked",
+                              "reason": abort_reason, "allowed_until": original_stop_at}))
+            return 2
         record = dict(read_runtime(state) or {})
         record["phase"] = "stopped"
         record["endedAt"] = utc_now()
         atomic_json(state / "runtime.json", record)
         code = 0 if early in (None, 0) else 1
         print(json.dumps({"command": "start", "status": "stopped",
-                          "allowed_until": window.get("stop_at"), "exit_code": code}))
+                          "allowed_until": original_stop_at, "exit_code": code}))
         return code
     finally:
         release_lock(fd)
@@ -833,12 +1021,19 @@ def cmd_stop(root) -> int:
     if not runtime:
         print(json.dumps({"command": "stop", "status": "stopped", "detail": "no-runtime"}))
         return 0
+    # Bound every stop deadline to the recorded coding cutoff when present.
+    stop_at = runtime.get("stopAt")
+    try:
+        stop_cutoff = datetime.fromisoformat(str(stop_at)).timestamp() if stop_at else None
+    except (TypeError, ValueError):
+        stop_cutoff = None
     terminated = []
     for name in ("api", "ui"):
         pid = runtime.get(f"{name}Pid")
         if pid is None:
             continue
-        if terminate_pid_group(pid, runtime.get(f"{name}Start"), 3.0):
+        if terminate_pid_group(pid, runtime.get(f"{name}Start"),
+                               bounded_grace(3.0, stop_cutoff)):
             terminated.append(name)
     supervisor_pid = runtime.get("supervisorPid")
     if supervisor_pid is not None and int(supervisor_pid) != os.getpid():

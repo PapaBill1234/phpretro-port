@@ -33,23 +33,31 @@ functions instead.
 - `check` — validates the source pin/runtimes/prereqs, runs a **fresh**
   coding-window gate check, tests that the loopback ports are bindable, reports
   lock state, onboarding state, the local compat-module state and the saved
-  model-routing compatibility. It never launches a child, never performs model
-  inference, and never dumps or mutates the saved config.
+  model-routing compatibility. Routing verification **fails closed**: only a
+  genuinely absent saved config (legitimate first-run) is compatible; an
+  existing config that is unsafe/unreadable/a symlink, malformed JSON, or whose
+  root is not a JSON object counts as incompatible. It never launches a child,
+  never performs model inference, and never dumps or mutates the saved config.
 - `start` — foreground supervisor. Acquires the non-blocking lock (a duplicate
-- `start` — foreground supervisor. Acquires the non-blocking lock (a duplicate
-  startup reports `busy` and does not dispatch), re-checks the gate, then starts
-  startup reports `busy` and does not dispatch), re-checks the gate, then starts
-  the API and UI children in their own process groups. It stops at the coding
-  window cutoff (five seconds early), on SIGTERM/SIGINT, or when a child exits,
-  always cleaning partial startup with bounded TERM then KILL including
-  descendants.
+  startup reports `busy` and does not dispatch), re-checks the gate **before
+  every launch** (after the slow prerequisite work and immediately before each
+  child), and never launches once it is within five seconds of the validated
+  cutoff. The originally validated cutoff is preserved so a later gate re-check
+  cannot extend the deadline; the API and UI children start in their own process
+  groups. It stops at the coding window cutoff (five seconds early), on
+  SIGTERM/SIGINT, or when a child exits, always cleaning partial startup with
+  bounded TERM then KILL including descendants, with every cleanup deadline
+  clamped so it cannot run past the known cutoff.
 - `status` — truthful `awaiting-onboarding` vs `stopped` vs `runtime-ready`
   distinction from identity-verified PIDs. No inference and no arbitrary API
   payload or secret is printed.
 - `stop` — verifies each stored PID start-tick (`/proc/<pid>/stat` field 22)
-  before signalling, so a reused PID is spared. It signals only the recorded
-  API/UI process groups and the recorded supervisor; it never uses a broad
-  `pkill`.
+  immediately before **every** signal (including the final KILL), so a reused
+  leader PID is spared. Original group members are captured before signalling so
+  known original descendants are still reclaimed by identity-checked single
+  signals even after the leader is reaped. Every stop deadline is clamped to the
+  recorded `stopAt`. It signals only the recorded API/UI process groups and the
+  recorded supervisor; it never uses a broad `pkill`.
 
 ## Security and state
 
@@ -87,9 +95,16 @@ This does not mark full Eliza complete.
 
 `python3 -m unittest discover -s tests/ops -p test_eliza_dashboard.py` exercises
 the pure helpers and real behaviour: registered-source pin/version/prereq
-validation, missing gate, denied gate, unsafe secret/symlink rejection, UI
-environment isolation, lock busy in a separate process, busy loopback port,
-partial-startup cleanup, real leader/grandchild group termination, and PID-reuse
-safe `stop`. Tests never run the live dashboard or model inference.
+validation, missing gate, denied gate, gate re-check after slow validation and
+before each spawn, no launch within five seconds of the cutoff, cleanup bounded
+by the original recorded cutoff, unsafe secret/symlink rejection, a FIFO log
+target rejected promptly without a reader, UI environment isolation, lock busy
+in a separate process, busy loopback port, partial-startup cleanup with the log
+descriptor closed on failure, invalid/native/unknown/empty/unsafe routing
+fail-closed, real leader/grandchild group termination, PID-replacement-safe and
+post-TERM-orphan-safe `stop`. Tests never run the live dashboard or model
+inference and use only disposable owned child processes.
 
 Readiness requires both identity-verified child processes and an authenticated loopback agent status with state running, canRespond true and startup phase ready. A listening/live process alone is starting. Records missing PID start ticks cannot authorize stop. No actual model inference is performed by the status probe.
+
+Saved route acceptance uses the pinned upstream model-resolution contract: `agents.defaults.model.primary = "openai/deepseek-flash"`, or `serviceRouting.llmText` with backend `openai`, transport `direct`, and primaryModel `deepseek-flash`. An OpenAI label elsewhere or an unsupported simplified `{provider, model}` object does not establish a selected route. Other saved profiles require explicit compatibility review.
