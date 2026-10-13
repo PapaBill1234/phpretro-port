@@ -52,9 +52,10 @@
     "direct_worker": "402_insufficient_balance_no_patch",
     "native_doctor": "preserved_not_rerun",
     "codex_rpc_readiness": "passed_installed0.162.0_no_inference",
-    "codex_help_inference": "attempted180s_timeout_no_completed_verdict",
+    "codex_help_inference": "health_completed_full_source_review180s_timeout",
     "funded_worker_dispatch": "pending",
     "offline_prepare": "passed_private_keyless",
-    "controlled_rpc_and_ops_tests": "78_passed"
+    "controlled_rpc_and_ops_tests": "78_passed",
+    "codex_subscription_health": "passed_one_tool_free_turn10.861s_exact_reply"
   }
 }
