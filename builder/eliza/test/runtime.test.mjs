@@ -252,7 +252,7 @@ test('bridge forwards the selected CODEX_HOME to its Python child but no provide
     assert.equal(safeProcessEnv().ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(bridgeEnv().CODEX_HOME, '/tmp/selected-codex-home');
     assert.equal(bridgeEnv().ANTHROPIC_AUTH_TOKEN, undefined);
-    assert.throws(() => rejectSecrets({ token: 'fixture-private-provider-value' }), /Secret-like/);
+    assert.throws(() => rejectSecrets({ token: 'sk-' + 'fixture'.repeat(5) }), /Secret-like/);
     assert.throws(() => rejectSecrets('openai_api_key=supersecretvalue'), /Secret-like/);
   } finally {
     for (const k of keys) { if (prior[k] === undefined) delete process.env[k]; else process.env[k] = prior[k]; }
