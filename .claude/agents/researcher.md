@@ -2,7 +2,7 @@
 name: researcher
 description: Read primary official specifications and repository contracts for a bounded question; return references and facts.
 tools: Read, Grep, Glob, WebFetch, WebSearch, mcp__jev__jev_judge
-model: haiku
+model: deepseek-flash
 effort: medium
 maxTurns: 15
 ---

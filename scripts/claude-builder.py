@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a project-scoped Claude CLI through the verified A6API Messages route.
+"""Start a project-scoped Claude CLI through direct DeepSeek or native subscription Codex.
 
 No shell evaluation, provider-key logging or unattended swarm. Permission bypass
 is enabled explicitly at the operator's request. This launcher does not enforce the supervisor's spending ledger.
@@ -16,6 +16,9 @@ import stat
 import subprocess
 import sys
 import uuid
+import urllib.request
+import urllib.error
+from decimal import Decimal, InvalidOperation
 
 import importlib.util
 
@@ -67,18 +70,18 @@ def private_key(path: Path, name: str) -> str:
 
 
 def credential() -> tuple[str, str]:
-    supplied = os.environ.get("A6API_API_KEY", "").strip()
+    supplied = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if supplied:
-        return supplied, "A6API_API_KEY environment"
-    explicit = os.environ.get("PHPRETRO_A6API_ENV")
+        return supplied, "DEEPSEEK_API_KEY environment"
+    explicit = os.environ.get("PHPRETRO_DEEPSEEK_ENV")
     candidates = [Path(explicit).expanduser()] if explicit else [
-        ROOT / "secrets" / "a6api.env",
-        Path.home() / "phpretro-dashboard" / "secrets" / "a6api.env",
+        ROOT / "secrets" / "deepseek.env",
+        Path.home() / ".hermes" / ".env",
     ]
     for path in candidates:
         if path.exists() or path.is_symlink():
-            return private_key(path, "A6API_API_KEY"), str(path)
-    raise SetupError("Set A6API_API_KEY or PHPRETRO_A6API_ENV to an existing private credential file.")
+            return private_key(path, "DEEPSEEK_API_KEY"), str(path)
+    raise SetupError("Set DEEPSEEK_API_KEY or PHPRETRO_DEEPSEEK_ENV to an existing private credential file.")
 
 
 def native_binary(version: str) -> Path:
@@ -95,20 +98,22 @@ def native_binary(version: str) -> Path:
 def configuration() -> dict:
     data = json.loads((ROOT / "config/models.json").read_text())
     settings = json.loads((ROOT / ".claude/settings.json").read_text())
-    if data.get("anthropic_base_url") != "https://api.a6api.com":
+    if data.get("anthropic_base_url") != "https://api.deepseek.com/anthropic":
         raise SetupError("Unexpected provider endpoint; verify a new route before changing this launcher.")
     env = settings.get("env", {})
     if env.get("ANTHROPIC_BASE_URL") != data["anthropic_base_url"]:
         raise SetupError("Project settings and the verified endpoint disagree.")
     if str(env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "0")) not in ("0", ""):
         raise SetupError("Remove CLAUDE_CODE_SUBAGENT_MODEL_FORCE; it overrides the reviewer model.")
-    if any(key in env for key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "A6API_API_KEY", "OPENROUTER_API_KEY")):
+    if any(key in env for key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "A6API_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY")):
         raise SetupError("Remove provider credentials from checked-in project settings.")
     if settings.get("worktree", {}).get("baseRef") != "head":
         raise SetupError("Use worktree.baseRef=head so workers branch from the recorded current commit.")
     for alias, model in data["aliases"].items():
         if env.get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL") != model:
             raise SetupError(f"The {alias} alias differs between settings and config/models.json.")
+    if any(model not in ("deepseek-flash", "deepseek-flash[1m]") for model in data["aliases"].values()):
+        raise SetupError("Claude aliases must be direct DeepSeek Flash; Sol uses Codex.")
     return data
 
 
@@ -126,11 +131,61 @@ def worker_path(name: str) -> Path:
     return Path(result.stdout.strip()).parent / ".claude" / "worktrees" / name
 
 
+def shared_slots_directory():
+    result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    return str(Path(result.stdout.strip()) / "phpretro-builder/deepseek-slots") if result.returncode == 0 else None
+
+
+def funding_ready(key):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    request = urllib.request.Request("https://api.deepseek.com/user/balance", headers={"Authorization": "Bearer " + key, "Accept": "application/json"})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                raise SetupError("DeepSeek balance response exceeded its bound.")
+            data = json.loads(raw)
+        balances = data.get("balance_infos")
+        amounts = [Decimal(item["total_balance"]) for item in balances if isinstance(item, dict) and item.get("currency") in ("USD", "CNY")]
+        if data.get("is_available") is not True or not amounts or any(not amount.is_finite() for amount in amounts) or not any(amount > 0 for amount in amounts):
+            raise SetupError("DeepSeek dispatch paused: available funding is not positive; checkpoint until the owner funds this provider.")
+    except SetupError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, InvalidOperation):
+        raise SetupError("DeepSeek dispatch paused: provider balance is unavailable.") from None
+
+
+def codex_readiness():
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/codex-bridge.py"), "limits", "--timeout", "30"], capture_output=True, text=True, timeout=35)
+    try:
+        report = json.loads(result.stdout)
+        ready = result.returncode == 0 and report.get("ok") is True and report["limits"]["dispatch_allowed"] is True
+    except (ValueError, KeyError, TypeError):
+        ready = False
+    if not ready:
+        raise SetupError("Codex dispatch paused: subscription/model/quota readiness must be known with more than10%remaining; inspect codex-bridge limits and checkpoint.")
+
+
+def codex_role(role, options, extra):
+    if extra:
+        raise SetupError("Interactive Codex roles accept no forwarded Claude arguments; use codex-bridge help --prompt-file for bounded requests.")
+    summary = {"role": options.role, "model": "gpt-6.1-sol", "provider": "codex-chatgpt-subscription", "history": "native selected CODEX_HOME, separate from Claude", "offline": True, "readiness_checked": False, "secrets_in_logs": False}
+    if options.check:
+        print(json.dumps(summary, indent=2)); return 0
+    codex_readiness()
+    env = {k:v for k,v in os.environ.items() if k in ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "LOGNAME", "SHELL", "CODEX_HOME")}
+    command = ["codex", "--model", "gpt-6.1-sol", "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"', "--sandbox", "read-only" if options.role == "reviewer" else "workspace-write", "--ask-for-approval", "on-request", "--cd", str(ROOT)]
+    os.execvpe("codex", command, env); return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("lead", "backup", "worker", "reviewer"), default="lead")
     parser.add_argument("--worktree-name", help="Worker worktree name; a unique name is generated by default.")
-    parser.add_argument("--check", action="store_true", help="Print redacted local setup metadata without inference.")
+    parser.add_argument("--prepare", action="store_true", help="Create private provider settings offline, without paid requests.")
+    parser.add_argument("--check", "--status", action="store_true", help="Print redacted local setup metadata without inference.")
     options, extra = parser.parse_known_args()
     if extra[:1] == ["--"]:
         extra = extra[1:]
@@ -145,6 +200,12 @@ def main() -> int:
         raise SetupError("Use a short alphanumeric worktree name with hyphens or underscores.")
     data = configuration()
     role = data["roles"][options.role]
+    if options.prepare and options.role != "worker":
+        raise SetupError("Offline --prepare is available for direct DeepSeek worker settings only.")
+    if role.get("provider") == "codex-chatgpt-subscription":
+        return codex_role(role, options, extra)
+    if role.get("model") not in ("deepseek-flash", "deepseek-flash[1m]"):
+        raise SetupError("Sol models cannot use the DeepSeek endpoint.")
     binary = native_binary(data["native_claude_version"])
     key, key_source = credential()
     config_home = ROOT / ".builder" / "claude"
@@ -158,9 +219,24 @@ def main() -> int:
         "worker_worktree": worktree_name if options.role == "worker" else None,
         "secrets_in_logs": False, "spending_guard_enforced_by_launcher": False,
     }
+    summary["worker_slots_directory"] = shared_slots_directory()
+    summary["slots_wrapper_available"] = (ROOT / "scripts/deepseek-slots.py").is_file()
+    if options.prepare:
+        directory = ROOT / ".builder/provider-settings"
+        # Reuse audited no-symlink private path construction; settings contain no key.
+        spec = importlib.util.spec_from_file_location("codex_bridge", ROOT / "scripts/codex-bridge.py")
+        helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+        helper.private_directory(directory)
+        prepared = json.loads((ROOT / ".claude/settings.json").read_text())
+        prepared["disableAllHooks"] = True
+        helper.save_json(directory / "settings.json", prepared)
+        summary.update(offline=True, prepared=True, settings_path=str(directory / "settings.json"),
+                       main_model=role["model"], subagent_model="deepseek-flash", funding_preflight_required=True)
+        print(json.dumps(summary, indent=2)); return 0
     if options.check:
         print(json.dumps(summary, indent=2))
         return 0
+    funding_ready(key)
     if options.role == "worker":
         # Reviewed settings pin worktree.baseRef=head; record the task base.
         worktree_path = worker_path(worktree_name)
@@ -169,9 +245,7 @@ def main() -> int:
     if options.role == "worker":
         history_registry.register_worktree(ROOT, worktree_name)
     config_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
-           and key not in ("A6API_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY")}
+    env = {k:v for k,v in os.environ.items() if k in ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "LOGNAME", "SHELL")}
     env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "/usr/bin:/bin")
     env.update({
         "ANTHROPIC_BASE_URL": data["anthropic_base_url"],
@@ -180,7 +254,7 @@ def main() -> int:
     })
     for alias, model in data["aliases"].items():
         env[f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL"] = model
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = "haiku"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = "deepseek-flash"
     if os.environ.get("PHPRETRO_OPENROUTER_ENV"):
         env["PHPRETRO_OPENROUTER_ENV"] = os.environ["PHPRETRO_OPENROUTER_ENV"]
     mcp = ROOT / ".mcp.json"
@@ -198,7 +272,10 @@ def main() -> int:
     command += extra
     print("[phpretro-builder] " + json.dumps(summary), file=sys.stderr, flush=True)
     os.chdir(ROOT)
-    os.execve(str(binary), command, env)
+    slots = ROOT / "scripts/deepseek-slots.py"
+    if not slots.is_file():
+        raise SetupError("Worker dispatch paused: the shared four-worker slots wrapper is not integrated.")
+    os.execve(sys.executable, [sys.executable, str(slots), "run", "--", *command], env)
     return 0
 
 

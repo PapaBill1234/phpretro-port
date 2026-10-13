@@ -2,7 +2,7 @@
 name: Explore
 description: Fast read-only source discovery; narrow candidate paths and verify exact symbols before implementation.
 tools: Read, Grep, Glob, mcp__jev__jev_judge
-model: haiku
+model: deepseek-flash
 effort: medium
 maxTurns: 15
 ---

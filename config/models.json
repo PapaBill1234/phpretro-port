@@ -1,40 +1,60 @@
 {
   "schema": "phpretro.builder.models.v1",
-  "anthropic_base_url": "https://api.a6api.com",
-  "provider_models_url": "https://api.a6api.com/v1/models",
-  "verified_at": "2026-10-11",
+  "anthropic_base_url": "https://api.deepseek.com/anthropic",
+  "provider_models_url": "https://api.deepseek.com/models",
+  "verified_at": "2026-10-13",
   "native_claude_version": "2.1.287",
   "aliases": {
-    "sonnet": "gpt-6.1-sol",
-    "haiku": "gpt-6-luna",
-    "opus": "gpt-6.1-sol"
+    "sonnet": "deepseek-flash[1m]",
+    "haiku": "deepseek-flash",
+    "opus": "deepseek-flash[1m]"
   },
   "roles": {
-    "lead": {"alias": "sonnet", "model": "gpt-6.1-sol", "effort": "high", "agent": "lead", "tools": "default"},
-    "backup": {"alias": "opus", "model": "gpt-6.1-sol", "effort": "high", "agent": "lead", "tools": "default"},
-    "worker": {"alias": "haiku", "model": "gpt-6-luna", "effort": "medium", "agent": "worker", "tools": "Read,Grep,Glob,Edit,Write,Bash,Skill,SendMessage,ListAgents"},
-    "reviewer": {"alias": "opus", "model": "gpt-6.1-sol", "effort": "high", "agent": "reviewer", "tools": "Read,Grep,Glob"}
+    "lead": {
+      "alias": "sonnet",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "agent": "lead",
+      "tools": "default",
+      "provider": "codex-chatgpt-subscription"
+    },
+    "backup": {
+      "alias": "opus",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "agent": "lead",
+      "tools": "default",
+      "provider": "codex-chatgpt-subscription"
+    },
+    "worker": {
+      "alias": "sonnet",
+      "model": "deepseek-flash[1m]",
+      "effort": "medium",
+      "agent": "worker",
+      "tools": "Read,Grep,Glob,Edit,Write,Bash,Skill,SendMessage,ListAgents",
+      "provider": "direct-deepseek"
+    },
+    "reviewer": {
+      "alias": "opus",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "agent": "reviewer",
+      "tools": "Read,Grep,Glob",
+      "provider": "codex-chatgpt-subscription"
+    }
   },
   "reported_aliases": {
-    "deepseek-v4.1-flash": ["deepseek-v4.1-flash", "cb/deepseek-v4.1-flash"],
-    "gpt-6-luna": ["gpt-6-luna", "cb/gpt-6-luna"],
-    "gpt-6.1-sol": ["gpt-6.1-sol"]
+    "direct_deepseek_flash": "deepseek-flash",
+    "codex_subscription_sol": "gpt-6.1-sol"
   },
   "verification": {
-    "catalog": "passed",
-    "messages_text_all_models": "passed",
-    "messages_sse_tool_roundtrip_all_models": "passed",
-    "native_cli_read_luna": "passed",
-    "native_cli_lead": "passed",
-    "native_cli_worker_worktree": "passed",
-    "native_cli_reviewer_read": "passed",
-    "independent_native_Sol_builder_source_review": "completed_blockers_found",
-    "native_subagent_Explore_model_selection": "passed",
-    "native_subagent_reviewer_model_selection": "pending",
-    "judge_mcp_lead_worker": "passed",
-    "native_doctor_installation": "passed",
-    "interactive_doctor_prompt_audit": "pending",
-    "provider_billing_rates": "unknown",
-    "interactive_handoff_configuration": "preflight_only_no_inference"
+    "direct_catalog": "passed_read_only",
+    "direct_worker": "402_insufficient_balance_no_patch",
+    "native_doctor": "preserved_not_rerun",
+    "codex_rpc_readiness": "passed_installed0.162.0_no_inference",
+    "codex_help_inference": "attempted180s_timeout_no_completed_verdict",
+    "funded_worker_dispatch": "pending",
+    "offline_prepare": "passed_private_keyless",
+    "controlled_rpc_and_ops_tests": "78_passed"
   }
 }
