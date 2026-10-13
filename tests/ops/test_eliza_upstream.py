@@ -37,6 +37,31 @@ def write_exe(path, body):
     return path
 
 
+def make_archive(path, files, dirs=()):
+    with tarfile.open(path, "w:gz") as tar:
+        for name in dirs:
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tar.addfile(info)
+        for name, body, mode in files:
+            data = body.encode()
+            info = tarfile.TarInfo(name)
+            info.mode = mode
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 class OffPeakGate(unittest.TestCase):
     def test_exact_boundaries(self):
         # 2026-10-13 is a Tuesday: peak 00:30-04:05 and 05:30-10:05 UTC.
@@ -235,6 +260,33 @@ class ProcessCleanup(unittest.TestCase):
             self.assertEqual(code, 75)
             self.assertLess(time.time() - started, 10)
 
+    def test_signal_death_is_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            code = upstream.run_supervised(
+                [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
+                cwd=directory, env=dict(os.environ), log_path=log)
+            self.assertEqual(code, 137)
+
+    def test_cutoff_cancels_orphan_grandchild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "pid"
+            log = Path(directory) / "log"
+            script = ("import subprocess, sys, time; "
+                      "p = subprocess.Popen(['sleep', '30']); "
+                      "open(sys.argv[1], 'w').write(str(p.pid)); time.sleep(30)")
+            stop_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=7)).isoformat()
+            code = upstream.run_supervised([sys.executable, "-c", script, str(pid_file)],
+                                           cwd=directory, env=dict(os.environ), log_path=log,
+                                           stop_at=stop_at)
+            self.assertEqual(code, 75)
+            self.assertTrue(pid_file.is_file())
+            grandchild = int(pid_file.read_text())
+            deadline = time.time() + 5
+            while pid_alive(grandchild) and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(pid_alive(grandchild))
+
 
 class CliFixture(unittest.TestCase):
     def test_cli_uses_pinned_binary_clean_env(self):
@@ -247,6 +299,7 @@ class CliFixture(unittest.TestCase):
                       "#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\nenv > %s\nexit 0\n"
                       % (argv_out, env_out))
             write_exe(upstream.node_bin(root), "#!/bin/sh\necho v24.15.0\n")
+            upstream.record_runtime(root, "bun", upstream.bun_bin(root))
             original_pin = upstream.UPSTREAM_PIN
             original_gate = upstream.gate_decision
             os.environ["OPENAI_API_KEY"] = "leak"
@@ -277,6 +330,85 @@ class CliFixture(unittest.TestCase):
                 self.assertEqual(upstream.main(["cli", "--", "--help"], root=root), 1)
             finally:
                 upstream.gate_decision = original_gate
+
+
+class DefaultArchivePaths(unittest.TestCase):
+    def test_extraction_lands_on_canonical_binary_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node_archive = root / "node.tgz"
+            make_archive(node_archive,
+                         files=[("node-v24.15.0-linux-x64/bin/node", "#!/bin/sh\necho v24.15.0\n", 0o755)],
+                         dirs=["node-v24.15.0-linux-x64", "node-v24.15.0-linux-x64/bin"])
+            bun_archive = root / "bun.tgz"
+            make_archive(bun_archive,
+                         files=[("package/bin/bun", "#!/bin/sh\necho 1.4.2\n", 0o755)],
+                         dirs=["package", "package/bin"])
+            original = upstream._ensure_archive
+            upstream._ensure_archive = lambda *a, **k: (bun_archive if k.get("sri") else node_archive)
+            try:
+                upstream.ensure_node(root)
+                upstream.ensure_bun(root)
+            finally:
+                upstream._ensure_archive = original
+            self.assertTrue(upstream.node_bin(root).is_file())
+            self.assertEqual(upstream.bun_bin(root),
+                             upstream.runtimes_dir(root) / "bun" / "package" / "bin" / "bun")
+            self.assertTrue(upstream.bun_bin(root).is_file())
+            self.assertIsNotNone(upstream.verified_runtime(root, "node"))
+            self.assertIsNotNone(upstream.verified_runtime(root, "bun"))
+
+
+class TamperReexecution(unittest.TestCase):
+    def test_tampered_cached_binary_is_not_trusted_or_executed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "bun.tgz"
+            make_archive(archive, files=[("package/bin/bun", "#!/bin/sh\necho 1.4.2\n", 0o755)],
+                         dirs=["package", "package/bin"])
+            original = upstream._ensure_archive
+            upstream._ensure_archive = lambda *a, **k: archive
+            try:
+                upstream.ensure_bun(root)
+            finally:
+                upstream._ensure_archive = original
+            self.assertIsNotNone(upstream.verified_runtime(root, "bun"))
+            with open(upstream.bun_bin(root), "ab") as handle:
+                handle.write(b"\n# tamper\n")
+            self.assertIsNone(upstream.verified_runtime(root, "bun"))
+            self.assertFalse(upstream.runtime_state(root)["ok"])
+            head = make_repo(upstream.source_dir(root))
+            original_pin = upstream.UPSTREAM_PIN
+            original_gate = upstream.gate_decision
+            try:
+                upstream.UPSTREAM_PIN = head
+                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": None}
+                self.assertEqual(upstream.main(["cli", "--", "--help"], root=root), 1)
+            finally:
+                upstream.UPSTREAM_PIN = original_pin
+                upstream.gate_decision = original_gate
+
+
+class AncestorSafety(unittest.TestCase):
+    def test_malicious_ancestor_preserves_external_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            external = root / "external"
+            external.mkdir()
+            (external / "marker.txt").write_text("keep")
+            upstream.runtimes_dir(root).mkdir(parents=True, exist_ok=True)
+            (upstream.runtimes_dir(root) / "bun").symlink_to(external)
+            archive = root / "bun.tgz"
+            make_archive(archive, files=[("package/bin/bun", "#!/bin/sh\necho 1.4.2\n", 0o755)],
+                         dirs=["package", "package/bin"])
+            original = upstream._ensure_archive
+            upstream._ensure_archive = lambda *a, **k: archive
+            try:
+                with self.assertRaises(upstream.SetupError):
+                    upstream.ensure_bun(root)
+            finally:
+                upstream._ensure_archive = original
+            self.assertTrue((external / "marker.txt").is_file())
 
 
 if __name__ == "__main__":

@@ -46,8 +46,10 @@ python3 scripts/eliza-upstream.py cli start
 - **check** is read-only and truthful. It reports the source pin versus the
   expected SHA, tracked modifications, runtime versions, whether `node_modules`
   is installed and whether provenance recorded the install. It never installs,
-  never downloads and never runs inference. Readiness is `true` only when all of
-  pin, runtimes and dependencies are verified.
+  never downloads and never runs inference. A runtime is only reported ready
+  when its bytes match the recorded digest, so an unverified binary is never
+  executed. Readiness is `true` only when all of pin, runtimes and dependencies
+  are verified.
 - **setup** is explicit and refuses to run while the off-peak gate is closed. It
   verifies the platform is linux-x64, downloads and verifies the pinned Node
   archive (SHA256 against the official `SHASUMS256.txt`), verifies the Bun
@@ -58,22 +60,30 @@ python3 scripts/eliza-upstream.py cli start
   script and the metadata-selected `appRegister` packages' own `build:js`.
   Environment is built from scratch (private PATH/cache, `LANG=C.UTF-8`); no
   arbitrary provider or cloud credential is inherited. Verified archives are
-  reused from the private cache; a hash mismatch re-downloads and re-verifies or
-  fails closed.
+  reused from the private cache; a cached runtime binary is re-hashed against its
+  recorded digest before reuse, and a hash mismatch re-installs or fails closed.
+  Every phase (clone, download, each subprocess) is bounded by the off-peak
+  cutoff.
 - **cli** runs the actual pinned Bun entry point
   `bun --no-install --conditions=eliza-source packages/app/src/entry.ts <argv>`
   with a clean private environment (`ELIZA_STATE_DIR` under `.builder/upstream`,
   local embeddings/voice/fused warmup disabled, loopback API bind). It requires a
-  pinned, clean checkout and refuses to launch while peak or without a verified
-  off-peak cutoff. No model/provider key is added and none is inherited.
+  pinned, clean checkout, verifies the Bun binary bytes before execution, and
+  refuses to launch while peak or without a verified off-peak cutoff. No
+  model/provider key is added and none is inherited.
 
 Optional `--node-path`/`--bun-path` accept a trusted operator-supplied runtime
 only after a matching `--version` check; otherwise setup fails closed. There is
 no fallback to global `node`/`bun`.
 
-Long-running steps run in their own process group and are TERM/KILL bounded with
-orphan cleanup on failure, cancellation or the off-peak cutoff. Setup holds one
-`fcntl` advisory lock with no PID file and no stale-PID unlink.
+Every delete or install first asserts the target stays inside `.builder/upstream`
+and crosses no symlinked ancestor, so a planted symlink cannot delete or write
+outside the private tree. Long-running steps run in their own process group and
+are TERM/KILL bounded with orphan cleanup on failure, cancellation or the
+off-peak cutoff; a helper that dies by signal is reported as a failure
+(`128+signum`), never success. Setup holds one `fcntl` advisory lock with no PID
+file and no stale-PID unlink. The off-peak decision is imported from the
+canonical `scripts/coding-window.py`.
 
 ## Integration seam (future work, not this task)
 

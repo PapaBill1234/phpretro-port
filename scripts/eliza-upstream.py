@@ -11,6 +11,7 @@ import base64
 import datetime as dt
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -21,6 +22,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -45,14 +47,7 @@ BUN_SHA256 = "0c75e0b94e9d56cece77abb7d03e9995b47b79506df5dcca3046eeb888db5934"
 ALLOWED_HOSTS = frozenset({"nodejs.org", "registry.npmjs.org"})
 LOG_LIMIT_BYTES = 4 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[1]
-
-# Off-peak coding gate mirrored from scripts/coding-window.py: DeepSeek peak
-# windows are weekdays (Mon-Fri, UTC) 01:00-04:00 and 06:00-10:00, buffered by
-# +5 min at the start and -30 min before the end.  Setup and CLI refuse to run
-# while a window is active or missing.
-PEAK_UTC = ((1, 4), (6, 10))
-GATE_SOURCE = "https://api-docs.deepseek.com/quick_start/pricing/"
-GATE_LOOKAHEAD_DAYS = 14
+_CODING_WINDOW = None
 
 
 class SetupError(Exception):
@@ -80,8 +75,12 @@ def node_bin(root):
     return node_dir(root) / "bin" / "node"
 
 
+def bun_dir(root):
+    return runtimes_dir(root) / "bun"
+
+
 def bun_bin(root):
-    return runtimes_dir(root) / "bun" / "package" / "bin" / "bun"
+    return bun_dir(root) / "package" / "bin" / "bun"
 
 
 def cache_dir(root):
@@ -96,6 +95,10 @@ def state_dir(root):
     return private_root(root) / "state"
 
 
+def integrity_path(root):
+    return private_root(root) / "runtime-integrity.json"
+
+
 def source_dir(root):
     return Path(root) / SOURCE_REL
 
@@ -104,42 +107,58 @@ def provenance_path(root):
     return private_root(root) / "provenance.json"
 
 
-# --- off-peak gate ----------------------------------------------------------
+# --- ownership containment (no symlink ancestors) ---------------------------
+def assert_private(root, target, action):
+    """Refuse a delete/install path that escapes, or crosses, a private symlink."""
+    base = Path(private_root(root))
+    if base.is_symlink():
+        raise SetupError("private tree root is a symlink; refusing %s" % action, code=1)
+    target = Path(target)
+    try:
+        rel = target.relative_to(base)
+    except ValueError:
+        raise SetupError("path outside private tree: %s" % target, code=1)
+    current = base
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            raise SetupError("unsafe symlink in private path: %s" % current, code=1)
+    return target
+
+
+# --- off-peak gate (canonical scripts/coding-window.py) ---------------------
+def coding_window(root=None):
+    global _CODING_WINDOW
+    if _CODING_WINDOW is not None:
+        return _CODING_WINDOW
+    path = (Path(root) if root else ROOT) / "scripts" / "coding-window.py"
+    if not path.is_file():
+        raise SetupError("canonical coding-window.py not found; no off-peak decision", code=75)
+    spec = importlib.util.spec_from_file_location("phpretro_coding_window", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _CODING_WINDOW = module
+    return module
+
+
 def gate_decision(now=None):
-    """Return the off-peak decision for ``now`` (UTC)."""
-    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    active = []
-    upcoming = []
-    for offset in range(-1, GATE_LOOKAHEAD_DAYS):
-        date = day + dt.timedelta(days=offset)
-        if date.weekday() >= 5:
-            continue
-        for start, end in PEAK_UTC:
-            begin = date + dt.timedelta(hours=start, minutes=-30)
-            finish = date + dt.timedelta(hours=end, minutes=5)
-            if begin <= now < finish:
-                active.append((begin, finish))
-            elif begin > now:
-                upcoming.append(begin)
-    blocked = bool(active)
-    cutoff = min(upcoming) if upcoming else None
-    return {
-        "allowed": not blocked and cutoff is not None,
-        "timezone": "UTC",
-        "observed_at": now.isoformat(),
-        "reason": "peak_or_buffer" if blocked else ("off_peak" if cutoff else "no_cutoff"),
-        "next_allowed_at": (active[0][1] if blocked else now).isoformat(),
-        "stop_at": cutoff.isoformat() if (not blocked and cutoff) else None,
-        "source": GATE_SOURCE,
-    }
+    return coding_window().decision(now)
 
 
 def enforce_gate(now=None):
     decision = gate_decision(now)
-    if not decision["allowed"]:
-        raise SetupError("off-peak gate closed (%s); refusing to run" % decision["reason"], code=75)
+    if not decision.get("allowed"):
+        raise SetupError("off-peak gate closed (%s); refusing to run" % decision.get("reason"), code=75)
     return decision
+
+
+def remaining(stop_at, floor=1):
+    if not stop_at:
+        return None
+    try:
+        return max(floor, dt.datetime.fromisoformat(stop_at).timestamp() - time.time())
+    except (TypeError, ValueError):
+        return None
 
 
 # --- integrity helpers ------------------------------------------------------
@@ -174,6 +193,37 @@ def parse_shasums(text, filename):
     return None
 
 
+def load_integrity(root):
+    try:
+        return json.loads(integrity_path(root).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_runtime(root, kind, binary):
+    """Record verified runtime bytes so future reuse re-checks before execution."""
+    data = load_integrity(root)
+    data[kind] = {"path": str(Path(binary)), "sha256": sha256_file(binary)}
+    integrity_path(root).parent.mkdir(parents=True, exist_ok=True)
+    integrity_path(root).write_text(json.dumps(data, indent=2) + "\n")
+
+
+def verified_runtime(root, kind):
+    """Return the runtime binary only if its bytes match the recorded digest."""
+    entry = load_integrity(root).get(kind)
+    if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
+        return None
+    binary = Path(entry["path"])
+    if not binary.is_file():
+        return None
+    try:
+        if sha256_file(binary) != entry["sha256"]:
+            return None
+    except OSError:
+        return None
+    return binary
+
+
 # --- bounded, fail-closed extraction ----------------------------------------
 def _within(target, base):
     target = os.path.normpath(str(target))
@@ -206,7 +256,6 @@ def validate_archive_members(archive, dest):
 
 
 def _extract_member(tar, member, dest):
-    """Extract one validated member; use the data filter where supported."""
     try:
         tar.extract(member, path=str(dest), filter="data")
     except TypeError:  # Python < 3.12 has no extraction filters
@@ -302,7 +351,12 @@ def run_supervised(argv, cwd, env, log_path, stop_at=None):
             return 143
         if halted:
             return 75
-        return child.returncode if child.returncode and child.returncode > 0 else 0
+        code = child.returncode
+        if code is None:
+            return 1
+        if code < 0:  # killed by a signal: report 128+signum, never success
+            return 128 - code
+        return code
     finally:
         if child is not None:
             terminate_group(child.pid, time.time() + 3)
@@ -323,7 +377,7 @@ def _truncate_log(path):
 
 
 # --- network (allowlisted, verified before use) -----------------------------
-def fetch(url, dest):
+def fetch(url, dest, timeout=300):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
         raise SetupError("refusing off-host URL: %s" % url, code=1)
@@ -331,13 +385,17 @@ def fetch(url, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "phpretro-eliza-upstream"})
-    with urllib.request.urlopen(request, timeout=120) as response, open(tmp, "wb") as out:
-        shutil.copyfileobj(response, out, length=1024 * 1024)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response, open(tmp, "wb") as out:
+            shutil.copyfileobj(response, out, length=1024 * 1024)
+    except (OSError, urllib.error.URLError) as error:
+        tmp.unlink(missing_ok=True)
+        raise SetupError("download failed: %s (%s)" % (url, error), code=1)
     os.replace(tmp, dest)
     return dest
 
 
-def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None):
+def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, timeout=300):
     dest = Path(dest)
     if dest.exists():
         if sha256 and not verify_sha256(dest, sha256):
@@ -346,14 +404,14 @@ def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None):
             dest.unlink()
         else:
             return dest
-    fetch(url, dest)
+    fetch(url, dest, timeout=timeout)
     if sri and not verify_sri(dest, sri):
         raise SetupError("download failed SRI verification: %s" % url, code=1)
     if sha256 and not verify_sha256(dest, sha256):
         raise SetupError("download failed SHA256 verification: %s" % url, code=1)
     if shasums:
         shasums_file = dest.with_name(dest.name + ".SHASUMS256.txt")
-        text = fetch(shasums, shasums_file).read_text()
+        text = fetch(shasums, shasums_file, timeout=timeout).read_text()
         expected = parse_shasums(text, dest.name)
         if not expected or not verify_sha256(dest, expected):
             raise SetupError("download failed official SHASUMS check: %s" % url, code=1)
@@ -387,8 +445,8 @@ def validate_provided_runtime(path, kind):
     return binary
 
 
-def _link_runtime(dest, source):
-    dest = Path(dest)
+def _link_runtime(root, dest, source):
+    dest = assert_private(root, dest, "link runtime")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_symlink() or dest.exists():
         dest.unlink()
@@ -396,11 +454,14 @@ def _link_runtime(dest, source):
 
 
 def ensure_node(root, provided=None):
+    private_root(root).mkdir(parents=True, exist_ok=True)
     if provided is not None:
-        _link_runtime(node_bin(root), validate_provided_runtime(provided, "node"))
+        _link_runtime(root, node_bin(root), validate_provided_runtime(provided, "node"))
+        record_runtime(root, "node", node_bin(root))
         return node_bin(root)
-    if _version(node_bin(root)) == "v%s" % NODE_VERSION:
+    if verified_runtime(root, "node") is not None:
         return node_bin(root)
+    assert_private(root, node_dir(root), "install node")
     archive = _ensure_archive(NODE_URL, cache_dir(root) / NODE_ARCHIVE,
                               sha256=NODE_SHA256, shasums=NODE_SHASUMS_URL)
     tmp = Path(tempfile.mkdtemp(prefix="node-", dir=str(private_root(root))))
@@ -409,21 +470,26 @@ def ensure_node(root, provided=None):
         source = tmp / ("node-v%s-%s" % (NODE_VERSION, NODE_ARCH))
         if _version(source / "bin" / "node") != "v%s" % NODE_VERSION:
             raise SetupError("extracted Node failed version check", code=1)
-        if node_dir(root).exists():
+        assert_private(root, node_dir(root), "replace node")
+        if node_dir(root).exists() or node_dir(root).is_symlink():
             shutil.rmtree(node_dir(root))
         node_dir(root).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(node_dir(root)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    record_runtime(root, "node", node_bin(root))
     return node_bin(root)
 
 
 def ensure_bun(root, provided=None):
+    private_root(root).mkdir(parents=True, exist_ok=True)
     if provided is not None:
-        _link_runtime(bun_bin(root), validate_provided_runtime(provided, "bun"))
+        _link_runtime(root, bun_bin(root), validate_provided_runtime(provided, "bun"))
+        record_runtime(root, "bun", bun_bin(root))
         return bun_bin(root)
-    if _version(bun_bin(root)) == BUN_VERSION:
+    if verified_runtime(root, "bun") is not None:
         return bun_bin(root)
+    assert_private(root, bun_dir(root), "install bun")
     archive = _ensure_archive(BUN_URL, cache_dir(root) / BUN_ARCHIVE, sri=BUN_SRI, sha256=BUN_SHA256)
     tmp = Path(tempfile.mkdtemp(prefix="bun-", dir=str(private_root(root))))
     try:
@@ -431,23 +497,27 @@ def ensure_bun(root, provided=None):
         source = tmp / "package"
         if _version(source / "bin" / "bun") != BUN_VERSION:
             raise SetupError("extracted Bun failed version check", code=1)
-        destination = runtimes_dir(root) / "bun"
-        if destination.exists():
-            shutil.rmtree(destination)
+        destination = bun_bin(root).parent.parent  # runtimes/bun/package
+        assert_private(root, destination, "replace bun")
+        if bun_dir(root).exists() or bun_dir(root).is_symlink():
+            shutil.rmtree(bun_dir(root))
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    record_runtime(root, "bun", bun_bin(root))
     return bun_bin(root)
 
 
 # --- source checkout --------------------------------------------------------
-def _git(args, cwd=None):
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+def _git(args, cwd=None, timeout=600):
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SetupError("git %s timed out" % (args[0] if args else "command"), code=75)
 
 
 def source_state(root):
-    """Truthful pin/modification status without installing anything."""
     src = source_dir(root)
     if not src.exists():
         return {"present": False, "ok": False, "reason": "missing"}
@@ -468,14 +538,16 @@ def source_state(root):
     return {"present": True, "ok": True, "reason": "pinned_clean", "revision": revision}
 
 
-def ensure_source(root):
+def ensure_source(root, stop_at=None):
     src = source_dir(root)
     if not src.exists():
         src.parent.mkdir(parents=True, exist_ok=True)
-        clone = _git(["clone", UPSTREAM_REPO, str(src)])
+        timeout = remaining(stop_at) or 600
+        clone = _git(["clone", UPSTREAM_REPO, str(src)], timeout=timeout)
         if clone.returncode != 0:
+            shutil.rmtree(src, ignore_errors=True)
             raise SetupError("source clone failed: %s" % clone.stderr.strip(), code=1)
-        checkout = _git(["checkout", "--detach", UPSTREAM_PIN], cwd=str(src))
+        checkout = _git(["checkout", "--detach", UPSTREAM_PIN], cwd=str(src), timeout=timeout)
         if checkout.returncode != 0:
             raise SetupError("pin checkout failed: %s" % checkout.stderr.strip(), code=1)
     state = source_state(root)
@@ -587,12 +659,11 @@ def setup_lock(root):
 
 # --- commands ---------------------------------------------------------------
 def runtime_state(root):
-    node = node_bin(root)
-    bun = bun_bin(root)
-    node_version = _version(node) if node.exists() or node.is_symlink() else None
-    bun_version = _version(bun) if bun.exists() or bun.is_symlink() else None
-    ok = node_version == "v%s" % NODE_VERSION and bun_version == BUN_VERSION
-    return {"ok": ok, "node": node_version, "bun": bun_version,
+    node = verified_runtime(root, "node")
+    bun = verified_runtime(root, "bun")
+    return {"ok": node is not None and bun is not None,
+            "node": _version(node) if node else None,
+            "bun": _version(bun) if bun else None,
             "expected": {"node": "v%s" % NODE_VERSION, "bun": BUN_VERSION}}
 
 
@@ -625,31 +696,30 @@ def command_setup(root, node_path=None, bun_path=None):
     private_root(root).mkdir(parents=True, exist_ok=True)
     phases = {}
     with setup_lock(root):
-        enforce_gate()
+        gate = enforce_gate()
         ensure_node(root, provided=node_path)
         ensure_bun(root, provided=bun_path)
         phases["runtimes"] = {"node": str(node_bin(root)), "bun": str(bun_bin(root))}
-        enforce_gate()
-        src = ensure_source(root)
+        gate = enforce_gate()
+        src = ensure_source(root, stop_at=gate["stop_at"])
         phases["source"] = {"revision": UPSTREAM_PIN}
-        enforce_gate()
-        code = run_supervised(frozen_install_argv(bun_bin(root)), cwd=src,
-                              env=build_env(root), log_path=logs_dir(root) / "install.log")
-        if code != 0:
-            raise SetupError("frozen install failed (exit %s)" % code, code=1)
-        phases["install"] = {"argv": frozen_install_argv(str(bun_bin(root))), "exit": code}
-        enforce_gate()
-        code = run_supervised(symlink_argv(bun_bin(root)), cwd=src,
-                              env=build_env(root), log_path=logs_dir(root) / "symlinks.log")
-        if code != 0:
-            raise SetupError("workspace symlink step failed (exit %s)" % code, code=1)
-        enforce_gate()
+        assert_private(root, logs_dir(root), "write logs")
+        steps = [("install", frozen_install_argv(bun_bin(root)), "install.log"),
+                 ("symlinks", symlink_argv(bun_bin(root)), "symlinks.log")]
+        for label, argv, log in steps:
+            gate = enforce_gate()
+            code = run_supervised(argv, cwd=src, env=build_env(root),
+                                  log_path=logs_dir(root) / log, stop_at=gate["stop_at"])
+            if code != 0:
+                raise SetupError("%s failed (exit %s)" % (label, code), code=1)
+            phases[label] = {"argv": [str(part) for part in argv], "exit": code}
         packages = select_registration_packages(src / "plugins")
         for name, package_dir in packages:
-            enforce_gate()
+            gate = enforce_gate()
             code = run_supervised(registration_argv(bun_bin(root), package_dir), cwd=src,
                                   env=build_env(root),
-                                  log_path=logs_dir(root) / ("registration-%s.log" % name.replace("/", "_")))
+                                  log_path=logs_dir(root) / ("registration-%s.log" % name.replace("/", "_")),
+                                  stop_at=gate["stop_at"])
             if code != 0:
                 raise SetupError("registration build failed for %s (exit %s)" % (name, code), code=1)
         phases["registrations"] = [name for name, _ in packages]
@@ -664,10 +734,12 @@ def command_cli(root, argv):
     source = source_state(root)
     if not source["ok"]:
         raise SetupError("source not pinned/clean: %s" % source["reason"], code=1)
-    if not (bun_bin(root).exists() or bun_bin(root).is_symlink()):
-        raise SetupError("pinned Bun runtime missing; run setup", code=1)
-    state_dir(root).mkdir(parents=True, exist_ok=True)
-    return run_supervised(cli_argv(bun_bin(root), argv), cwd=source_dir(root),
+    bun = verified_runtime(root, "bun")
+    if bun is None:
+        raise SetupError("pinned Bun runtime missing or unverified; run setup", code=1)
+    state = assert_private(root, state_dir(root), "write state")
+    state.mkdir(parents=True, exist_ok=True)
+    return run_supervised(cli_argv(bun, argv), cwd=source_dir(root),
                           env=client_env(root), log_path=logs_dir(root) / "cli.log",
                           stop_at=decision.get("stop_at"))
 
