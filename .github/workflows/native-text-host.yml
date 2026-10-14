@@ -1,0 +1,44 @@
+name: Native text host qualification
+
+# Push-only, path-scoped, and never triggered by a pull request or
+# pull_request_target. It runs on the integration branch only, so a worker
+# branch push (which runs the standard Verify workflow) never launches the heavy
+# job. The heavy job itself is refused by the wrapper until the reviewed
+# stop-receipt API is present and integrated.
+on:
+  push:
+    branches:
+      - build/eliza-deepseek-themes
+    paths:
+      - scripts/native-host.py
+      - scripts/native-host-ci.py
+      - tests/ops/test_native_host_ci.py
+      - docs/eliza-native-ci.md
+      - builder/eliza/native-host/**
+      - .github/workflows/native-text-host.yml
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the fixed source (no credentials, no submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Run the bounded native host qualification wrapper
+        run: python3 scripts/native-host-ci.py --caller-limit-seconds 3600
+
+      - name: Upload the sanitized qualification artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-text-host-qualification
+          path: .builder/native-host-ci/artifact/
+          retention-days: 3
+          if-no-files-found: error

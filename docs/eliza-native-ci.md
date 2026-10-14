@@ -1,0 +1,124 @@
+# Eliza native text-host CI qualification (G05-native-ci-build)
+
+This document describes the bounded, push-only CI job that turns the reviewed
+source-only startup/registry/adversarial test patches into compiled
+qualification evidence. It is **not** runtime, browser, model or native-admission
+evidence.
+
+## Status
+
+**Authored and unrun.** No Rust build, service, inference or network call was
+made while authoring this task. The heavy job is deliberately refused until the
+reviewed stop-receipt fix is present in the accepted source and independently
+accepted and integrated. The runtime guard remains false and main is unchanged.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `.github/workflows/native-text-host.yml` | The push-only hosted job (checkout, wrapper, artifact). |
+| `scripts/native-host-ci.py` | The bounded wrapper that drives the accepted `native-host.py` APIs. |
+| `tests/ops/test_native_host_ci.py` | Fixture tests for the wrapper's pure logic and orchestration. |
+| `docs/eliza-native-ci.md` | This document. |
+
+## Workflow contract
+
+- **Triggers:** `push` to `build/eliza-deepseek-themes` only, path-scoped to the
+  owned native paths. There is **no** `pull_request` and **no**
+  `pull_request_target`, so a worker-branch push runs only the standard `Verify`
+  workflow.
+- `runs-on: ubuntu-24.04`, `timeout-minutes: 90`, `permissions: contents: read`.
+- `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` with
+  `persist-credentials: false` and `submodules: false`.
+- `actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02` (v4) with
+  `retention-days: 3`, uploading only the wrapper's allowlisted artifact
+  directory. No `actions/cache`, so no credential or cache data is uploaded.
+
+## Wrapper contract
+
+1. **Identity first.** GitHub repo/ref/sha/run/attempt are captured from the
+   environment *before* it is cleared. A non-commit `GITHUB_SHA` is refused.
+2. **Credential exclusion.** The child environment is an allowlist
+   (`PATH`, `LANG`, `LC_ALL`, `TZ`, `NO_COLOR`, `TERM`) with a private `HOME`.
+   Every token, provider key and `GITHUB_*` value is dropped.
+3. **Mechanical prerequisite.** The accepted `native-host.py` must expose
+   `record_build_attempt` and a `run_supervised` that accepts `outcome`. Absence
+   is a refusal *before* any heavy setup; no gate, preflight or build runs.
+4. **One immutable deadline.** A single deadline =
+   `min(canonical off-peak cutoff, caller limit, default 3600s)` is captured once
+   and passed to every stage. Any gate override is restored in `finally`.
+5. **Resource preflight.** The accepted 3 GiB RAM / 12 GiB disk floors are
+   checked before heavy work; an unknown reading fails closed. No broad disk
+   cleanup is performed.
+6. **Production build first.** The unchanged pinned source is prepared with the
+   reviewed production patch and the locked release-local version repair and the
+   accepted fixed profile. The production patch, lock, binary and profile are
+   verified. Test patches only follow a successful production build.
+7. **Ordered test patches.** Only the three public test patches
+   (`qualification-tests`, `qualification-registry`, `qualification-adversarial`)
+   are applied, in that exact order, each with its reviewed patch digest and the
+   expected patched target digests, and a **test-file-only** scope. Production
+   source, lock, binary and provenance digests are rechecked afterwards.
+8. **Bounded compile.** A locked online `cargo test --release --locked --jobs 1
+   --no-run -p codex-core --lib` preparation, then the offline qualification
+   command `cargo test --release --locked --offline --jobs 1 -p codex-core --lib
+   native_text_host_qualification -- --test-threads=1`. Every heavy command runs
+   under one `run_supervised` cutoff, the RAM floor and the filtered release
+   environment.
+9. **Exact results.** Exactly the fifteen selected test names must complete: 15
+   passed and zero failed/ignored/skipped. Missing, duplicate, unexpected,
+   empty or truncated results fail qualification even on exit 0. Extra unrelated
+   results are ignored.
+
+## The fifteen selected tests
+
+Gathered from the three patches (startup, registry, adversarial):
+
+- `native_text_host_qualification_new_thread_without_init_captures_empty_ceiling`
+- `native_text_host_qualification_overwrites_unrestricted_caller_init`
+- `native_text_host_qualification_overwrites_conflicting_caller_init`
+- `native_text_host_qualification_legacy_history_mode_is_covered`
+- `native_text_host_qualification_legacy_fork_is_covered`
+- `native_text_host_qualification_internal_guardian_source_is_covered`
+- `native_text_host_qualification_cold_resume_captures_empty_ceiling`
+- `native_text_host_qualification_manager_started_registry_is_empty`
+- `native_text_host_qualification_manager_started_registry_rejects_dynamic_tools`
+- `native_text_host_qualification_captured_policy_rejects_registration`
+- `native_text_host_qualification_warm_resume_keeps_live_session_and_ceiling`
+- `native_text_host_qualification_cold_resume_constructor_matrix_captures_ceiling`
+- `native_text_host_qualification_manager_started_code_mode_only_registry_is_empty`
+- `native_text_host_qualification_manager_started_code_mode_registry_is_empty`
+- `native_text_host_qualification_captured_policy_denies_dispatch`
+
+## Patch and target digests
+
+| Patch | SHA-256 | Patched target digest |
+| --- | --- | --- |
+| `text-only.patch` | `09b3ef5a…66c7f` | `thread_manager.rs` = `d65c1697…88bf8` |
+| `qualification-tests.patch` | `c2c2f0bb…3fc57` | `thread_manager_tests.rs` = `4e0ec767…28d3e0` |
+| `qualification-registry.patch` | `21a127fa…8d0408` | `spec_plan_tests.rs` = `cef566b0…be09c`; `registry_tests.rs` = `6d1621dc…8c2b7` |
+| `qualification-adversarial.patch` | `952355fb…cb5edc` | `thread_manager_tests.rs` = `13b3e918…618aa`; `spec_plan_tests.rs` = `569d21b9…d3dc4`; `registry_tests.rs` = `ffb81085…08570857` |
+
+The full digests are embedded in `scripts/native-host-ci.py`; the reviewed docs
+give the leading/trailing segments shown here.
+
+## Artifact allowlist
+
+On success the artifact contains only the compiled `codex` binary, the sanitized
+JSON receipt, and the upstream `LICENSE`/`NOTICE`. On failure it contains only
+the truthful receipt: no qualified binary, no partial binary, no home data and
+no full build or test logs. The receipt records the exact build inputs (source
+pin, patch, lock, toolchain, profile, binary digest), the test-patch digests and
+observed result names, the GitHub run/ref/SHA identity, timing and resources,
+and always `native_admission: false` with the guard unchanged.
+
+## Remaining gaps
+
+- The heavy job is **unrun**: no compiled qualification, resource fit or artifact
+  integrity is claimed until the stop-receipt prerequisite is accepted,
+  integrated and a fresh quota window permits a real run.
+- The wrapper is authored against the accepted read-only API; the
+  `record_build_attempt` helper is not yet in the accepted source, so the
+  wrapper refuses rather than launching heavy work.
+- Import of the resulting binary remains a separate, independently reviewed
+  task. This task neither imports nor admits anything.
