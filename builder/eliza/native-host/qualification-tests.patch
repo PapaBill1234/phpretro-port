@@ -1,0 +1,258 @@
+diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
+index c9c6fde..8299817 100644
+--- a/codex-rs/core/src/thread_manager_tests.rs
++++ b/codex-rs/core/src/thread_manager_tests.rs
+@@ -3358,3 +3358,253 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
+         1,
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Native text-host qualification (source-level, unbuilt here).
++//
++// The reviewed `text-only.patch` inserts an unconditional empty `ToolPolicy`
++// ceiling in the single production spawn funnel
++// (`ThreadManagerState::spawn_thread`), *after* any caller-supplied
++// `thread_extension_init` and before `Session::new` captures it. These tests
++// drive the real `ThreadManager` startup/resume/fork/internal entry points and
++// assert the manager-started session captured that empty ceiling, regardless of
++// the caller init supplied (absent, unrestricted, or conflicting). No turn is
++// submitted and no model/account/network call is made.
++// ---------------------------------------------------------------------------
++
++fn qh_init_with(policy: codex_extension_api::ToolPolicy) -> codex_extension_api::ExtensionDataInit {
++    let mut init = codex_extension_api::ExtensionDataInit::new();
++    init.insert(policy);
++    init
++}
++
++/// The ordinary (unrestricted) policy a caller could mistakenly expect to keep.
++fn qh_unrestricted_policy() -> codex_extension_api::ToolPolicy {
++    codex_extension_api::ToolPolicy::default()
++}
++
++/// A permissive policy that would relax the ceiling if it were not overwritten.
++fn qh_conflicting_policy() -> codex_extension_api::ToolPolicy {
++    codex_extension_api::ToolPolicy {
++        allowed_tools: Some(vec![codex_tools::ToolName::plain("exec_command")]),
++        require_managed_sandbox: false,
++        require_unified_exec: false,
++        expose_additional_permissions: true,
++    }
++}
++
++/// Asserts the session captured exactly the reviewed empty ceiling.
++fn qh_assert_empty_ceiling(new_thread: &NewThread) {
++    let policy = new_thread.thread.session.tool_policy.as_ref();
++    assert_eq!(
++        policy.allowed_tools.as_ref().map(Vec::len),
++        Some(0),
++        "manager-started session must capture an empty tool ceiling"
++    );
++    assert!(
++        !policy.require_managed_sandbox,
++        "ceiling must not require a managed sandbox"
++    );
++    assert!(
++        !policy.require_unified_exec,
++        "ceiling must not require unified exec"
++    );
++    assert!(
++        !policy.expose_additional_permissions,
++        "ceiling must not expose additional permissions"
++    );
++}
++
++/// Offline manager fixture: temp codex home, dummy auth, test environment manager.
++async fn qh_manager() -> (tempfile::TempDir, ThreadManager, Config) {
++    let temp_dir = tempdir().expect("tempdir");
++    let mut config = test_config().await;
++    config.codex_home = temp_dir.path().join("codex-home").abs();
++    config.cwd = config.codex_home.abs();
++    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
++    let manager = ThreadManager::with_models_provider_and_home_for_tests(
++        CodexAuth::from_api_key("dummy"),
++        config.model_provider.clone(),
++        config.codex_home.to_path_buf(),
++        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++    );
++    (temp_dir, manager, config)
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_new_thread_without_init_captures_empty_ceiling() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let started = manager
++        .start_thread(StartThreadOptions::new(config))
++        .await
++        .expect("start new thread without caller init");
++    qh_assert_empty_ceiling(&started);
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down new thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_overwrites_unrestricted_caller_init() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let started = manager
++        .start_thread(StartThreadOptions {
++            thread_extension_init: qh_init_with(qh_unrestricted_policy()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .expect("start new thread with unrestricted caller init");
++    qh_assert_empty_ceiling(&started);
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down new thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_overwrites_conflicting_caller_init() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let started = manager
++        .start_thread(StartThreadOptions {
++            thread_extension_init: qh_init_with(qh_conflicting_policy()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .expect("start new thread with conflicting caller init");
++    qh_assert_empty_ceiling(&started);
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down new thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_legacy_history_mode_is_covered() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let started = manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            thread_extension_init: qh_init_with(qh_conflicting_policy()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .expect("start legacy thread");
++    qh_assert_empty_ceiling(&started);
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down legacy thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_legacy_fork_is_covered() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let root = manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            ..StartThreadOptions::new(config.clone())
++        })
++        .await
++        .expect("start fork source thread");
++    qh_assert_empty_ceiling(&root);
++    let fork = manager
++        .spawn_legacy_subagent(
++            root.thread_id,
++            StartThreadOptions {
++                thread_extension_init: qh_init_with(qh_conflicting_policy()),
++                ..StartThreadOptions::new(config)
++            },
++        )
++        .await
++        .expect("fork legacy subagent");
++    qh_assert_empty_ceiling(&fork);
++    fork.thread.shutdown_and_wait().await.expect("shut down fork");
++    root.thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down fork source");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_internal_guardian_source_is_covered() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let root = manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            ..StartThreadOptions::new(config.clone())
++        })
++        .await
++        .expect("start internal parent thread");
++    let internal = manager
++        .spawn_internal_session(
++            root.thread_id,
++            StartThreadOptions {
++                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
++                thread_extension_init: qh_init_with(qh_conflicting_policy()),
++                ..StartThreadOptions::new(config)
++            },
++        )
++        .await
++        .expect("start internal guardian session");
++    qh_assert_empty_ceiling(&internal);
++    internal
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down internal session");
++    root.thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down internal parent");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_cold_resume_captures_empty_ceiling() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let original = manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            ..StartThreadOptions::new(config.clone())
++        })
++        .await
++        .expect("start resume source thread");
++    original.thread.ensure_rollout_materialized().await;
++    original
++        .thread
++        .flush_rollout()
++        .await
++        .expect("flush source rollout");
++    let rollout_path = original
++        .thread
++        .rollout_path()
++        .expect("source rollout path should exist");
++    let original_id = original.thread_id;
++    original
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down source thread");
++    let _ = manager.remove_thread(&original_id).await;
++
++    let resumed = manager
++        .resume_legacy_thread_from_rollout(
++            config,
++            rollout_path,
++            Arc::clone(&manager.state.auth_manager),
++            /*parent_trace*/ None,
++            ClientMcpExtensions::default(),
++        )
++        .await
++        .expect("cold resume source thread");
++    qh_assert_empty_ceiling(&resumed);
++    resumed
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down resumed thread");
++}
