@@ -28,16 +28,20 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 HIGH_CONTEXT_CACHE_TOKENS = 200_000
 
-# Only these metadata keys are ever read; anything else is dropped.
+# Only these metadata keys are ever read; anything else is dropped. The task id
+# field has no single name, so the trusted forms are aliased here.
 META_KEYS = {
     "attempt_id": ("attempt_id", "attemptId", "id"),
-    "task_id": ("task_id", "taskId"),
+    "task_id": ("task_id", "taskId", "task"),
     "provider": ("provider",),
     "model": ("model",),
 }
 # Defensive: a metadata key matching this is never copied even if allowlisted.
 SECRET_NAME = re.compile(r"(?i)(key|token|secret|auth|passwd|password|bearer|credential|cookie|session|account)")
 LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+# Model ids may carry a routing suffix such as deepseek-flash[1m]; brackets and a
+# few separators are allowed but the label stays bounded with no spaces/quotes.
+MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@\[\]-]{0,63}$")
 UNIT_FACTORS = {"per_million_tokens": 1_000_000, "per_thousand_tokens": 1_000}
 BUDGET_SUBTYPES = {"error_max_turns", "max_turns", "error_budget", "budget_stop", "error_limit"}
 COUNTER_KEYS = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens")
@@ -51,8 +55,8 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
-def sanitize_label(value):
-    if isinstance(value, str) and LABEL.match(value):
+def sanitize_label(value, pattern=LABEL):
+    if isinstance(value, str) and pattern.match(value):
         return value
     return None
 
@@ -97,11 +101,18 @@ def safe_read_bytes(path: Path, limit: int) -> bytes:
 
 
 def decode_values(data: bytes):
-    """Decode a possibly concatenated stream of JSON values ("startup config" + result)."""
+    """Extract complete top-level JSON values, skipping prose diagnostics safely.
+
+    Native ``--output-format json`` can interleave CLI startup text, one complete
+    JSON config frame (which may hold secrets), intervening diagnostic text and the
+    final result value. Only values that begin at the start of a line and end before
+    any trailing prose are accepted, so JSON embedded inside a diagnostic or inside a
+    quoted string of another value is never mistaken for a top-level result.
+    """
     try:
-        text = data.decode("utf-8").lstrip("﻿")
-    except UnicodeDecodeError as error:
-        raise UsageError("input_not_utf8") from error
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
     decoder = json.JSONDecoder()
     values = []
     index, length = 0, len(text)
@@ -110,11 +121,26 @@ def decode_values(data: bytes):
             index += 1
         if index >= length:
             break
+        if text[index] not in '{["-0123456789tfn':
+            index += 1
+            continue
+        line_start = text.rfind("\n", 0, index) + 1
+        if text[line_start:index].strip():  # value must begin a line, not sit in prose
+            index += 1
+            continue
         try:
-            value, index = decoder.raw_decode(text, index)
-        except ValueError as error:
-            raise UsageError("input_not_json") from error
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index += 1
+            continue
+        tail = end
+        while tail < length and text[tail] in " \t\r":
+            tail += 1
+        if tail < length and text[tail] != "\n":  # trailing prose => not a top-level value
+            index += 1
+            continue
         values.append(value)
+        index = end
     return values
 
 
@@ -190,12 +216,12 @@ def read_metadata(path: Path) -> dict:
     if not isinstance(data, dict):
         return meta
     for field, names in META_KEYS.items():
+        pattern = MODEL_LABEL if field == "model" else LABEL
         for name in names:
             if SECRET_NAME.search(name):  # never copy a secret-looking field
                 continue
             if name in data:
-                value = data[name]
-                meta[field] = sanitize_label(value) if isinstance(value, str) else None
+                meta[field] = sanitize_label(data[name], pattern)
                 break
     return meta
 
@@ -278,7 +304,7 @@ def extract_attempt(directory: Path, total_state, max_file_bytes, max_total_byte
     provider = meta["provider"] or {"claude": "deepseek", "codex": "codex"}.get(fmt)
     record.update({
         "attempt": _sha(attempt_id),
-        "task": meta["task_id"],
+        "task_id": meta["task_id"],
         "provider": provider,
         "model": meta["model"],
         "format": fmt,

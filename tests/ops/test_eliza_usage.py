@@ -41,10 +41,17 @@ class ElizaUsageTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_startup_stream_secrets_stay_private(self):
-        stream = json.dumps({"apiKey": SECRET, "authorization": "Bearer " + SECRET, "type": "startup"}) \
-            + "\n" + claude_result(input_tokens=100, cache_read_input_tokens=40,
-                                   cache_creation_input_tokens=5, output_tokens=7)
-        write_attempt(self.root, "a1", stream, {"attempt_id": "a1", "provider": "deepseek", "model": "deepseek-flash"})
+        startup_config = json.dumps({"apiKey": SECRET, "authorization": "Bearer " + SECRET,
+                                     "type": "startup", "note": json.dumps({"type": "result"})})
+        stream = ("claude startup: loading configuration\n"
+                  + startup_config + "\n"
+                  + "warning: retrying request\n"
+                  + 'diagnostic mentions {"type":"result","subtype":"fake","usage":{"input_tokens":9999}}\n'
+                  + "done\n"
+                  + claude_result(input_tokens=100, cache_read_input_tokens=40,
+                                  cache_creation_input_tokens=5, output_tokens=7))
+        write_attempt(self.root, "a1", stream, {"attempt_id": "a1", "provider": "deepseek",
+                                                "model": "deepseek-flash[1m]", "task": "G19-eliza-usage"})
         report = usage.build_report(self.root)
         blob = json.dumps(report)
         self.assertNotIn(SECRET, blob)
@@ -52,6 +59,8 @@ class ElizaUsageTests(unittest.TestCase):
         attempt = report["attempts"][0]
         self.assertEqual(attempt["input_tokens"], 100)
         self.assertEqual(attempt["output_tokens"], 7)
+        self.assertEqual(attempt["model"], "deepseek-flash[1m]")
+        self.assertEqual(attempt["task_id"], "G19-eliza-usage")
         self.assertEqual(report["providers"][0]["totals"]["input_tokens"], 100)
 
     def test_last_top_level_result_wins(self):
@@ -149,9 +158,12 @@ class ElizaUsageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((out / name).stat().st_mode), 0o600)
 
     def test_cli_subprocess_report_has_no_secret(self):
-        stream = json.dumps({"credentials": {"apiKey": SECRET}, "type": "startup"}) + "\n" \
-            + claude_result(input_tokens=42, output_tokens=3)
-        write_attempt(self.root, "a1", stream, {"attempt_id": "a1", "provider": "deepseek", "model": "deepseek-flash"})
+        stream = ("cli startup banner\n"
+                  + json.dumps({"credentials": {"apiKey": SECRET}, "model": "deepseek-flash[1m]"}) + "\n"
+                  + "diagnostic noise line\n"
+                  + claude_result(input_tokens=42, cache_read_input_tokens=8, output_tokens=3))
+        write_attempt(self.root, "a1", stream, {"attempt_id": "a1", "provider": "deepseek",
+                                                "model": "deepseek-flash[1m]", "task": "G19-eliza-usage"})
         out = self.root / "cli-out"
         completed = subprocess.run(
             [sys.executable, str(SCRIPT), "--workers-dir", str(self.root), "--output-dir", str(out), "--print-summary"],
@@ -161,6 +173,11 @@ class ElizaUsageTests(unittest.TestCase):
         summary = json.loads((out / "summary.json").read_text())
         self.assertEqual(summary["schema"], usage.SCHEMA)
         self.assertEqual(summary["counts"]["attempts"], 1)
+        attempt = summary["attempts"][0]
+        self.assertEqual(attempt["model"], "deepseek-flash[1m]")
+        self.assertEqual(attempt["task_id"], "G19-eliza-usage")
+        self.assertEqual(attempt["input_tokens"], 42)
+        self.assertEqual(attempt["output_tokens"], 3)
         self.assertNotIn(SECRET, (out / "summary.md").read_text())
 
     def test_skipped_entries_carry_no_paths(self):

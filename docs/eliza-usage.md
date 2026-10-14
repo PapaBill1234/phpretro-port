@@ -10,14 +10,19 @@ transcripts, keys, accounts, auth state, history or cloud/OAuth data.
 
 For each attempt directory it reads two bounded, owned, regular, non-symlink files:
 
-- `task.json` — trusted metadata; only `attempt_id`, `task_id`, `provider` and
-  `model` are read, and any secret-looking field name is dropped.
+- `task.json` — trusted metadata; only `attempt_id`, the task id (aliased from
+  `task_id`, `taskId` or `task`), `provider` and `model` are read, and any
+  secret-looking field name is dropped.
 - `result.private.json` — the raw result stream. Native Claude
-  `--output-format json` may emit several JSON values (a startup config frame before
-  the final result), so the stream is decoded as concatenated values and the **last
-  top-level `type=result` object** is used. Nested or arbitrary objects are never
-  inspected. Codex bridge result files with `usage.last` / `usage.cumulative` are read
-  using one snapshot only, so a `last` and `cumulative` pair is never double-counted.
+  `--output-format json` interleaves CLI startup text, one complete JSON config frame
+  (which may carry secrets), intervening diagnostic text and the final result value.
+  A tolerant scanner accepts only complete JSON values that begin at the start of a
+  line and end before trailing prose, so JSON embedded in a diagnostic or inside a
+  quoted string is never mistaken for a top-level result, and the **last
+  `type=result` value** is used. Codex bridge result files with `usage.last` /
+  `usage.cumulative` are read using one snapshot only, so a `last` and `cumulative`
+  pair is never double-counted. Model ids may carry a routing suffix such as
+  `deepseek-flash[1m]`.
 
 Reads are bounded by `--max-files`, `--max-file-bytes` and `--max-total-bytes`; unsafe
 or oversized inputs are skipped by reason code.
@@ -26,7 +31,7 @@ or oversized inputs are skipped by reason code.
 
 Only these fields are ever emitted, per attempt:
 
-`attempt` (hashed attempt id), `task`, `provider`, `model`, `result_subtype`,
+`attempt` (hashed attempt id), `task_id`, `provider`, `model`, `result_subtype`,
 `seconds`, `reported_turns`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`,
 `output_tokens`, `source_evidence` (source content hash). Missing accounting is
 recorded as `null` (unknown), never as zero; boolean values are treated as unknown.
