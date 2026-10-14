@@ -197,3 +197,51 @@ callbacks and exact-namespace stop/status. `python3 -m unittest` adapter and
 adjacent dashboard suites pass (46 adapter, 59 dashboard, one skip). This is a
 source-and-behavior checkpoint: the configured host, browser and native
 generation remain unqualified and **G06 stays Partial**.
+
+## Local-auth credentials for the acceptance API — 2026-10-14
+
+The acceptance profile now sets `local_auth=True` and
+`secrets=('api.token','vault.passphrase')`. The noncompat API child receives
+`ELIZA_API_TOKEN`, `ELIZA_VAULT_PASSPHRASE` and `ELIZA_VAULT_DISABLE_KEYCHAIN=1`
+(the headless-host keychain bypass) **only** when `local_auth` is enabled; the
+UI environment is built from the secret-free allowlist and never receives them.
+The compat dashboard profile is unchanged (it still injects its own token,
+passphrase, keychain bypass and DeepSeek credentials).
+
+Credentials are canonical bytes: `secrets.token_urlsafe(32)` encoded as 43 ASCII
+`[A-Za-z0-9_-]` characters with **no newline**. Reuse is byte-for-byte — values
+are validated strictly and are never stripped or normalized, and refusals are
+value-free (only the fixed file name appears). Setup creation is split from
+read-only loading:
+
+- `setup` (`_acceptance_setup_state` → `dash.create_credentials`) creates the
+  private runtime directories and the two credential files **once** (`O_EXCL`,
+  `O_NOFOLLOW`, mode `0600`); an existing **valid** file is reused unchanged and
+  an unsafe or malformed file is refused, never repaired.
+- `start` (the `load_secrets` callback → `_acceptance_secrets` →
+  `dash.load_local_credentials`) only validates and reads: the credential
+  directory must already be owned `0700`; each file is opened descriptor-anchored
+  (`O_NOFOLLOW`) and must be a regular file, owned by the user, with exactly
+  `0600`. Nothing is created, chmod-ed or replaced.
+
+Before `_Admission` or `dash.ensure_state_dir` can `chmod` the namespace,
+`_prevalidate_private_parents` refuses a pre-existing namespace parent that is
+not owned `0700` (and `_ensure_private_chain` creates only missing parents
+`0700`), so no inherited helper can silently repair an unsafe directory.
+
+A missing `vault.passphrase` is refused when persisted vault state exists
+(`<runtime>/.vault-pglite` or legacy `vault.json`), so a regenerated key can
+never orphan existing ciphertext; the passphrase is otherwise stable across
+restart, and the pinned `passphraseMasterKey` derivation (service `eliza` →
+salt `eliza.vault.masterKey.v1`, scrypt cost `2^15`, 32-byte key) therefore keeps
+the same vault identity.
+
+Tests add negative-path coverage (malformed/`0600`-violating/symlink/non-regular
+refusal, non-`0700` parent refusal without repair, missing-passphrase-with-vault-
+state refusal, setup reuse/reuse-refusal) plus a real pinned-crypto probe: the
+pinned exported `master-key.ts`/`crypto.ts` encrypt a value in one Bun process
+and recover it in a fresh process from the same persisted passphrase. Public
+probe output is booleans/status only; no plaintext credential is logged or
+committed. Adapter and dashboard suites pass (107 existing + new checks). The
+configured host startup and browser mounting remain unqualified, the native
+provider guard stays false, and **G06 stays Partial**.

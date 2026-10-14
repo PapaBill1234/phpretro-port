@@ -242,6 +242,57 @@ def _reject_namespace_symlinks(root):
     return current
 
 
+def _ensure_private_chain(root, target):
+    """Create the missing owned 0700 components of ``target`` under ``root``.
+
+    Only directories that do not yet exist are created (mode 0700); an existing
+    component is validated as an owned directory and is never re-moded or
+    repaired.  A symlinked or non-directory component is refused.
+    """
+    root, target = Path(root), Path(target)
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        raise AcceptanceError("acceptance path escapes project")
+    current = root
+    for part in rel.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            os.chmod(current, 0o700)
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise AcceptanceError("acceptance namespace parent is unsafe")
+    return target
+
+
+def _prevalidate_private_parents(root):
+    """Read-only refusal of a pre-existing namespace parent that is not owned 0700.
+
+    Runs *before* ``_Admission`` and ``dash.ensure_state_dir`` — both of which
+    ``chmod`` the namespace — so an unsafe or foreign-owned pre-existing parent
+    is refused instead of being silently repaired.  A parent that does not yet
+    exist is left to the safe creator.
+    """
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise AcceptanceError("project root is not a safe directory")
+    current = root
+    for part in _current_rel().parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue  # not created yet; the creator creates it 0700
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise AcceptanceError("acceptance namespace parent is unsafe")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise AcceptanceError("acceptance namespace parent is not owned 0700")
+    return root
+
+
 # --- source / profile -------------------------------------------------------
 def _acceptance_source(root, ns=None, captured_stop=None):
     ns = _current_rel() if ns is None else Path(ns)
@@ -342,9 +393,10 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
         allowed_hosts=API_HOST,
         source=_acceptance_source(root, ns, captured_stop),
         run_path=overlay_dir(root),
-        secrets=(),
+        secrets=dash.SECRET_FILES,
         dotenv=None,
         compat=False,
+        local_auth=True,
         autonomy=False,
         routing=False,
         home=state / "home",
@@ -355,14 +407,71 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
     )
 
 
-def _acceptance_secrets(root, deadline=None):
-    profile = assert_private_path(root, state_dir(root) / "runtime")
-    for directory in (profile, profile / "db", profile / "workspace", state_dir(root) / "home"):
+# Persisted vault state is bound to the existing passphrase: the PGlite vault
+# directory and the legacy vault.json both invalidate a regenerated passphrase,
+# so a missing passphrase must refuse rather than mint a new key.
+VAULT_STATE_REL = Path(".vault-pglite")
+LEGACY_VAULT_REL = Path("vault.json")
+
+
+def _private_runtime_dirs(root):
+    runtime = state_dir(root) / "runtime"
+    return (runtime, runtime / "db", runtime / "workspace", state_dir(root) / "home")
+
+
+def vault_state_present(runtime) -> bool:
+    """True when persisted vault state binds values to the existing passphrase."""
+    runtime = Path(runtime)
+    return (runtime / VAULT_STATE_REL).exists() or (runtime / LEGACY_VAULT_REL).exists()
+
+
+def _acceptance_setup_state(root, deadline=None):
+    """Setup: create the private directories once and the canonical credentials.
+
+    Existing directories are validated (owned, 0700, no symlink), never
+    re-moded; a missing directory is created 0700.  Credentials are created once
+    and reused unchanged; a corrupted or unsafe file is refused, and a missing
+    passphrase is refused when persisted vault state exists (never replaced).
+    """
+    _remaining(deadline, "private directory")
+    state = assert_private_path(root, acceptance_root(root))
+    _ensure_private_chain(root, state)
+    for directory in _private_runtime_dirs(root):
         _remaining(deadline, "private directory")
         assert_private_path(root, directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-    return {"profile": profile}
+        _ensure_private_chain(root, directory)
+        dash.require_private_dir(directory)
+    runtime = state_dir(root) / "runtime"
+    if not (state / "vault.passphrase").exists() and vault_state_present(runtime):
+        raise AcceptanceError("persisted vault state requires the existing vault passphrase")
+    _remaining(deadline, "credentials")
+    dash.create_credentials(state)
+    return {"profile": runtime}
+
+
+def _acceptance_secrets(root, deadline=None):
+    """Read-only load of the acceptance credentials and private directories.
+
+    Creates and re-modes nothing; a missing or unsafe directory, an unsafe or
+    malformed credential, or a missing passphrase with persisted vault state is
+    refused before any launch.
+    """
+    state = assert_private_path(root, acceptance_root(root))
+    _prevalidate_private_parents(root)
+    for directory in _private_runtime_dirs(root):
+        _remaining(deadline, "private directory")
+        assert_private_path(root, directory)
+        dash.require_private_dir(directory)
+    runtime = state_dir(root) / "runtime"
+    if not (state / "vault.passphrase").exists() and vault_state_present(runtime):
+        raise AcceptanceError("persisted vault state requires the existing vault passphrase")
+    try:
+        credentials = dash.load_local_credentials(state)
+    except FileNotFoundError:
+        raise AcceptanceError("acceptance credentials are incomplete") from None
+    except DashboardError as exc:
+        raise AcceptanceError(str(exc)) from None
+    return {"profile": runtime, **credentials}
 
 
 # --- bounded cutoff (captured once, never extended) -------------------------
@@ -504,14 +613,12 @@ class _Admission:
         _reject_namespace_symlinks(self.root)
         # 1) fixed acceptance-wide admission lock (never namespace-scoped)
         shared = assert_fixed_path(self.root, self.root / ADMISSION_REL, RUNS_REL)
-        shared.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(shared.parent, 0o700)
+        _ensure_private_chain(self.root, shared.parent)
         self.shared_fd = _acquire_operation_lock(shared)
         try:
             # 2) per-run operation lock
             root_dir = assert_private_path(self.root, acceptance_root(self.root))
-            root_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(root_dir, 0o700)
+            _ensure_private_chain(self.root, root_dir)
             path = assert_private_path(self.root, operation_lock_path(self.root))
             self.fd = _acquire_operation_lock(path)
         except BaseException:
@@ -1037,7 +1144,9 @@ def operation_budget(args, cap):
 def cmd_setup(root, _argv=None):
     root = Path(root)
     budget = operation_budget(_argv, SETUP_BUDGET_S)
-    # Read-only preflight: refuse an expired run before any lock/state write.
+    # Read-only preflight: refuse an unsafe pre-existing parent and an expired
+    # run before any lock/state write.
+    _prevalidate_private_parents(root)
     if preflight_expired(root, DEFAULT_WINDOW_S):
         raise AcceptanceError("acceptance cutoff reached; no launch")
     try:
@@ -1060,7 +1169,7 @@ def cmd_setup(root, _argv=None):
             raise AcceptanceError("acceptance setup has no cleanup budget")
         deadline = time.monotonic() + min(budget, seconds)
         build_overlay(root, deadline)
-        _acceptance_secrets(root, deadline)
+        _acceptance_setup_state(root, deadline)
         install_dropins(root, deadline)
         write_config(root, deadline)
         _remaining(deadline, "setup completion")
@@ -1075,7 +1184,9 @@ def cmd_setup(root, _argv=None):
 def cmd_start(root, _argv=None):
     root = Path(root)
     window_s = operation_budget(_argv, DEFAULT_WINDOW_S)
-    # Read-only preflight: refuse an expired run before lock/state creation.
+    # Read-only preflight: refuse an unsafe pre-existing parent and an expired
+    # run before lock/state creation.
+    _prevalidate_private_parents(root)
     if preflight_expired(root, window_s):
         raise AcceptanceError("acceptance cutoff reached; no launch")
     try:

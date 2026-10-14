@@ -49,6 +49,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import signal
 import socket
 import shlex
@@ -115,7 +117,7 @@ _DYNAMIC_PROFILE_FIELDS = frozenset({
 _PROFILE_DEFAULTS = {
     "secrets": (), "dotenv": None, "compat": True, "autonomy": True,
     "routing": True, "home": None, "window_seconds": None, "gate": None,
-    "load_secrets": None, "verify": None,
+    "load_secrets": None, "verify": None, "local_auth": False,
 }
 
 
@@ -283,6 +285,116 @@ def read_private_text(path, require_mode: int | None = 0o600) -> str:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# Local-auth credentials (canonical bytes; create once, load read-only)
+# --------------------------------------------------------------------------
+# Canonical credential bytes: 32 random bytes rendered as URL-safe base64, i.e.
+# exactly 43 ASCII characters from ``[A-Za-z0-9_-]`` with no padding and no
+# newline.  Reuse is byte-for-byte: values are validated strictly and are never
+# stripped, normalized, or repaired, and error messages never carry a value.
+CREDENTIAL_BYTES = 32
+_CREDENTIAL_LENGTH = 43
+_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_-]{%d}\Z" % _CREDENTIAL_LENGTH)
+
+
+def canonical_credential() -> bytes:
+    """Return fresh canonical credential bytes (no newline)."""
+    return secrets.token_urlsafe(CREDENTIAL_BYTES).encode("ascii")
+
+
+def parse_credential(raw: bytes, name: str) -> str:
+    """Strictly validate canonical credential bytes; value-free errors.
+
+    No ``.strip()`` and no normalization: a trailing newline, non-ASCII byte,
+    wrong length or out-of-alphabet character is refused.
+    """
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise DashboardError(f"{name} is malformed") from None
+    if not _CREDENTIAL_RE.match(text):
+        raise DashboardError(f"{name} is malformed")
+    return text
+
+
+def require_private_dir(path) -> Path:
+    """Read-only check: an owned, exactly 0700, non-symlink directory.
+
+    Never creates or re-modes anything; an unsafe directory is refused so no
+    helper can normalize permissions it did not create.
+    """
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise DashboardError("private directory is missing") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise DashboardError("private directory is unsafe")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise DashboardError("private directory is unsafe")
+    return path
+
+
+def load_credential(path, name: str) -> str:
+    """Descriptor-anchored read of one canonical credential file.
+
+    Rejects a symlink (``O_NOFOLLOW``), a non-regular file, a foreign owner and
+    any mode other than exactly 0600; validates canonical bytes without
+    stripping.  Raises ``FileNotFoundError`` only when the file is absent.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise DashboardError(f"{name} is not a safe credential file") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise DashboardError(f"{name} is not a safe credential file")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise DashboardError(f"{name} must be mode 0600")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return parse_credential(raw, name)
+
+
+def create_credentials(state) -> None:
+    """Create canonical credential files once; reuse valid ones unchanged.
+
+    The containing directory must already exist as an owned 0700 directory; it
+    is never created or re-moded here.  An existing file is reused only when it
+    is already valid; an unsafe or malformed file is refused, never repaired
+    and never replaced.
+    """
+    state = require_private_dir(state)
+    for name in SECRET_FILES:
+        path = state / name
+        try:
+            load_credential(path, name)
+            continue  # valid file reused byte-for-byte
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            load_credential(path, name)  # raced; must already be valid
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(canonical_credential())
+
+
+def load_local_credentials(state) -> dict:
+    """Read-only load of both canonical credentials from an owned 0700 dir."""
+    state = require_private_dir(state)
+    return {name.replace(".", "_"): load_credential(state / name, name)
+            for name in SECRET_FILES}
 
 
 def parse_dotenv(text: str) -> dict:
@@ -770,6 +882,14 @@ def build_env(source, secrets, profile=DASHBOARD_PROFILE):
         # Acceptance profile: no model credential, no autonomy, no cloud keys.
         api_env["ENABLE_AUTONOMY"] = "false"
         api_env["ELIZA_AGENT_ORCHESTRATOR"] = "0"
+        if profile.local_auth:
+            # Acceptance local auth: a private API token and the persisted
+            # passphrase-derived vault key, with the OS keychain bypassed on a
+            # headless host.  These secrets are added to the API child only; the
+            # UI environment (``dict(base)``) stays secret-free.
+            api_env["ELIZA_API_TOKEN"] = secrets["api_token"]
+            api_env["ELIZA_VAULT_PASSPHRASE"] = secrets["vault_passphrase"]
+            api_env["ELIZA_VAULT_DISABLE_KEYCHAIN"] = "1"
         return api_env, dict(base)
     api_env["ELIZA_API_TOKEN"] = secrets["api_token"]
     api_env["ELIZA_VAULT_PASSPHRASE"] = secrets["vault_passphrase"]

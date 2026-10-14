@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,16 @@ host = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(host)
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def private_chain(root, *parts):
+    """Create an owned 0700 chain under ``root`` (matches the host layout)."""
+    current = Path(root)
+    for part in parts:
+        current = current / part
+        current.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(current, 0o700)
+    return current
 
 
 def _git(cwd, *args):
@@ -72,7 +83,8 @@ class EnvAllowlistTest(unittest.TestCase):
     def test_acceptance_env_is_allowlisted_with_private_home(self):
         root = Path("/tmp/root")
         profile = host.acceptance_profile(root)
-        secrets = {"profile": host.state_dir(root) / "runtime"}
+        secrets = {"profile": host.state_dir(root) / "runtime",
+                   "api_token": "A" * 43, "vault_passphrase": "B" * 43}
         with mock.patch.dict(os.environ, {"DATABASE_URL": "postgres://secret",
                                           "OPENAI_API_KEY": "sk-secret"}, clear=False):
             api_env, ui_env = host.dash.build_env(profile.source, secrets, profile)
@@ -85,7 +97,14 @@ class EnvAllowlistTest(unittest.TestCase):
         self.assertEqual(api_env["PGLITE_DATA_DIR"], str(secrets["profile"] / "db"))
         self.assertEqual(api_env["ELIZA_WORKSPACE_DIR"], str(secrets["profile"] / "workspace"))
         self.assertEqual(host.plugins_custom_dir(root), secrets["profile"] / "plugins" / "custom")
-        self.assertNotIn("ELIZA_API_TOKEN", ui_env)  # UI receives no secret
+        # local-auth acceptance: the API child gets the token, passphrase and the
+        # headless keychain bypass; the UI environment receives no secret at all.
+        self.assertEqual(api_env["ELIZA_API_TOKEN"], secrets["api_token"])
+        self.assertEqual(api_env["ELIZA_VAULT_PASSPHRASE"], secrets["vault_passphrase"])
+        self.assertEqual(api_env["ELIZA_VAULT_DISABLE_KEYCHAIN"], "1")
+        for name in ("ELIZA_API_TOKEN", "ELIZA_VAULT_PASSPHRASE",
+                     "ELIZA_VAULT_DISABLE_KEYCHAIN"):
+            self.assertNotIn(name, ui_env)
 
 
 class PluginConfigTest(unittest.TestCase):
@@ -345,7 +364,8 @@ class CapturedDeadlineTest(unittest.TestCase):
 
     def _run_start(self, root, namespace, canonical, saved, window):
         cutoff = root / namespace / "cutoff.json"
-        cutoff.parent.mkdir(parents=True)
+        private_chain(root, *Path(namespace).parts)
+        host.dash.create_credentials(root / namespace)  # start requires credentials
         cutoff.write_text(json.dumps({"stop_at": saved}) + "\n")
         before = cutoff.read_bytes()
         seen = {}
@@ -723,7 +743,7 @@ class CutoffTest(unittest.TestCase):
             root = Path(tmp)
             with host._Namespace(host.RUNS_REL / "expired"):
                 path = host.cutoff_path(root)
-                path.parent.mkdir(parents=True)
+                private_chain(root, *Path(host.RUNS_REL / "expired").parts)
                 path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}) + "\n")
                 before = path.read_bytes()
                 with mock.patch.object(host.dash, "require_window",
@@ -741,8 +761,9 @@ class CutoffTest(unittest.TestCase):
 
 class ActiveNamespaceTest(unittest.TestCase):
     def _runtime(self, root, payload):
-        path = host.acceptance_root(root) / "runtime.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        directory = host.acceptance_root(root)
+        private_chain(root, *directory.relative_to(Path(root)).parts)
+        path = directory / "runtime.json"
         path.write_text(json.dumps(payload))
         os.chmod(path, 0o600)
 
@@ -929,6 +950,169 @@ class ExactCommandTest(unittest.TestCase):
                 self.assertEqual(host.cmd_status(root), 0)
                 self.assertEqual(host.cmd_stop(root), 0)
             self.assertFalse((root / host.RUNS_REL / "readonly").exists())
+
+
+class CredentialTest(unittest.TestCase):
+    """Local-auth credentials: create once, load read-only, refuse unsafe state."""
+
+    def _root(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def _setup(self, root):
+        with host._Namespace(host.ACCEPTANCE_REL):
+            host._acceptance_setup_state(root)
+        return host.acceptance_root(root)
+
+    def test_setup_creates_canonical_credentials_and_read_load_reuses_them(self):
+        root = self._root()
+        state = self._setup(root)
+        for name in host.dash.SECRET_FILES:
+            path = state / name
+            self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o600)
+            raw = path.read_bytes()
+            self.assertEqual(len(raw), 43)
+            self.assertNotIn(b"\n", raw)
+            host.dash.parse_credential(raw, name)  # canonical ASCII, no newline
+        for directory in host._private_runtime_dirs(root):
+            self.assertEqual(stat.S_IMODE(directory.lstat().st_mode), 0o700)
+        before = {n: (state / n).read_bytes() for n in host.dash.SECRET_FILES}
+        with host._Namespace(host.ACCEPTANCE_REL):
+            creds = host._acceptance_secrets(root)
+        self.assertEqual(creds["api_token"].encode("ascii"), before["api.token"])
+        self.assertEqual(creds["vault_passphrase"].encode("ascii"), before["vault.passphrase"])
+        with host._Namespace(host.ACCEPTANCE_REL):
+            host._acceptance_setup_state(root)  # second setup reuses unchanged
+        self.assertEqual({n: (state / n).read_bytes() for n in host.dash.SECRET_FILES}, before)
+
+    def test_malformed_credentials_are_refused_value_free(self):
+        root = self._root()
+        state = self._setup(root)
+        for payload in (b"short", ("S" * 43 + "\n").encode("ascii"), ("é" * 43).encode("utf-8")):
+            with self.subTest(payload=payload[:6]):
+                (state / "api.token").write_bytes(payload)
+                os.chmod(state / "api.token", 0o600)
+                with host._Namespace(host.ACCEPTANCE_REL):
+                    with self.assertRaises(host.DashboardError) as caught:
+                        host._acceptance_secrets(root)
+                self.assertNotIn("S" * 43, str(caught.exception))
+
+    def test_symlink_nonregular_and_bad_mode_are_refused_without_repair(self):
+        root = self._root()
+        state = self._setup(root)
+        api = state / "api.token"
+        good = api.read_bytes()
+        foreign = root / "foreign.token"
+        foreign.write_bytes(good)
+        os.chmod(foreign, 0o600)
+        api.unlink()
+        api.symlink_to(foreign)  # symlink refused
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.DashboardError):
+                host._acceptance_secrets(root)
+        api.unlink()
+        api.mkdir()  # non-regular refused
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.DashboardError):
+                host._acceptance_secrets(root)
+        api.rmdir()
+        api.write_bytes(good)
+        os.chmod(api, 0o644)  # bad mode refused, never repaired
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.DashboardError):
+                host._acceptance_secrets(root)
+        self.assertEqual(stat.S_IMODE(api.lstat().st_mode), 0o644)
+        os.chmod(api, 0o600)
+        with host._Namespace(host.ACCEPTANCE_REL):
+            self.assertIn("api_token", host._acceptance_secrets(root))
+
+    def test_missing_passphrase_with_persisted_vault_state_refuses(self):
+        root = self._root()
+        state = self._setup(root)
+        (state / "vault.passphrase").unlink()
+        runtime = host.state_dir(root) / "runtime"
+        (runtime / host.VAULT_STATE_REL).mkdir(mode=0o700)
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.AcceptanceError):
+                host._acceptance_secrets(root)
+            with self.assertRaises(host.AcceptanceError):
+                host._acceptance_setup_state(root)  # never mints a fresh key
+        self.assertFalse((state / "vault.passphrase").exists())
+
+    def test_setup_refuses_to_repair_a_corrupt_existing_file(self):
+        root = self._root()
+        state = self._setup(root)
+        passphrase = state / "vault.passphrase"
+        passphrase.write_bytes(b"corrupt-not-canonical")
+        os.chmod(passphrase, 0o600)
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.DashboardError):
+                host._acceptance_setup_state(root)
+        self.assertEqual(passphrase.read_bytes(), b"corrupt-not-canonical")
+
+    def test_prevalidate_refuses_non_0700_parent_without_repair(self):
+        root = self._root()
+        parent = root / ".builder"
+        parent.mkdir(mode=0o755)
+        os.chmod(parent, 0o755)
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.AcceptanceError):
+                host._prevalidate_private_parents(root)
+        self.assertEqual(stat.S_IMODE(parent.lstat().st_mode), 0o755)  # untouched
+
+
+class VaultRecoveryTest(unittest.TestCase):
+    """Real pinned vault crypto: an encrypted value survives a stop/restart.
+
+    Uses the pinned exported vault modules (not a mock cipher) under Bun when the
+    pin and runtime are present; skipped otherwise.  Public output is a family of
+    booleans/status only — no plaintext credential is logged.
+    """
+
+    _PROBE = (
+        'import { readFileSync, writeFileSync } from "node:fs";\n'
+        'import { passphraseMasterKey } from %(master)s;\n'
+        'import { encrypt, decrypt } from %(crypto)s;\n'
+        'const [mode, passFile, ctFile] = process.argv.slice(2);\n'
+        'const passphrase = readFileSync(passFile, "utf8");\n'
+        'const key = await passphraseMasterKey({ passphrase }).load();\n'
+        'if (mode === "encrypt") {\n'
+        '  writeFileSync(ctFile, encrypt(key, %(value)s, %(aad)s));\n'
+        '  console.log("encrypted");\n'
+        '} else {\n'
+        '  console.log("recovered:" + decrypt(key, readFileSync(ctFile, "utf8"), %(aad)s));\n'
+        '}\n')
+
+    def test_pinned_vault_recovers_value_across_restart(self):
+        vault = host.canonical_source(REPO) / "packages" / "auth" / "src" / "vault"
+        if not host._BUN.is_file() or not (vault / "master-key.ts").is_file() \
+                or not (vault / "crypto.ts").is_file():
+            self.skipTest("pinned vault source or Bun runtime unavailable")
+        value, aad = "acceptance-probe-value", "eliza.acceptance.probe"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.ACCEPTANCE_REL):
+                host._acceptance_setup_state(root)
+            pass_file = host.acceptance_root(root) / "vault.passphrase"
+            script = root / "vault-probe.mjs"
+            script.write_text(self._PROBE % {
+                "master": json.dumps(str(vault / "master-key.ts")),
+                "crypto": json.dumps(str(vault / "crypto.ts")),
+                "value": json.dumps(value), "aad": json.dumps(aad)})
+            ct = root / "value.ct"
+            first = subprocess.run([str(host._BUN), str(script), "encrypt",
+                                    str(pass_file), str(ct)],
+                                   capture_output=True, text=True, timeout=120, cwd=str(vault))
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(first.stdout.strip(), "encrypted")
+            self.assertTrue(ct.read_text().startswith("v1:"))
+            self.assertNotIn(value, ct.read_text())  # ciphertext only, no plaintext
+            second = subprocess.run([str(host._BUN), str(script), "decrypt",
+                                     str(pass_file), str(ct)],
+                                    capture_output=True, text=True, timeout=120, cwd=str(vault))
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(second.stdout.strip(), "recovered:" + value)
 
 
 if __name__ == "__main__":
