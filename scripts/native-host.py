@@ -16,9 +16,14 @@ Guarantees:
   * the official Rust toolchain is installed from
     ``https://static.rust-lang.org`` with SHA-256 verification into a private
     prefix, never globally and never into ``~/.cargo``/``~/.rustup``;
-  * the build is one low-priority (``nice 19``) release job with no debuginfo,
-    ``--locked`` dependencies, a private Cargo cache and a filtered environment
-    that carries no provider credentials and copies no account/OAuth material;
+  * the build is one low-priority (``nice 19``) release job with a fixed
+    low-memory release profile (one contract feeds both the filtered Cargo
+    environment and provenance) and ``--locked`` dependencies, a private Cargo
+    cache and a filtered environment that carries no provider credentials and
+    copies no account/OAuth material;
+  * the owned build group is stopped (nonzero) if available RAM falls below the
+    project floor or becomes unreadable, checked before launch and sampled at a
+    fixed bounded interval while the child runs;
   * every expensive stage is gated by the canonical off-peak coding window and
     runs in its own supervised process group bounded by the shared cutoff;
   * a successful build is build provenance only.  It does NOT qualify the model
@@ -69,6 +74,19 @@ LOCK_LOCAL_PACKAGES = 161
 JOBS = 1  # one low-priority build job, never a parallel herd
 DISK_MIN_FREE_BYTES = 12 * 1024 ** 3
 RAM_MIN_AVAILABLE_BYTES = 3 * 1024 ** 3
+# One fixed low-memory release-profile contract. The filtered Cargo environment
+# and the recorded build provenance are both generated from this single
+# definition, so a profile change can never be env-only or provenance-only.
+# These override the source release profile (thin LTO, four codegen units).
+RELEASE_PROFILE = (
+    ("opt-level", "0"),
+    ("lto", "false"),
+    ("codegen-units", "256"),
+    ("debug", "0"),
+    ("incremental", "false"),
+)
+RAM_POLL_SECONDS = 1.0  # fixed bounded interval between owned-run RAM samples
+RESOURCE_STOP_EXIT = 1  # a resource stop stays failure even if the child exits 0
 LOG_LIMIT_BYTES = 4 * 1024 * 1024
 PROBE_TIMEOUT_SECONDS = 30  # bounded read-only git probes outside a gated stage
 STOP_MARGIN_SECONDS = 5  # reserve room for cleanup before the immutable cutoff
@@ -542,7 +560,8 @@ def _drain(pump, cutoff):
     pump.join(timeout=min(CLEANUP_GRACE_SECONDS, remaining) if remaining > 0 else 0.001)
 
 
-def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BYTES):
+def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BYTES,
+                   ram_floor_bytes=None, ram_probe=None, ram_interval=RAM_POLL_SECONDS):
     """Run argv in its own session, bounded in time, log size and group cleanup.
 
     The cutoff is required and validated before the child is launched, the
@@ -551,10 +570,21 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
     cleaned (so its id cannot be recycled under a killpg), the log is capped
     while the child runs, and every wait and drain is bounded by the original
     cutoff.  Failure or an unprovable group state is never reported as success.
+
+    When ``ram_floor_bytes`` is given, available RAM is checked immediately
+    before launch and re-sampled at the fixed bounded ``ram_interval`` while the
+    child runs.  A reading below the floor, or any missing/malformed/unusable
+    reading (``ram_probe`` returns None), stops the owned group with the same
+    unreaped-leader cleanup and original cutoff and reports a nonzero resource
+    stop even if the child later exits zero.  Without a floor the behaviour of
+    other callers is unchanged.
     """
     cutoff = require_future_cutoff(stop_at)
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    probe = ram_probe or available_ram_bytes
+    if ram_floor_bytes is not None:
+        require_available_ram(probe(), ram_floor_bytes, "job")  # fail closed pre-launch
     stopped = []
     state = {"overflow": False}
     child = None
@@ -576,10 +606,18 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
                                                     state, cutoff), daemon=True)
         pump.start()
         halted = False
+        resource_stop = False
+        next_sample = time.time() + ram_interval
         while not _leader_exited(child.pid):  # WNOWAIT: never reaps the leader
             if stopped or time.time() >= cutoff - STOP_MARGIN_SECONDS:
                 halted = True
                 break
+            if ram_floor_bytes is not None and time.time() >= next_sample:
+                ram = probe()
+                if ram is None or ram < ram_floor_bytes:
+                    resource_stop = True
+                    break
+                next_sample = time.time() + ram_interval
             time.sleep(0.2)
         # The leader is still unreaped here: clean its whole group first, then
         # reap it once.  ``cleaned`` guarantees the finally block never signals
@@ -592,6 +630,8 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
         code = child.returncode
         if stopped:
             return 143
+        if resource_stop:
+            return RESOURCE_STOP_EXIT  # a resource stop is failure, never success
         if halted:
             return 75
         if not group_gone:
@@ -1086,17 +1126,28 @@ def installer_env(root):
     return _minimal_env(root)
 
 
+def build_profile_env():
+    """Filtered release-profile overrides derived from the one fixed contract."""
+    return {"CARGO_PROFILE_RELEASE_" + key.upper().replace("-", "_"): value
+            for key, value in RELEASE_PROFILE}
+
+
+def build_profile_contract():
+    """The recorded, comparable profile contract (same source as the env)."""
+    return dict(RELEASE_PROFILE)
+
+
 def build_env(root):
     """A from-scratch environment: private caches, no inherited credentials."""
     env = _minimal_env(root)
     env.update({
         "CARGO_HOME": str(cargo_home(root)),
         "CARGO_TARGET_DIR": str(target_dir(root)),
-        "CARGO_PROFILE_RELEASE_DEBUG": "0",
         "CARGO_INCREMENTAL": "0",
         "RUSTUP_HOME": str(private_root(root) / "rustup-unused"),
         "SOURCE_DATE_EPOCH": "0",
     })
+    env.update(build_profile_env())  # release-profile sizing from the same contract
     return env
 
 
@@ -1107,14 +1158,48 @@ def build_argv(cargo, jobs=JOBS, package=PACKAGE, bin_name=BIN):
 
 
 # --- resource preflight (protect XRDP) --------------------------------------
+_MEMINFO_UNIT_BYTES = {"kB": 1024}
+
+
 def available_ram_bytes(meminfo=Path("/proc/meminfo")):
+    """Return ``MemAvailable`` in bytes, else None for any unusable reading.
+
+    Only the canonical ``MemAvailable: <non-negative int> kB`` form is trusted.
+    A missing line, a non-integer or negative value, a wrong field count or an
+    unrecognized unit all yield None so every caller fails closed instead of
+    acting on a number it cannot validate.
+    """
     try:
-        for line in meminfo.read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
+        text = Path(meminfo).read_text()
+    except OSError:
         return None
+    for line in text.splitlines():
+        if not line.startswith("MemAvailable:"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            return None
+        unit = _MEMINFO_UNIT_BYTES.get(parts[2])
+        if unit is None:
+            return None
+        try:
+            value = int(parts[1])
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return value * unit
     return None
+
+
+def require_available_ram(ram, floor, action="build"):
+    """Fail closed unless ``ram`` is a known value at or above ``floor``."""
+    if ram is None:
+        raise SetupError("cannot determine available RAM; refusing %s (fail closed)" % action,
+                         code=1)
+    if ram < floor:
+        raise SetupError("insufficient available RAM (%d MiB < %d MiB); refusing %s"
+                         % (ram // 2 ** 20, floor // 2 ** 20, action), code=1)
 
 
 def preflight_resources(path, disk_usage=shutil.disk_usage, meminfo=Path("/proc/meminfo")):
@@ -1124,11 +1209,7 @@ def preflight_resources(path, disk_usage=shutil.disk_usage, meminfo=Path("/proc/
         raise SetupError("insufficient free disk (%d MiB < %d MiB); refusing build"
                          % (free // 2 ** 20, DISK_MIN_FREE_BYTES // 2 ** 20), code=1)
     ram = available_ram_bytes(meminfo)
-    if ram is None:
-        raise SetupError("cannot determine available RAM; refusing build (fail closed)", code=1)
-    if ram < RAM_MIN_AVAILABLE_BYTES:
-        raise SetupError("insufficient available RAM (%d MiB < %d MiB); refusing build"
-                         % (ram // 2 ** 20, RAM_MIN_AVAILABLE_BYTES // 2 ** 20), code=1)
+    require_available_ram(ram, RAM_MIN_AVAILABLE_BYTES)
     return {"free_disk_bytes": free, "available_ram_bytes": ram}
 
 
@@ -1214,7 +1295,10 @@ def build_state(root):
              and inputs.get("toolchain") == toolchain.get("version")
              and cargo.get("sha256") is not None
              and inputs.get("cargo_sha256") == cargo.get("sha256")
-             and inputs.get("rustc_sha256") == rustc.get("sha256"))
+             and inputs.get("rustc_sha256") == rustc.get("sha256")
+             # The exact release profile is a build input: a missing, altered or
+             # different profile invalidates provenance even if the hash matches.
+             and inputs.get("profile") == build_profile_contract())
     return {"ok": bool(ok and fresh), "binary": str(path), "package": entry.get("package"),
             "target": entry.get("target"), "stale": not fresh}
 
@@ -1318,7 +1402,8 @@ def command_build(root):
         verify_sha256(lock, LOCK_BUILD_SHA256)
         argv = build_argv(cargo)
         code = run_supervised(argv, cwd=build / "codex-rs", env=build_env(root),
-                              log_path=logs_dir(root) / "build.log", stop_at=deadline)
+                              log_path=logs_dir(root) / "build.log", stop_at=deadline,
+                              ram_floor_bytes=RAM_MIN_AVAILABLE_BYTES)
         if code != 0:
             raise SetupError("codex-cli build did not complete (exit %s); checkpoint at build" % code, code=1)
         lock_digest = sha256_file(lock)
@@ -1339,7 +1424,8 @@ def command_build(root):
                        "lock_sha256": lock_digest,
                        "toolchain": (data.get("toolchain") or {}).get("version"),
                        "cargo_sha256": (bins.get("cargo") or {}).get("sha256"),
-                       "rustc_sha256": (bins.get("rustc") or {}).get("sha256")},
+                       "rustc_sha256": (bins.get("rustc") or {}).get("sha256"),
+                       "profile": build_profile_contract()},
             "resources": resources,
         }
         data["checks"] = {"source": "pinned_clean", "patch": "digest_verified",
