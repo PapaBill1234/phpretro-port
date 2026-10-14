@@ -733,8 +733,50 @@ def _tracked_paths(source, deadline=None):
     return paths
 
 
+def _exports_declare_source_condition(exports):
+    """True when an ``exports`` map offers a source condition target anywhere.
+
+    The pinned children run with ``--conditions=eliza-source``; a package whose
+    ``exports`` declare ``eliza-source``/``source`` resolves to ``src/*.ts`` and
+    can be served by the overlay's source-only copy.
+    """
+    if isinstance(exports, dict):
+        if "eliza-source" in exports or "source" in exports:
+            return True
+        return any(_exports_declare_source_condition(value) for value in exports.values())
+    return False
+
+
+def _workspace_package_needs_built_output(package_dir):
+    """Whether a workspace package resolves only through its built ``dist/``.
+
+    The overlay copies pinned *tracked* source only, so a package that ships
+    build output and declares no source condition cannot resolve from the
+    overlay copy: its ``exports`` (e.g. a boot-registered ``./register`` leaf)
+    point at ``dist/*.js``, which the overlay never contains.  Such a member
+    must keep its complete verified canonical package binding.
+    """
+    package_dir = Path(package_dir)
+    try:
+        manifest = json.loads((package_dir / "package.json").read_text())
+    except (OSError, ValueError):
+        return False
+    exports = manifest.get("exports")
+    if not isinstance(exports, dict):
+        return False
+    if _exports_declare_source_condition(exports):
+        return False
+    return (package_dir / "dist").is_dir()
+
+
 def dependency_bindings(source, overlay, deadline=None):
-    """Exact installed dependency locations; workspace links resolve in the overlay."""
+    """Exact installed dependency locations; workspace links resolve in the overlay.
+
+    A source-complete workspace member binds to the private overlay copy.  A
+    member that resolves only through built output (no source export condition,
+    but a canonical ``dist/``) keeps its verified canonical binding, because the
+    source-only overlay would otherwise drop that built subpath.
+    """
     source, overlay = Path(source).resolve(), Path(overlay)
     bindings = {}
     for directory, names, _files in os.walk(source):
@@ -757,7 +799,7 @@ def dependency_bindings(source, overlay, deadline=None):
                 target = member
                 if _under(resolved, source):
                     relative = resolved.relative_to(source)
-                    if "node_modules" not in relative.parts:
+                    if "node_modules" not in relative.parts and not _workspace_package_needs_built_output(resolved):
                         target = overlay / relative
                 entries[name] = str(target)
         bindings[str(rel)] = entries

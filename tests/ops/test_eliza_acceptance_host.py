@@ -204,6 +204,61 @@ class OverlayTest(unittest.TestCase):
                 with self.assertRaises(host.AcceptanceError):
                     host.link_dependencies(root, host.overlay_dir(root))
 
+    def test_built_output_workspace_keeps_canonical_binding(self):
+        """A boot-registered workspace plugin whose `exports` resolve through
+        built `dist/` (no source condition) must not be re-pointed at the
+        source-only overlay copy, which drops that built subpath and breaks
+        Vite's import analysis of the app's plugin-registration seam."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, patch = self._fixture(tmp)
+            source = host.canonical_source(root)
+            (source / ".gitignore").write_text("node_modules/\ndist/\n")
+            # the failing package: ships dist, declares no eliza-source condition
+            built_pkg = source / "plugins/plugin-native-settings"
+            (built_pkg / "src").mkdir(parents=True)
+            (built_pkg / "package.json").write_text(json.dumps({
+                "name": "@elizaos/plugin-native-settings",
+                "exports": {
+                    ".": {"import": "./dist/index.js", "default": "./dist/index.js"},
+                    "./*": {"import": "./dist/*.js", "default": "./dist/*.js"},
+                },
+            }, indent=2) + "\n")
+            (built_pkg / "src/register.ts").write_text("export function registerApp(): void {}\n")
+            (built_pkg / "dist").mkdir()
+            (built_pkg / "dist/register.js").write_text("export function registerApp() {}\n")
+            # a source-complete plugin keeps its overlay binding
+            src_pkg = source / "plugins/plugin-with-source"
+            (src_pkg / "src").mkdir(parents=True)
+            (src_pkg / "package.json").write_text(json.dumps({
+                "name": "@elizaos/plugin-with-source",
+                "exports": {".": {"eliza-source": "./src/index.ts", "import": "./dist/index.js"}},
+            }, indent=2) + "\n")
+            (src_pkg / "src/index.ts").write_text("export const x = 1;\n")
+            (src_pkg / "dist").mkdir()
+            (src_pkg / "dist/index.js").write_text("export const x = 1;\n")
+            (source / "node_modules/@elizaos/plugin-native-settings").symlink_to(
+                "../../plugins/plugin-native-settings")
+            (source / "node_modules/@elizaos/plugin-with-source").symlink_to(
+                "../../plugins/plugin-with-source")
+            _git(source, "add", "-A")
+            _git(source, "commit", "-m", "plugins")
+            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            with mock.patch.object(host.upstream, "UPSTREAM_PIN", pin), \
+                    mock.patch.object(host, "PATCH_SHA256", host.sha256_file(patch)):
+                host.build_overlay(root)
+                self.assertTrue(host.verify_overlay(root))
+                overlay = host.overlay_dir(root)
+                bound = overlay / "node_modules/@elizaos/plugin-native-settings"
+                # the built `/register` leaf resolves through the kept canonical binding
+                self.assertTrue((bound / "dist/register.js").is_file())
+                self.assertEqual(bound.resolve(), built_pkg.resolve())
+                self.assertNotEqual(bound.resolve(), (overlay / "plugins/plugin-native-settings").resolve())
+                self.assertTrue((overlay / "plugins/plugin-native-settings/src/register.ts").is_file())
+                # the source-complete plugin still resolves to the private overlay copy
+                self.assertEqual((overlay / "node_modules/@elizaos/plugin-with-source").resolve(),
+                                 (overlay / "plugins/plugin-with-source").resolve())
+
     def test_legacy_scope_migration_rejects_unknown_scope_and_empty_additions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
