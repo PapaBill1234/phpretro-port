@@ -206,7 +206,13 @@ first real hosted Ubuntu 24.04 run (`38641368461`), which refused in 9s with
 `"qualified": false, "reason": "os error during preflight"`: the wrapper called
 `shutil.disk_usage` on a private build root that a fresh checkout has not
 created yet. Creating that root (idempotent, before any heavy work) is repaired
-in the following commit; `tests.ops.test_native_host_ci` Ran 59 tests OK and
+in the following commit `fbad50b`, together with a regression test for exactly
+this fresh-root case (`tests/ops/test_native_host_ci.py`, class
+`OrchestrationFixtureTests`, stubbing `preflight_resources` to raise
+`FileNotFoundError` on an absent path). Removing the `mkdir` makes that test fail
+with the hosted reason string; an independent read-only DeepSeek review of the
+test commit found no confirmed defects. `tests.ops.test_native_host_ci` Ran 60
+tests OK at the integrated tip and
 `tests.ops.test_native_host_setup` Ran 103 tests OK against the repaired source,
 and an independent read-only DeepSeek review of the repair found no confirmed
 defects (it also flagged, as a non-blocking latent pattern, the same
