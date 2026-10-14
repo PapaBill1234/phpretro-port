@@ -41,13 +41,18 @@ fields were absent.
   startup signatures (`cli/src/main.rs`, app-server `lib.rs`/`extensions.rs`)
   expose no `ExtensionDataInit`/`ToolPolicy` argument, and no supported stock
   config route was found. The core thread hook above does not establish a
-  working app-server host. Constructor plumbing and a qualified build remain
-  open. See [cli/main.rs][cli],
+  working app-server host. The exact constructor/session funnel is now traced;
+  the reviewed [central empty-ceiling source patch](../builder/eliza/native-host/README.md)
+  is published but unbuilt and unqualified. A qualified build remains open. See [cli/main.rs][cli],
   [app-server/lib.rs][app].
 - **Hard-parent cleanup.** The pinned stdio EOF path starts a 45-second
   watchdog while asynchronous teardown continues. Source inspection supplies
   no proof that killing the Python parent promptly kills its detached native
-  child. A controlled process test and bounded cleanup are still required.
+  child. A separate Linux guardian now implements bounded owned-group cleanup,
+  including hard parent death and startup races. Its 25 controlled
+  process/race/observation checks passed independent review; the unchanged
+  bridge and generator plus guardian passed 83 Python checks. This prerequisite
+  does not establish the native registry or main-chat readiness.
   See [stdio.rs][stdio].
 - Feature/config flags, prompts and a single model turn are **not** isolation
   proof.
@@ -58,8 +63,9 @@ fields were absent.
 
 Each step is gated; no inference runs until every prerequisite is proven.
 
-1. **Immutable ceiling.** Supply `Some(empty)` at thread start, re-supply it on
-   resume/fork and to helper roles. Preserve the pinned app-server's native
+1. **Immutable ceiling.** Apply the reviewed central `Some(empty)` patch to
+   every newly constructed session, including cold resume/fork and helper roles;
+   a warm resume retains its already constrained live session. Preserve the pinned app-server's native
    JSON-RPC/authentication/configuration stack, with an immutable host ceiling
    enforced centrally rather than an RPC option that can relax it.
 2. **Positive runtime/source proof.** Qualify the exact host build against the
@@ -74,8 +80,9 @@ Each step is gated; no inference runs until every prerequisite is proven.
 5. **Separate steps.** Account metadata is a distinct read-only step; a live text
    turn is a further distinct step.
 
-The tool guard is not weakened by this plan; no code, model, account, service or
-build changes accompany it. See the [integration boundary](eliza-integration.md)
+The runtime guard remains false. The reviewed source artifact and guardian do
+not admit generation; no model, account, service or native build was used for
+these checks. See the [integration boundary](eliza-integration.md)
 and [known gaps](gaps.md).
 
 [tp]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/ext/extension-api/src/tool_policy.rs
