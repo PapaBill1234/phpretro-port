@@ -90,7 +90,7 @@ and clean state are verified before copy/launch. All acceptance-path ancestors
 and write targets are checked for symlinks before mutation. Launch verification
 requires both overlay and drop-in provenance.
 
-Twenty-two adapter checks pass; 59 dashboard checks pass with one existing skip.
+Twenty-four adapter checks pass; 59 dashboard checks pass with one existing skip.
 Tests include parent-path symlinks, closed-gate setup with no writes, wrapper
 modification and missing provenance. Private real-source/loader/schema proof is
 under `.builder/current-workers/root-acceptance-takeover/` and the neighboring
@@ -102,8 +102,8 @@ checks passed, and actual Bun resolution selects the overlay UI source. No host
 or model was launched. The caller's `--deadline` now reaches setup and launch;
 Git/patch timeouts, hashes, copying, links, provenance, configuration and completion
 use the original remaining budget. Start validators derive that budget from the
-saved captured cutoff. Only the generated root `node_modules` is exempt from
-source traversal; unexpected nested dependency links are rejected. Reads of
+saved captured cutoff. Only the exact verified dependency locations from the pinned installation are
+exempt from source traversal; unknown nested dependency links are rejected. Reads of
 provenance/package metadata reject symlink ancestors and leaves. Default supervisor
 execution directories and Vite resolve to the source that was actually validated,
 covered by captured child-launch regressions.
@@ -116,3 +116,25 @@ The adapter `check` reads existing prerequisites without creating directories,
 lock files or a captured cutoff. Acquiring the lifecycle lock belongs to `start`.
 Independent Sol review accepted this no-write adjustment; a successful-check
 regression leaves a fresh private root empty.
+
+## Actual startup correction — package-specific dependency bindings
+
+The first supervised production startup attempted the actual entry point and
+stopped before runtime initialization because `packages/core` could not resolve
+`markdown-it`. Both children were cleaned up. Root-only dependency links were
+insufficient for the installed Bun package layout.
+
+The adapter now materializes all 131 actual installed dependency locations.
+Workspace links resolve to the private overlay; external package/cache links
+retain their verified canonical installation targets. Verification requires exact
+member sets, scope names and link targets before those locations are excluded
+from source traversal. Only known old canonical workspace/scope links may be
+migrated; unknown links, regular entries and empty extra scopes are rejected.
+Actual complete binding verification and Bun resolution of `markdown-it` and
+patched UI passed. Independent Sol source review accepted the repair; 24 adapter
+checks pass, including legacy scope migration and tamper refusal.
+
+This is dependency-binding evidence. The captured host cutoff expired without a
+qualified runtime; it was not extended. Full-host initialization, owner/user
+transport, plugin view mounting and browser behavior still require a fresh
+bounded acceptance run. Native generation remains blocked.
