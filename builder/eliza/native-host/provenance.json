@@ -52,7 +52,7 @@
   "not_done": [
     "No compile, test, or build was run in this phase (toolchain not installed here).",
     "Runtime registry-emptiness qualification is not claimed; the finalized registry must still be measured on a real build.",
-    "The planned real Rust startup/router qualification tests are specified in README.md but are not yet implemented, compiled, or passing."
+    "Source-reviewed startup/registry/adversarial test patches are implemented but uncompiled and unrun; full MCP/contributor and compiled CLI qualification remain open."
   ],
   "notice": {
     "file": "NOTICE",

@@ -60,11 +60,15 @@ hosted-spec retain reject every tool.
 
 This is the *designed* behavior at the pin. It is **not** qualified here.
 
-## Planned qualification (NOT YET IMPLEMENTED)
+## Qualification sources (UNCOMPILED / UNRUN)
 
-The following tests are **planned and unimplemented**; they are not compiled,
-not run, and not passing. They must drive production startup/router paths rather
-than duplicate test-only clamp logic.
+Fifteen source-reviewed startup, registry and adversarial tests are published
+in `qualification-tests.patch`, `qualification-registry.patch` and
+`qualification-adversarial.patch`, in that order after `text-only.patch`. They
+are **uncompiled and unrun**; clean application does not establish passing tests.
+Additional MCP/extension/hosted qualification and compiled CLI admission remain
+open. The target acceptance matrix follows; implemented source coverage and
+remaining gaps are described in each patch's accompanying document.
 
 - Start through `ThreadManager::start_thread` (and `spawn_internal_session`)
   across: new, cold-resume, fork, internal, legacy, and guardian reviewer
