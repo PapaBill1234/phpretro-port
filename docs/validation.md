@@ -49,3 +49,27 @@ MFA/role reset now deletes a prior staff session instead of retaining member aut
 Native CLI token counters and its displayed cost are diagnostic evidence, not verified a6api billing. A configured native turn limit was exceeded by the CLI; only externally bounded wall time was observed. Price enforcement, cross-session doctor improvements and matched Jev savings remain open builder work.
 
 Public-file integrity and local links passed; a scan of all136 candidate public files found none of the known provider/development credential values. Provider transcripts and enrollment files remain ignored/private.
+
+## G05-release-lock — 2026-10-14
+
+The actual bounded private `cargo build --release --locked -p codex-cli --bin
+codex --jobs 1` stopped before compilation on the pinned release's lockfile
+mismatch. A disposable offline diagnostic resolved only 161 local package
+versions from `0.0.0` to `0.162.0`. Independent Sol review and root comparison
+verified all 1,473 package records; all other fields and external dependencies
+are identical. The deterministic repair reproduces the exact output digest
+listed in [native bootstrap evidence](eliza-native-host.md). Trusted source
+stays clean at `c1382380de69521303b416720a52f42d51af6248`.
+
+The focused bootstrap suite has 69 checks, including refusal of unknown/symlinked
+locks, external-entry preservation, old/wrong provenance rejection, and an actual
+controlled compiler that must not record provenance if it mutates the lockfile.
+Controlled compiler success does not establish a real Rust build. Runtime guard
+remains false; compiled qualification and full-host/browser/live queue acceptance
+are pending. Private review/check logs and usage are retained under
+`.builder/current-workers/root-lock-repair/`.
+
+Results: 69 bootstrap tests passed in 13.048 seconds; public-file/document/config
+and whitespace checks passed. Independent final Sol review accepted the five-file
+change without a P0/P1 finding. The repaired `--locked` build has reached actual
+Rust/C compilation, but completion and runtime qualification are not yet claimed.

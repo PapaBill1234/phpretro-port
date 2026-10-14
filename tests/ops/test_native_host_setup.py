@@ -635,6 +635,64 @@ class ResourcePreflight(unittest.TestCase):
             self.assertGreaterEqual(report["free_disk_bytes"], host.DISK_MIN_FREE_BYTES)
 
 
+class ReleaseLockRepair(unittest.TestCase):
+    BASE = b'''version = 4
+
+[[package]]
+name = "local"
+version = "0.0.0"
+dependencies = ["external"]
+
+[[package]]
+name = "external"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "unchanged"
+'''
+    OUTPUT = BASE.replace(b'version = "0.0.0"', b'version = "0.162.0"', 1)
+
+    def test_only_local_versions_change_and_repeat_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            lock = build / "codex-rs/Cargo.lock"
+            lock.parent.mkdir()
+            lock.write_bytes(self.BASE)
+            with patch.object(host, "LOCK_BASE_SHA256", hashlib.sha256(self.BASE).hexdigest()), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(self.OUTPUT).hexdigest()), \
+                    patch.object(host, "LOCK_LOCAL_PACKAGES", 1):
+                host.repair_release_lock(build)
+                self.assertEqual(lock.read_bytes(), self.OUTPUT)
+                with self.assertRaises(host.SetupError):
+                    host.repair_release_lock(build)
+                self.assertEqual(lock.read_bytes(), self.OUTPUT)
+
+    def test_unknown_input_and_wrong_output_never_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            lock = build / "codex-rs/Cargo.lock"
+            lock.parent.mkdir()
+            lock.write_bytes(self.BASE)
+            with self.assertRaises(host.SetupError):
+                host.repair_release_lock(build)
+            with patch.object(host, "LOCK_BASE_SHA256", hashlib.sha256(self.BASE).hexdigest()), \
+                    patch.object(host, "LOCK_LOCAL_PACKAGES", 1):
+                with self.assertRaises(host.SetupError):
+                    host.repair_release_lock(build)
+            self.assertEqual(lock.read_bytes(), self.BASE)
+
+    def test_symlink_cannot_mutate_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            target = build / "trusted.lock"
+            target.write_bytes(self.BASE)
+            lock = build / "codex-rs/Cargo.lock"
+            lock.parent.mkdir()
+            lock.symlink_to(target)
+            with self.assertRaises(host.SetupError):
+                host.repair_release_lock(build)
+            self.assertEqual(target.read_bytes(), self.BASE)
+
+
 class BuildContract(unittest.TestCase):
     def test_build_uses_nested_cargo_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -643,6 +701,7 @@ class BuildContract(unittest.TestCase):
             workspace = build / "codex-rs"
             workspace.mkdir(parents=True)
             (workspace / "Cargo.toml").write_text('[workspace]\n')
+            (workspace / "Cargo.lock").write_bytes(b"fixture lock")
             compiler = root / "cargo-fixture"
             compiler.write_text(
                 '#!' + sys.executable + '\n'
@@ -659,8 +718,14 @@ class BuildContract(unittest.TestCase):
             with patch.object(host, "gate_cutoff", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
-                    patch.object(host, "preflight_resources", return_value={"fixture": True}):
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
                 self.assertEqual(host.command_build(root), 0)
+                recorded = host.load_provenance(root)
+                compiler.write_text(compiler.read_text() + 'Path("Cargo.lock").write_bytes(b"tampered")\n')
+                with self.assertRaisesRegex(host.SetupError, "lockfile changed"):
+                    host.command_build(root)
+                self.assertEqual(host.load_provenance(root), recorded)
             self.assertEqual((host.target_dir(root) / "release" / "codex").read_bytes(),
                              b"controlled-build-result")
             self.assertFalse(host.load_provenance(root)["checks"]["qualified"])
@@ -708,6 +773,7 @@ class BuildBinding(unittest.TestCase):
             "build": {"package": package or host.PACKAGE, "target": target or host.RUST_TRIPLE,
                       "binary": {"path": str(binary), "sha256": hashlib.sha256(b"elf").hexdigest()},
                       "inputs": {"source": host.CODEX_PIN, "patch": patch or digest,
+                                 "lock_sha256": host.LOCK_BUILD_SHA256,
                                  "toolchain": host.RUST_VERSION, "cargo_sha256": cargo or cargo_hash,
                                  "rustc_sha256": rustc or rustc_hash}},
         })
@@ -728,6 +794,17 @@ class BuildBinding(unittest.TestCase):
                 state = host.build_state(root)
                 self.assertFalse(state["ok"], kwargs)
                 self.assertTrue(state["stale"], kwargs)
+
+
+    def test_missing_or_wrong_release_lock_provenance_is_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            for value in (None, "0" * 64):
+                data = host.load_provenance(root)
+                data["build"]["inputs"]["lock_sha256"] = value
+                host.save_provenance(root, data)
+                self.assertFalse(host.build_state(root)["ok"])
 
 
 class LockAndProvenance(unittest.TestCase):

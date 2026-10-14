@@ -73,6 +73,8 @@ python3 scripts/native-host.py build
   free disk and available RAM to protect XRDP, then runs exactly one
   low-priority release job:
   `nice -n 19 cargo build --release --locked -p codex-cli --bin codex --jobs 1`.
+  Before Cargo, the pinned release-local lock mismatch is repaired as described
+  below, while retaining `--locked`.
   Debuginfo is disabled, the Cargo cache/target are private and the environment
   is built from scratch (no inherited provider or cloud credential, no account
   or OAuth copy).
@@ -90,7 +92,7 @@ target bytes are verified against the private checkout `base_sha256` **before**
 the patch is applied and `patched_sha256` **after**, so a wrong target is
 rejected. The patch is applied only to the private build checkout, so the trusted
 clone is never dirtied and `status` stays truthful; a recorded build whose
-source, production patch or actual toolchain binary digests no longer match is
+source, production patch, repaired lock digest or actual toolchain binary digests no longer match is
 reported stale, never ready.
 
 The official toolchain manifest is trusted only through its HTTPS `.sha256`
@@ -155,3 +157,30 @@ build is still pending** and is executed by Root after independent review; the
 `source`, `toolchain` and `build` mutating commands are unaccepted until then.
 No runtime qualification, main-Sol acceptance, live queue or configured host
 startup is claimed here.
+
+## G05 release lock correction — 2026-10-14
+
+The real private build reached Cargo and failed before compilation because the
+release workspace declares version `0.162.0`, while 161 local packages in the
+pinned `Cargo.lock` still declare `0.0.0`. A disposable offline diagnostic build
+produced a minimal correction. Independent Sol inspection and root semantic
+comparison verified that every external package version, checksum, source and
+dependency list is unchanged across all 1,473 packages.
+
+The helper now accepts only the exact pinned input lock SHA-256
+`49fe417bcafe3f69f1f6636e23274f90d37e75e388127a76888c39001a4f8117`,
+updates only source-less local package versions, requires exactly 161 changes,
+and requires the output SHA-256
+`1f770c0e411d51770e6dd48e9f3f4eab847bbabc7949f82f3619414697d68b8d`.
+It refuses unknown input, symlinks, repeated repair and unexpected output before
+writing. The persisted bytes are verified before Cargo and rechecked afterward;
+only the verified digest is recorded as a build input. Old build provenance
+without this digest is stale. The trusted source and production ceiling patch
+remain unchanged. This is a build-input repair, not native runtime admission.
+
+Private diagnostic evidence: `.builder/native-host/logs/build.log`,
+`minimal-lock-probe.log`, and
+`.builder/current-workers/root-lock-repair/architecture.json`. Provider review
+transcripts remain private. Tests exercise external-entry preservation, refusal
+without writes, symlink refusal, stale provenance and a real controlled compiler
+that mutates the lockfile and must not publish new provenance.

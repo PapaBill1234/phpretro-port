@@ -77,3 +77,18 @@ The Linux guardian prerequisite now passed independent review after repairing ob
 ## G05 native bootstrap and qualification sources — 2026-10-14
 
 The reviewed native-host bootstrap verifies the actual public source/patch contract, HTTPS Rust manifest sidecar/archive hashes, private paths and resources, and bounds download, archive decompression, installation and child-group cleanup by the original cutoff. Three real acceptance failures triggered a small Sol extraction-timer repair; 64 focused and 30 upstream checks passed. Real pinned-source inspection succeeded. The first private Rust toolchain installation is in progress; no native binary or compiled qualification result is claimed. Fifteen source-reviewed startup/registry/adversarial tests are published as ordered patches, explicitly uncompiled/unrun. Full MCP/contributor and compiled CLI admission, actual full-host/browser and live queue checks remain open. G05/G06 stay Partial.
+
+## G05 release lock mismatch — 2026-10-14
+
+Task G05-release-lock; pinned Codex source
+`c1382380de69521303b416720a52f42d51af6248`. A real bounded build exposed a
+release-local `Cargo.lock` version mismatch before compilation. The bootstrap
+now performs an exact input/output-hash-bound correction of 161 local package
+versions in its private build copy, retaining `--locked` and all external
+package versions/checksums/dependencies. Independent Sol source comparison
+verified the diagnosis; persisted lock digests are checked before/after Cargo
+and bound to build provenance. Exact source comparison and focused regression
+checks are recorded in [validation](validation.md) and
+[bootstrap evidence](eliza-native-host.md). Native build, compiled qualification,
+MCP/contributor coverage and full-host/browser/live queue admission remain open.
+**G05/G06 remain Partial.**

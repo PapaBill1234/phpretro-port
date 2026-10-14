@@ -63,6 +63,9 @@ ALLOWED_HOSTS = frozenset({"static.rust-lang.org"})
 PATCH_DIR_REL = Path("builder") / "eliza" / "native-host"
 PATCH_MANIFEST = "provenance.json"
 NATIVE_REL = Path(".builder") / "native-host"
+LOCK_BASE_SHA256 = "49fe417bcafe3f69f1f6636e23274f90d37e75e388127a76888c39001a4f8117"
+LOCK_BUILD_SHA256 = "1f770c0e411d51770e6dd48e9f3f4eab847bbabc7949f82f3619414697d68b8d"
+LOCK_LOCAL_PACKAGES = 161
 JOBS = 1  # one low-priority build job, never a parallel herd
 DISK_MIN_FREE_BYTES = 12 * 1024 ** 3
 RAM_MIN_AVAILABLE_BYTES = 3 * 1024 ** 3
@@ -1130,6 +1133,30 @@ def preflight_resources(path, disk_usage=shutil.disk_usage, meminfo=Path("/proc/
 
 
 # --- private build checkout (patch applied, trusted clone untouched) --------
+def repair_release_lock(build):
+    """Correct pinned release-local package versions without resolving dependencies."""
+    path = Path(build) / "codex-rs" / "Cargo.lock"
+    if path.is_symlink() or not path.is_file() or sha256_file(path) != LOCK_BASE_SHA256:
+        raise SetupError("release lockfile does not match the pinned input; refusing")
+    original = path.read_bytes()
+    blocks = original.split(b"[[package]]")
+    changed = 0
+    for index, block in enumerate(blocks[1:], 1):
+        entry = tomllib.loads(b"[[package]]".decode() + block.decode())["package"][0]
+        if "source" not in entry and entry["version"] == "0.0.0":
+            needle = b'\nversion = "0.0.0"\n'
+            if block.count(needle) != 1:
+                raise SetupError("release-local lock entry is ambiguous; refusing")
+            blocks[index] = block.replace(needle, b'\nversion = "0.162.0"\n', 1)
+            changed += 1
+    repaired = b"[[package]]".join(blocks)
+    if changed != LOCK_LOCAL_PACKAGES or hashlib.sha256(repaired).hexdigest() != LOCK_BUILD_SHA256:
+        raise SetupError("release lock repair differs from reviewed output; refusing")
+    path.write_bytes(repaired)
+    verify_sha256(path, LOCK_BUILD_SHA256)
+    return sha256_file(path)
+
+
 def prepare_build(root, deadline=None):
     """Clone the trusted source into a private checkout and apply the patch."""
     parse_cutoff(deadline)  # refuse invalid/missing/expired cutoff before clone/apply
@@ -1154,6 +1181,7 @@ def prepare_build(root, deadline=None):
     if applied.returncode != 0:
         raise SetupError("reviewed patch application failed; refusing", code=1)
     verify_target_files(build, manifest, patched=True)
+    repair_release_lock(build)
     return build, patch, digest
 
 
@@ -1181,6 +1209,7 @@ def build_state(root):
     # actual toolchain binary digests — a bare version string is not enough.
     fresh = (entry.get("package") == PACKAGE and entry.get("target") == RUST_TRIPLE
              and inputs.get("source") == CODEX_PIN
+             and inputs.get("lock_sha256") == LOCK_BUILD_SHA256
              and current_patch is not None and inputs.get("patch") == current_patch
              and inputs.get("toolchain") == toolchain.get("version")
              and cargo.get("sha256") is not None
@@ -1285,11 +1314,16 @@ def command_build(root):
         assert_private(root, logs_dir(root) / "build.log", "build log")
         build, patch, digest = prepare_build(root, deadline=deadline)
         resources = preflight_resources(private_root(root))
+        lock = build / "codex-rs" / "Cargo.lock"
+        verify_sha256(lock, LOCK_BUILD_SHA256)
         argv = build_argv(cargo)
         code = run_supervised(argv, cwd=build / "codex-rs", env=build_env(root),
                               log_path=logs_dir(root) / "build.log", stop_at=deadline)
         if code != 0:
             raise SetupError("codex-cli build did not complete (exit %s); checkpoint at build" % code, code=1)
+        lock_digest = sha256_file(lock)
+        if lock_digest != LOCK_BUILD_SHA256:
+            raise SetupError("build lockfile changed during Cargo; refusing provenance")
         binary = target_dir(root) / "release" / BIN
         if not binary.is_file():
             raise SetupError("build produced no %s binary; refusing" % BIN, code=1)
@@ -1302,6 +1336,7 @@ def command_build(root):
             "binary": {"path": str(binary), "sha256": sha256_file(binary)},
             "patch": {"file": str(patch), "sha256": digest},
             "inputs": {"source": CODEX_PIN, "patch": digest,
+                       "lock_sha256": lock_digest,
                        "toolchain": (data.get("toolchain") or {}).get("version"),
                        "cargo_sha256": (bins.get("cargo") or {}).get("sha256"),
                        "rustc_sha256": (bins.get("rustc") or {}).get("sha256")},
