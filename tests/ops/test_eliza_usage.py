@@ -79,6 +79,23 @@ class ElizaUsageTests(unittest.TestCase):
         self.assertIsNone(attempt["output_tokens"])
         self.assertIsNone(report["providers"][0]["totals"]["input_tokens"])
 
+    def test_partial_known_totals_do_not_hide_known_values(self):
+        write_attempt(self.root, "a1", claude_result(input_tokens=100, output_tokens=10),
+                      {"attempt_id": "a1", "provider": "deepseek", "model": "m"})
+        write_attempt(self.root, "a2", claude_result(input_tokens=None, output_tokens=4),
+                      {"attempt_id": "a2", "provider": "deepseek", "model": "m"})
+        report = usage.build_report(self.root)
+        group = report["providers"][0]
+        self.assertIsNone(group["totals"]["input_tokens"])  # any unknown keeps the total null
+        self.assertEqual(group["known_totals"]["input_tokens"], 100)
+        self.assertEqual(group["known_counts"]["input_tokens"], 1)
+        self.assertEqual(group["unknown"]["input_tokens"], 1)
+        self.assertEqual(group["totals"]["output_tokens"], 14)  # fully known stays a real total
+        self.assertEqual(group["known_counts"]["output_tokens"], 2)
+        markdown = usage.render_markdown(report)
+        self.assertIn("100 (partial, +1 unknown)", markdown)
+        self.assertNotIn("214", markdown)  # partial value is never folded into a total
+
     def test_unsupported_format_is_unknown(self):
         write_attempt(self.root, "a1", json.dumps({"foo": 1, "bar": SECRET}), {"attempt_id": "a1", "provider": "deepseek"})
         report = usage.build_report(self.root)

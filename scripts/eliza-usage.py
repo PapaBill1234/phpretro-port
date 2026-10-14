@@ -354,7 +354,9 @@ def build_report(workers_dir: Path, *, max_files=MAX_FILES, max_file_bytes=MAX_F
     for record in attempts:
         key = (record["provider"], record["model"])
         group = groups.setdefault(key, {"provider": key[0], "model": key[1], "attempts": 0,
-                                        "totals": _blank_totals(), "unknown": _blank_totals(),
+                                        "totals": _blank_totals(), "known_totals": _blank_totals(),
+                                        "known_counts": {f: 0 for f in _blank_totals()},
+                                        "unknown": _blank_totals(),
                                         "cost": 0.0, "cost_currency": None, "cost_known": True})
         group["attempts"] += 1
         for field in group["totals"]:
@@ -363,6 +365,8 @@ def build_report(workers_dir: Path, *, max_files=MAX_FILES, max_file_bytes=MAX_F
                 group["unknown"][field] += 1
             else:
                 group["totals"][field] += value
+                group["known_totals"][field] += value
+                group["known_counts"][field] += 1
         if record["cost"] is None:
             group["cost_known"] = False
         else:
@@ -371,6 +375,7 @@ def build_report(workers_dir: Path, *, max_files=MAX_FILES, max_file_bytes=MAX_F
     providers = []
     for group in groups.values():
         group["totals"] = {k: (None if group["unknown"][k] else v) for k, v in group["totals"].items()}
+        group["known_totals"] = {k: (v if group["known_counts"][k] else None) for k, v in group["known_totals"].items()}
         group["cost"] = round(group["cost"], 6) if group["cost_known"] else None
         group.pop("cost_known")
         providers.append(group)
@@ -441,9 +446,19 @@ def write_private_file(path: Path, text: str):
             temp.unlink()
 
 
+def _render_field(total, known, unknown_count):
+    """A total, or an explicit partial value with its unknown attempt count."""
+    if total is not None:
+        return str(total)
+    if known is None:
+        return "unknown"
+    return "{0} (partial, +{1} unknown)".format(known, unknown_count)
+
+
 def render_markdown(report) -> str:
     lines = ["# Eliza builder usage (private)", "",
-             "Metadata-only allowlisted aggregate. Missing accounting is unknown, not zero.", "",
+             "Metadata-only allowlisted aggregate. Missing accounting is unknown, not zero.",
+             "A `partial` value is a subtotal over known attempts only; it is not the total.", "",
              "## Counts", "",
              "- Attempts: {attempts}".format(**report["counts"]),
              "- Deduplicated copies excluded: {deduplicated}".format(**report["counts"]),
@@ -453,11 +468,12 @@ def render_markdown(report) -> str:
              "| provider | model | attempts | input | cache_read | cache_write | output | seconds | turns | cost |",
              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for group in report["providers"]:
-        t = group["totals"]
+        t, known, unk = group["totals"], group["known_totals"], group["unknown"]
+        cell = lambda field: _render_field(t[field], known[field], unk[field])
         lines.append("| {p} | {m} | {n} | {i} | {cr} | {cw} | {o} | {s} | {tu} | {c} |".format(
             p=group["provider"] or "unknown", m=group["model"] or "unknown", n=group["attempts"],
-            i=t["input_tokens"], cr=t["cache_read_tokens"], cw=t["cache_write_tokens"],
-            o=t["output_tokens"], s=t["seconds"], tu=t["reported_turns"],
+            i=cell("input_tokens"), cr=cell("cache_read_tokens"), cw=cell("cache_write_tokens"),
+            o=cell("output_tokens"), s=cell("seconds"), tu=cell("reported_turns"),
             c=("unknown" if group["cost"] is None else "{0} {1}".format(group["cost"], group["cost_currency"] or ""))))
     lines += ["", "## Doctor recommendations (deterministic)", ""]
     if report["recommendations"]:

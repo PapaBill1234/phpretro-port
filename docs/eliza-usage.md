@@ -39,7 +39,11 @@ recorded as `null` (unknown), never as zero; boolean values are treated as unkno
 Never emitted: worker result text, errors, private paths, raw model-usage maps, session
 or account identities, provider headers, keys or transcripts. Cache-read, cache-write,
 input and output counters are aggregated separately; there is no "cached tokens are
-free" assumption and no token-derived session-limit rating.
+free" assumption and no token-derived session-limit rating. When any attempt in a group
+leaves a field unknown, the group `totals` entry stays `null`; a `known_totals` /
+`known_counts` subtotal over known attempts is reported alongside it and rendered as
+`partial` with its unknown count, never presented as the total. Costs stay unknown and
+no savings are claimed.
 
 Deduplication collapses identical copies of the same attempt (same attempt id and same
 source content hash). Different attempt files remain separate charges even when a
