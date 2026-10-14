@@ -18,6 +18,30 @@ timing-dependent startup interval; source review retained that nonblocking
 limitation. Actual native build, compiled tests and registry/contributor/MCP
 qualification remain open; generation remains disabled.
 
+## G06 fresh run and actual startup — 2026-10-14
+
+Worker `077dcdbe52aeec7d95fee2eeecadb33489ccedb5` passed independent native Sol
+re-review and CI `38616073837`; feature integration is `2221edd`. Root ran the
+combined 107 adapter/dashboard tests in the candidate (19.298 seconds, one
+source-availability skip) and integration checkout (19.277 seconds, no skips).
+Tests include separate-process cross-namespace admission, immutable cutoff
+capture and effective caller/canonical deadline propagation. Expiry simulation
+is not a real elapsed-deadline acceptance run.
+
+Actual fresh setup succeeded. The supervised production API then exited with
+a headless-vault master-key error, and the supervisor cleaned its children.
+No authenticated host/browser/model acceptance follows from that startup.
+Private receipts are in `.builder/current-workers/acceptance-fresh-runs`.
+Chromium `153.0.8010.12` launched and rendered a local test page using the private
+project cache; no application browser acceptance is claimed.
+
+The real resource-fit native build exited 1 at `codex-app-server-protocol` with
+no completed binary and no compiler error diagnostic. The current supervisor
+does not persist an exact resource-stop reason. Both owned build locks were
+verified unheld afterward. Sanitized failure evidence is retained in
+`.builder/current-workers/native-resource-fit/resource-fit-build-result.json`.
+The trusted source/toolchain/cache remain; compiled qualification is open.
+
 # Checkpoint validation — 2026-10-11
 
 This is a runnable development foundation, not the completed CMS/game port.

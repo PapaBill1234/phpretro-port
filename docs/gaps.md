@@ -138,3 +138,28 @@ tests and 30 upstream tests; worker CI `38612139952` passed. These tests include
 real process cleanup and a subprocess argument/environment fixture, not a Rust
 compile. Actual resource fit, compiled qualification and native admission remain
 open. The generation guard remains false. See [validation](validation.md).
+
+The first real resource-fit compile exited 1 at `codex-app-server-protocol`
+without a completed binary or a compiler error diagnostic. Its supervisor does
+not retain a distinct resource-stop reason, so the precise cause is unproven.
+The build and continuation locks were released. Stop-reason evidence is a new
+bounded prerequisite before another justified attempt; compiled qualification
+remains open.
+
+## G06 fresh run isolation and runtime vault boundary — 2026-10-14
+
+Task G06-fresh-acceptance-runs; worker `077dcdb`, feature integration `2221edd`.
+Validated run IDs select isolated state, overlay, database and home directories.
+Saved cutoff bytes remain immutable; a shared admission lock covers setup and
+foreground supervision. A source-review finding about shorter launch deadlines
+was repaired before integration. Root ran 107 adapter/dashboard tests with no
+skips (19.277 seconds); worker CI `38616073837` passed. Independent Sol re-review
+accepted the final source. See [validation](validation.md).
+
+Actual setup of a fresh run succeeded. Production startup progressed past the
+dependency boundary and stopped because the headless local vault had no master
+key. Per-run local credentials are now a separately reviewed prerequisite;
+actual authenticated OWNER/USER transport, browser mounting, two-room new-chat
+persistence/reload and live queues remain unverified. A privately installed
+Chromium launched successfully, which establishes browser availability only.
+The expired original run and operator state were preserved. G05/G06 stay Partial.
