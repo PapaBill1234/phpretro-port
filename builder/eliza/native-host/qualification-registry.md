@@ -61,7 +61,8 @@ tests), `ToolRouter::{model_visible_specs, registered_tool_names_for_test,
 tool_exposure_for_test, tool_namespaces_info, code_mode_tool_names, exposes_tool}`,
 `ToolRegistry::{with_tool_policy, register_trusted, prepend_trusted, register_external,
 entries}`, `TurnContext.dynamic_tools: Vec<DynamicToolSpec>` (mutable via
-`Arc::make_mut`; `TurnContext: Clone`), `ToolExposure` variants
+`Arc::get_mut`, since the pinned `TurnContext` implements no `Clone` and
+`Arc::make_mut` therefore fails to compile), `ToolExposure` variants
 (`Direct/Deferred/DeferredModelOnly/DirectModelOnly/CodeModeOnly/Hidden`),
 `ToolName::{plain,new}`. `session.tool_policy` is `pub(crate)`; `CodexThread.session`
 is `pub(crate)`.
