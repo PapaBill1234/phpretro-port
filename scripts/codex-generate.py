@@ -35,6 +35,7 @@ NO success and NO fallback.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import importlib.util
 import json
 import math
@@ -133,6 +134,84 @@ SCHEMA_FILE_MAX_BYTES = 8 * 1024 * 1024
 SCHEMA_OUTPUT_SUBDIR = "schema"
 SCHEMA_THREAD_FILE = ("v2", "ThreadStartParams.json")
 THREAD_SCHEMA_TITLE = "ThreadStartParams"
+# Cleanup reserve (seconds) taken ONLY from the off-peak GATE budget, never from
+# the caller's short ``--timeout``. The gate stop_at is the canonical cutoff;
+# the work deadline is the earlier of ``caller timeout`` and ``gate - reserve``.
+CLEANUP_RESERVE = 5.0
+# One monotonic work deadline for the WHOLE call (metadata probes, app-server and
+# the turn). Set once in ``execute`` from the captured cutoff; every bounded
+# subprocess and RPC operation is capped by what remains. The default (None)
+# preserves the plain helper signatures: a direct call is uncapped as before.
+_DEADLINE = contextvars.ContextVar("codex_generate_work_deadline", default=None)
+
+
+def _remaining_budget():
+    """Seconds left before the captured work deadline, or ``None`` when unset."""
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _budget_timeout(cap):
+    """Cap a subprocess timeout by the remaining work budget; never extend it."""
+    remaining = _remaining_budget()
+    if remaining is None:
+        return cap
+    if remaining <= 0:
+        raise bridge.BridgeError("timeout", "Work deadline reached before offline metadata.")
+    return min(cap, remaining)
+
+
+def _check_budget(stage):
+    """Refuse to start ``stage`` once the captured work deadline has passed."""
+    remaining = _remaining_budget()
+    if remaining is not None and remaining <= 0:
+        raise bridge.BridgeError("timeout", "Work deadline reached before " + stage + ".")
+
+
+def capture_work_deadline(window, timeout, now_monotonic=None, now_utc=None):
+    """Map the canonical gate cutoff to ONE monotonic work deadline, or refuse.
+
+    The off-peak ``stop_at`` is captured once (caller passes the value returned by
+    ``window_policy.require_allowed``) and rejected when missing, unparseable or
+    already expired. The UTC cutoff is converted to a monotonic deadline using the
+    SAME pair of clocks, so wall-clock drift after capture cannot extend it. The
+    work deadline is the EARLIER of ``start + timeout`` and ``gate cutoff minus
+    CLEANUP_RESERVE``; the reserve is subtracted only from the gate budget, so a
+    short caller ``--timeout`` is never shortened into the reserve.
+    """
+    stop_at = window.get("stop_at") if isinstance(window, dict) else None
+    if not isinstance(stop_at, str) or not stop_at:
+        raise bridge.BridgeError(
+            "off_peak_paused", "Off-peak window has no verified cutoff; refusing to dispatch."
+        )
+    try:
+        parsed = window_policy.dt.datetime.fromisoformat(stop_at)
+    except (TypeError, ValueError):
+        raise bridge.BridgeError(
+            "off_peak_paused", "Off-peak window cutoff is invalid; refusing to dispatch."
+        ) from None
+    # The canonical cutoff is always UTC aware; a naive timestamp has no defined
+    # offset and must not be converted to an epoch (it could silently shift the
+    # window), so it is rejected rather than assumed to be UTC.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise bridge.BridgeError(
+            "off_peak_paused", "Off-peak window cutoff is not timezone-aware; refusing to dispatch."
+        )
+    cutoff = parsed.timestamp()
+    start_mono = time.monotonic() if now_monotonic is None else now_monotonic
+    start_utc = time.time() if now_utc is None else now_utc
+    if not math.isfinite(cutoff) or cutoff <= start_utc:
+        raise bridge.BridgeError(
+            "off_peak_paused", "Off-peak window cutoff has expired; refusing to dispatch."
+        )
+    gate_deadline = start_mono + (cutoff - start_utc) - CLEANUP_RESERVE
+    if gate_deadline <= start_mono:
+        raise bridge.BridgeError(
+            "off_peak_paused", "Off-peak window is within its cleanup reserve; refusing to dispatch."
+        )
+    return min(start_mono + timeout, gate_deadline)
 # Exact declared shape each isolation field must have in the installed
 # experimental schema. A field is trusted only when its declared ``type`` (and,
 # for the array fields, its item ``$ref``) matches EXACTLY; anything else is an
@@ -265,7 +344,7 @@ def probe_feature_list(binary: str, overrides=()):
                 command,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                timeout=20,
+                timeout=_budget_timeout(20),
                 env=env,
             )
         except (OSError, subprocess.SubprocessError):
@@ -276,6 +355,7 @@ def probe_feature_list(binary: str, overrides=()):
             raise bridge.BridgeError(
                 "feature_policy", "Installed Codex feature list is unavailable; refusing to dispatch."
             )
+        _check_budget("feature list parsing")
         features = {}
         for line in completed.stdout.decode("utf-8", "replace").splitlines():
             parts = line.split()
@@ -341,7 +421,7 @@ def thread_params_supported(binary: str) -> bool:
                 command,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                timeout=SCHEMA_TIMEOUT,
+                timeout=_budget_timeout(SCHEMA_TIMEOUT),
                 env=env,
             )
         except (OSError, subprocess.SubprocessError):
@@ -354,6 +434,7 @@ def thread_params_supported(binary: str) -> bool:
                 "thread_params_unsupported",
                 "Installed Codex experimental schema is unavailable; refusing to dispatch.",
             )
+        _check_budget("schema parsing")
         base = Path(out_dir).resolve()
         path = base.joinpath(*SCHEMA_THREAD_FILE).resolve()
         if base not in path.parents:
@@ -470,7 +551,7 @@ def verify_version(binary: str, expected: str = CODEX_VERSION) -> str:
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=10,
+            timeout=_budget_timeout(10),
             env=bridge.child_environment(),
         )
     except (OSError, subprocess.SubprocessError):
@@ -639,6 +720,7 @@ def run_turn(client, request, emit, workspace: Path, isolation_fields: bool = Fa
                 "allowProviderModelFallback": False,
             }
         )
+    _check_budget("thread start")
     thread = client.request("thread/start", thread_params)
     try:
         thread_id = thread["thread"]["id"]
@@ -659,6 +741,7 @@ def run_turn(client, request, emit, workspace: Path, isolation_fields: bool = Fa
     }
     if isolation_fields:
         turn_params["environments"] = []
+    _check_budget("turn start")
     start = client.request("turn/start", turn_params)
     try:
         turn_id = start["turn"]["id"]
@@ -776,14 +859,31 @@ def execute(args, command=None, emit=None, qualify=None):
         try:
             raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
             request = parse_request(raw)
-            # Fresh off-peak window and fresh subscription quota EVERY call.
+            # Fresh off-peak window: capture the CANONICAL cutoff exactly once and
+            # map it to a monotonic work deadline BEFORE any offline metadata
+            # subprocess runs. A missing/invalid/expired cutoff refuses to dispatch.
             try:
-                window_policy.require_allowed()
+                window = window_policy.require_allowed()
             except ValueError:
                 raise bridge.BridgeError(
                     "off_peak_paused",
                     "Generation is paused outside the verified off-peak window.",
                 ) from None
+            work_deadline = capture_work_deadline(window, args.timeout)
+        except ValueError:
+            emit({"type": "error", "code": "off_peak_paused", "message": "Off-peak window is invalid."})
+            return {"schema": SCHEMA, "ok": False, "error_code": "off_peak_paused"}
+        except bridge.BridgeError as error:
+            emit({"type": "error", "code": error.code, "message": str(error)})
+            return {"schema": SCHEMA, "ok": False, "error_code": error.code}
+        # ONE deadline for the whole call. Every probe and RPC operation is capped
+        # by what remains; it is never recomputed, so metadata/account/thread work
+        # can never extend the window.
+        token = _DEADLINE.set(work_deadline)
+        client = None
+        success = False
+        try:
+            _check_budget("metadata qualification")
             # Contract qualification runs BEFORE the app-server (account/model/
             # thread/turn) is ever started: an unprovable tool-isolation contract
             # must block without touching the account or a model.
@@ -797,6 +897,7 @@ def execute(args, command=None, emit=None, qualify=None):
                 # Caller-emulated qualified host: no offline schema detection is
                 # performed, so isolation fields are NOT sent (fail closed).
                 qualification = {"qualified": True, "schema_supported": False}
+            _check_budget("contract qualification")
             if not qualification.get("qualified"):
                 raise bridge.BridgeError(
                     "unsupported_contract",
@@ -804,12 +905,13 @@ def execute(args, command=None, emit=None, qualify=None):
                 )
             if command is None:
                 command = generation_codex_command(bridge.resolve_codex_binary(args.codex_bin))
-            client = bridge.RpcClient(command, args.timeout)
-        except bridge.BridgeError as error:
-            emit({"type": "error", "code": error.code, "message": str(error)})
-            return {"schema": SCHEMA, "ok": False, "error_code": error.code}
-        success = False
-        try:
+            _check_budget("app-server launch")
+            client = bridge.RpcClient(command, _budget_timeout(args.timeout))
+            # Retain the ABSOLUTE clamp: the RPC client deadline can never exceed
+            # the captured work deadline, even if the remaining budget shrank
+            # between capture and launch.
+            client.deadline = min(client.deadline, work_deadline)
+            _check_budget("account inspection")
             limits, available, _account = bridge.inspect_account(client)
             if not limits["dispatch_allowed"]:
                 raise bridge.BridgeError(
@@ -832,7 +934,9 @@ def execute(args, command=None, emit=None, qualify=None):
             result.update(ok=False, error_code=error.code)
         finally:
             # Interrupt on any non-success path; close() terminates the group.
-            client.close(interrupt=not success)
+            if client is not None:
+                client.close(interrupt=not success)
+            _DEADLINE.reset(token)
         return result
 
 

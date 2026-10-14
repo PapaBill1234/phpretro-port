@@ -25,6 +25,20 @@ def _load(name, relative):
 
 generate = _load("codex_generate", "scripts/codex-generate.py")
 
+
+def _iso(epoch):
+    dt = generate.window_policy.dt
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).isoformat()
+
+
+def _window(stop_at=None, seconds=3600):
+    """Deterministic allowed gate: a cutoff derived from a caller-chosen offset,
+    never from the real off-peak schedule."""
+    if stop_at is None:
+        stop_at = _iso(generate.window_policy.dt.datetime.now(
+            generate.window_policy.dt.timezone.utc).timestamp() + seconds)
+    return {"allowed": True, "timezone": "UTC", "reason": "off_peak_buffered", "stop_at": stop_at}
+
 FAKE = r'''
 import json,sys,time,subprocess
 scenario,record=sys.argv[1:]
@@ -34,7 +48,9 @@ for line in sys.stdin:
  with open(record,'a') as f:f.write(json.dumps({'method':method,'params':p})+'\n')
  if method=='initialize':value={}
  elif method=='initialized':continue
- elif method=='account/read':value={'account':{'type':'apiKey' if scenario=='apikey' else 'chatgpt','email':'private@example.invalid'}}
+ elif method=='account/read':
+  if scenario=='account-stall':time.sleep(5);continue
+  value={'account':{'type':'apiKey' if scenario=='apikey' else 'chatgpt','email':'private@example.invalid'}}
  elif method=='account/rateLimits/read':
   value={'ordinaryUsageAllowed':True,'accountId':'account-one','rateLimitsByLimitId':{'codex':{'spendControlReached':False,'rateLimitReachedType':None,'primary':{'usedPercent':90 if scenario=='reserve' else 5,'windowDurationMins':300,'resetsAt':time.time()+3600},'secondary':{'usedPercent':1,'windowDurationMins':10080,'resetsAt':time.time()+9000}}}}
   if scenario=='unknown':value['ordinaryUsageAllowed']=None
@@ -85,6 +101,23 @@ class _Stdin:
         self.buffer = io.BytesIO(data)
 
 
+class _RecordingClient:
+    """Minimal RpcClient stand-in for controlled-clock run_turn deadline tests."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+        self.active = None
+        self.pending = []
+
+    def request(self, method, params):
+        self.calls.append(method)
+        return self.responses[method]
+
+    def next(self):
+        return None
+
+
 class GenerateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -102,11 +135,19 @@ class GenerateTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def run_generate(self, scenario="completed", request=None, timeout=2, qualify=None):
+    def run_generate(self, scenario="completed", request=None, timeout=2, qualify=None,
+                     window=None, gate=None):
         events = []
         args = generate.parser().parse_args(["--state-dir", str(self.state), "--timeout", str(timeout)])
         command = [sys.executable, str(self.fake), scenario, str(self.record)]
-        with patch.object(sys, "stdin", _Stdin(json.dumps(request or self.request()).encode())):
+        if gate is None:
+            chosen = window if window is not None else _window()
+
+            def gate():
+                return chosen
+        with patch.object(generate.window_policy, "require_allowed", gate), patch.object(
+            sys, "stdin", _Stdin(json.dumps(request or self.request()).encode())
+        ):
             result = generate.execute(args, command=command, emit=events.append, qualify=qualify)
         return result, events
 
@@ -217,8 +258,7 @@ class GenerateTests(unittest.TestCase):
     def test_off_peak_pause_blocks_generation(self):
         def blocked():
             raise ValueError("off-peak closed")
-        with patch.object(generate.window_policy, "require_allowed", blocked):
-            _, events = self.run_generate()
+        _, events = self.run_generate(gate=blocked)
         self.assertEqual(events[-1]["code"], "off_peak_paused")
         self.assertFalse(self.record.exists())
 
@@ -226,6 +266,115 @@ class GenerateTests(unittest.TestCase):
         _, events = self.run_generate("timeout", timeout=0.3)
         self.assertEqual(events[-1]["code"], "timeout")
         self.assertIn("turn/interrupt", self.methods())
+
+    def test_capture_work_deadline_rejects_missing_invalid_expired_and_reserved(self):
+        now = 1000.0
+        for bad in (None, {}, {"stop_at": None}, {"stop_at": ""}, {"stop_at": "not-a-time"},
+                    {"stop_at": "2030-01-01T00:00:00"},  # naive timestamp (no timezone)
+                    {"stop_at": _iso(now - 1)}, {"stop_at": _iso(now + 4)}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(generate.bridge.BridgeError) as caught:
+                    generate.capture_work_deadline(bad, 30, now_monotonic=now, now_utc=now)
+                self.assertEqual(caught.exception.code, "off_peak_paused")
+        self.assertAlmostEqual(
+            generate.capture_work_deadline({"stop_at": _iso(now + 3600)}, 30, now_monotonic=now, now_utc=now),
+            now + 30,
+        )
+
+    def test_capture_work_deadline_uses_earlier_of_caller_timeout_and_gate(self):
+        now = 500.0
+        # A far gate: the short caller timeout binds and the reserve is never taken from it.
+        self.assertAlmostEqual(
+            generate.capture_work_deadline({"stop_at": _iso(now + 3600)}, 0.3, now_monotonic=now, now_utc=now),
+            now + 0.3,
+        )
+        # A near gate: only the GATE budget loses the five-second cleanup reserve.
+        self.assertAlmostEqual(
+            generate.capture_work_deadline({"stop_at": _iso(now + 6)}, 300, now_monotonic=now, now_utc=now),
+            now + 1.0,
+        )
+
+    def test_missing_or_expired_cutoff_blocks_before_app_server(self):
+        for window in ({"allowed": True}, {"allowed": True, "stop_at": _iso(
+                generate.window_policy.dt.datetime.now(generate.window_policy.dt.timezone.utc).timestamp() - 1)}):
+            with self.subTest(window=window):
+                self.record.unlink(missing_ok=True)
+                result, events = self.run_generate(window=window)
+                self.assertFalse(result["ok"])
+                self.assertEqual(events[-1]["code"], "off_peak_paused")
+                self.assertFalse(self.record.exists())
+
+    def test_metadata_exhausting_budget_blocks_before_rpc(self):
+        self.record.unlink(missing_ok=True)
+
+        def qualify():
+            # Metadata consumed the whole captured budget.
+            generate._DEADLINE.set(generate.time.monotonic() - 1)
+            return {"qualified": True, "schema_supported": True}
+
+        result, events = self.run_generate(qualify=qualify)
+        self.assertFalse(result["ok"])
+        self.assertEqual(events[-1]["code"], "timeout")
+        self.assertFalse(self.record.exists())  # the app-server never started
+
+    def test_window_is_captured_once_and_cannot_be_extended(self):
+        calls = []
+        windows = [_window(seconds=3600), _window(seconds=99999)]
+
+        def gate():
+            calls.append(1)
+            return windows[min(len(calls) - 1, 1)]
+
+        result, events = self.run_generate(gate=gate)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 1)  # no later window can extend the deadline
+
+    def test_short_caller_timeout_still_completes_with_gate_only_reserve(self):
+        result, events = self.run_generate(timeout=0.5)
+        self.assertTrue(result["ok"])
+        self.assertEqual(events[-1]["type"], "final")
+
+    def test_gate_cutoff_binds_rpc_deadline_not_caller_timeout(self):
+        now = generate.window_policy.dt.datetime.now(generate.window_policy.dt.timezone.utc).timestamp()
+        start = time.monotonic()
+        _, events = self.run_generate("timeout", timeout=30, window={"allowed": True, "stop_at": _iso(now + 8)})
+        elapsed = time.monotonic() - start
+        self.assertEqual(events[-1]["code"], "timeout")
+        self.assertLess(elapsed, 6)  # bounded by gate - reserve (~3s), not the 30s caller timeout
+        self.assertIn("turn/interrupt", self.methods())
+
+    def test_account_stall_times_out_before_thread(self):
+        self.record.unlink(missing_ok=True)
+        _, events = self.run_generate("account-stall", timeout=0.5)
+        self.assertEqual(events[-1]["code"], "timeout")
+        self.assertNotIn("thread/start", self.methods())
+
+    def test_run_turn_refuses_thread_start_once_budget_is_spent(self):
+        client = _RecordingClient({})
+        request = generate.parse_request(json.dumps(self.request()).encode())
+        generate._DEADLINE.set(generate.time.monotonic() - 1)
+        try:
+            with self.assertRaises(generate.bridge.BridgeError) as caught:
+                generate.run_turn(client, request, lambda _e: None, self.root)
+        finally:
+            generate._DEADLINE.set(None)
+        self.assertEqual(caught.exception.code, "timeout")
+        self.assertEqual(client.calls, [])
+
+    def test_run_turn_refuses_turn_start_when_thread_used_the_budget(self):
+        client = _RecordingClient({
+            "thread/start": {"thread": {"id": "t"}, "model": generate.MODEL, "modelProvider": generate.PROVIDER},
+        })
+        request = generate.parse_request(json.dumps(self.request()).encode())
+        generate._DEADLINE.set(100.0)
+        try:
+            with patch.object(generate.time, "monotonic", side_effect=[99.0, 101.0]):
+                with self.assertRaises(generate.bridge.BridgeError) as caught:
+                    generate.run_turn(client, request, lambda _e: None, self.root)
+        finally:
+            generate._DEADLINE.set(None)
+        self.assertEqual(caught.exception.code, "timeout")
+        self.assertEqual(client.calls, ["thread/start"])
 
     def test_each_call_opens_a_unique_stateless_thread(self):
         self.run_generate()

@@ -125,6 +125,20 @@ proven, so the generator blocks. The controls it evaluates:
 - **Quota/off-peak**: a fresh off-peak window and fresh subscription quota per
   call. Unknown quota, `spendControlReached`, or any window at ≥90% used blocks
   dispatch.
+- **Shared work deadline (metadata → account → thread → turn)**: the canonical
+  off-peak `stop_at` is captured **once** and mapped to a single monotonic work
+  deadline before any offline metadata subprocess runs. A missing, unparseable,
+  naive (no timezone) or already-expired cutoff refuses to dispatch. The work
+  deadline is the **earlier** of `caller --timeout` and `gate cutoff − 5 s`, and
+  the five-second cleanup reserve is taken **only** from the gate budget, so a
+  short caller timeout is never shortened into the reserve. That one deadline is
+  threaded through every version/features/schema subprocess (each cap becomes
+  `min(existing cap, remaining)`), rechecked before and after metadata parsing,
+  before the app-server/account inspection, and immediately before the
+  `thread/start` and `turn/start` operations. The `RpcClient` deadline is
+  additionally pinned to `min(remaining, captured deadline)` so RPC can never
+  outrun the window. The deadline is never recomputed, so metadata/account/thread
+  work can never extend it.
 - **Thread (per-generation)**: a unique, stateless thread per generation (never
   resumed) with host-fixed `baseInstructions` / `developerInstructions` and an
   empty host-derived workspace as `cwd`. When the experimental schema is
@@ -143,8 +157,10 @@ proven, so the generator blocks. The controls it evaluates:
   erase inherited entries; the effective config is checked, never echoed).
 - **Text only**: any non-text item or unrecognized turn event aborts the turn;
   server-initiated requests are refused by `RpcClient`. Cancellation/timeout/
-  provider errors interrupt the turn and terminate the process group — no
-  success, no fallback.
+  provider errors interrupt the turn and terminate the app-server's own process
+  group — no success, no fallback. **Hard-parent cleanup is not covered**: only
+  the child's group is signalled, so a process a descendant re-parented outside
+  that group is *not* provably reclaimed, and that remains unqualified.
 
 ## Known limits and gaps (not closed)
 
@@ -177,6 +193,15 @@ proven, so the generator blocks. The controls it evaluates:
 - **TextStreamResult is a live iterator**: `stream: true` yields deltas as they
   arrive and settles `text`/`usage`/`finishReason` on the exact completed turn.
   Cancellation kills the transport and rejects with no fallback.
+- **Deadline prerequisite, not a generation unblock.** The shared metadata/
+  account/thread/turn deadline and the five-second gate cleanup reserve are
+  implemented and controlled-fixture verified, but they are a *prerequisite*:
+  generation still **blocks** on `unverified_runtime_toolset`, and this slice made
+  **no live native call, login, account or model request** and started no service.
+- **Hard-parent cleanup remains unqualified.** Normal timeout/interrupt closes
+  the app-server's process group. Killing the Python transport from JavaScript
+  does not yet prove that its detached native group is reclaimed promptly.
+  That process-boundary acceptance remains open.
 - Installed-CLI feature-key names beyond the listed set are **not** confirmed;
   any key that proves unrecognized on the installed CLI must block, not be
   assumed away.
@@ -184,9 +209,9 @@ proven, so the generator blocks. The controls it evaluates:
 ## Verification (this slice)
 
 ```
-python3 -m unittest tests.ops.test_codex_generate   # 31 tests, process boundary + FakeRPC + contract/schema qualification
+python3 -m unittest tests.ops.test_codex_generate   # 41 tests, process boundary + FakeRPC + contract/schema qualification + shared deadline
 node builder/eliza/native-model/native-model.fixture.mjs   # 19/19 controlled checks (draft handlers)
-python3 -m unittest tests.ops.test_codex_bridge      # 11 tests, dependency unchanged
+python3 -m unittest tests.ops.test_codex_bridge      # 13 tests, dependency unchanged
 ```
 
 Offline qualification evidence (raw ELF, empty HOME/CODEX_HOME; no login/account/
