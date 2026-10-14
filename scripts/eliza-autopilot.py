@@ -139,7 +139,7 @@ def scope_allowed(path):
         return False
     if any(p == ".." for p in parts):
         return False
-    if any(p == ".git" or p.startswith(".env") for p in parts):
+    if any(p.startswith(".") or p in ("node_modules", "secrets", "private") for p in parts):
         return False
     if DENY_SUFFIX.search(norm):
         return False
@@ -352,6 +352,10 @@ class QState:
         """Return a reason string while any qstate field blocks a new dispatch."""
         if self.data.get("recoveryRequired"):
             return "recovery_required"
+        if self.data.get("waitingReserve"):
+            return "quota_reserve"
+        if self.data.get("owner") not in (None, "codex-eliza", "eliza-autopilot"):
+            return "ownership_changed"
         if self.data.get("paused"):
             return self.data.get("pauseReason") or "paused"
         return None
@@ -545,6 +549,34 @@ class Autopilot:
     def stop_flag(self):
         return (self.state_dir / "STOP").exists()
 
+    def coordination_blocking(self):
+        """Honor the host's handoff marker without changing its ownership."""
+        path = BUILDER_STATE / "quota-state.json"
+        try:
+            state = json.loads(read_private(path, MAX_MANIFEST_BYTES))
+        except FileNotFoundError:
+            return None  # Standalone host-owned queue; no coordinator marker exists.
+        except (ValueError, OSError, AutopilotError):
+            return "coordination_unknown"
+        if not isinstance(state, dict) or state.get("coordinatorOwner") != "codex-eliza":
+            return "ownership_changed"
+        if state.get("paused") or state.get("humanPaused"):
+            return "coordinator_paused"
+        if state.get("status") not in ("active-eliza-only", "waiting-for-offpeak", "active"):
+            return "coordinator_paused"
+        windows = state.get("reportedWindows")
+        if not isinstance(windows, list) or not windows:
+            return "coordination_quota_unknown"
+        for window in windows:
+            used = window.get("usedPercent") if isinstance(window, dict) else None
+            if not isinstance(used, (int, float)) or isinstance(used, bool):
+                return "coordination_quota_unknown"
+            if not 0 <= used <= 100:
+                return "coordination_quota_unknown"
+            if used >= 90:
+                return "quota_reserve"
+        return None
+
     # -- decisions -------------------------------------------------------------
     def decide(self, now, *, for_run):
         if not self.manifest["tasks"]:
@@ -553,6 +585,11 @@ class Autopilot:
         if not window["allowed"]:
             return {"action": "stay_idle", "reason": window["reason"],
                     "next_wake": window["next_allowed_at"]}
+        blocking = self.qstate.blocking() or self.coordination_blocking()
+        if blocking:
+            if blocking == "recovery_required":
+                return {"action": "recovery_required", "markers": self.attempts.unresolved()}
+            return {"action": "paused", "reason": blocking}
         stop_at = dt.datetime.fromisoformat(window["stop_at"])
         if for_run and (stop_at - now).total_seconds() <= self.grace:
             return {"action": "winddown", "stop_at": window["stop_at"]}
@@ -781,7 +818,8 @@ class Autopilot:
         # Reconcile during an open window so completed workers are accepted
         # (with scope verification and third-failure handoff). Never during a
         # blocked window, and never while an ambiguity needs recovery.
-        if coding_window.decision(now)["allowed"] and not self.attempts.unresolved():
+        if (coding_window.decision(now)["allowed"] and not self.attempts.unresolved()
+                and not self.qstate.blocking() and not self.coordination_blocking()):
             self.reconcile(now)
         decision = self.decide(now, for_run=True)
         action = decision["action"]
@@ -808,8 +846,6 @@ class Autopilot:
         if self.stop_flag():
             return {"action": "stopped", "reason": "private STOP flag present"}
         self.singleton.acquire()
-        self.qstate.data["owner"] = f"eliza-autopilot:{os.getpid()}"
-        self.qstate.save()
         deadline = time.time() + self.max_seconds
         try:
             while True:

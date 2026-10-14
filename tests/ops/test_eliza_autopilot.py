@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "eliza-autopilot.py"
@@ -255,6 +256,58 @@ class SingletonTests(Base):
 
 
 class ControlFlowTests(Base):
+    def test_nested_private_scope_is_rejected(self):
+        for path in ["builder/eliza/.builder/control.token", "builder/eliza/private/report.json",
+                     "builder/eliza/node_modules/package/index.js", "builder/eliza/secrets/provider.json"]:
+            with self.subTest(path=path):
+                self.assertFalse(ap.scope_allowed(path))
+
+    def test_reserve_and_foreign_owner_block_before_reconciliation(self):
+        self.write_manifest([self.task()])
+        self.start_fixture()
+        pilot = self.pilot(OPEN)
+        for flags, reason in [({"waitingReserve": True}, "quota_reserve"),
+                              ({"owner": "claude-code"}, "ownership_changed")]:
+            pilot.qstate.data.update(waitingReserve=False, owner=None, paused=False)
+            pilot.qstate.data.update(flags)
+            with mock.patch.object(pilot, "reconcile") as reconcile:
+                result = pilot.step(dt.datetime.fromisoformat(OPEN))
+            self.assertEqual(result["action"], "paused")
+            self.assertEqual(result["reason"], reason)
+            reconcile.assert_not_called()
+            self.assertEqual(self.fixture.posts("task-dispatch"), [])
+
+    def test_canonical_handoff_blocks_without_changing_owner(self):
+        self.write_manifest([self.task()])
+        pilot = self.pilot(OPEN)
+        with mock.patch.object(ap, "ROOT", self.root):
+            directory = self.root / ".builder"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            marker = directory / "quota-state.json"
+            state = {"coordinatorOwner": "claude-code", "status": "active-eliza-only",
+                     "reportedWindows": [{"usedPercent": 10}]}
+            marker.write_text(json.dumps(state))
+            marker.chmod(0o600)
+            self.assertEqual(pilot.coordination_blocking(), "ownership_changed")
+            state["coordinatorOwner"] = "codex-eliza"
+            state["reportedWindows"][0]["usedPercent"] = 90
+            marker.write_text(json.dumps(state))
+            self.assertEqual(pilot.coordination_blocking(), "quota_reserve")
+            state["reportedWindows"] = []
+            marker.write_text(json.dumps(state))
+            self.assertEqual(pilot.coordination_blocking(), "coordination_quota_unknown")
+            self.assertEqual(json.loads(marker.read_text()), state)
+
+    def test_foreign_owner_cannot_cancel_at_winddown(self):
+        self.write_manifest([self.task()])
+        self.start_fixture()
+        pilot = self.pilot(WINDDOWN)
+        pilot.qstate.data["owner"] = "claude-code"
+        pilot.tracked = {"t-1": {"attemptId": "a1", "boardId": "AUTO-1"}}
+        result = pilot.step(dt.datetime.fromisoformat(WINDDOWN))
+        self.assertEqual(result["reason"], "ownership_changed")
+        self.assertEqual(self.fixture.posts("task-cancel"), [])
+
     def test_peak_idles_until_next_allowed_at_without_dispatch(self):
         self.write_manifest([self.task()])
         self.start_fixture()

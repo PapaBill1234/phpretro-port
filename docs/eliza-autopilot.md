@@ -100,6 +100,14 @@ blocks a new dispatch without spending. Weekly/5-hour windows are never relabell
 as a daily allowance, and the autopilot never consumes a reset credit or changes
 an account.
 
+The queue also honors the host coordinator's private `quota-state.json` when
+present: foreign ownership, pause, unknown reported windows or a reserve blocks
+reconciliation and dispatch. Startup preserves that ownership. Ownership checks
+precede cutoff cancellation as well; a handed-off queue cannot cancel another
+coordinator's tasks. Nested private, hidden and dependency paths are excluded
+from every declared worker scope. This queue is not installed as a live service
+and has not passed a funded end-to-end deployment check.
+
 ## Durable attempts and recovery
 
 Every mutating control request is preceded by a durable attempt marker. If a
