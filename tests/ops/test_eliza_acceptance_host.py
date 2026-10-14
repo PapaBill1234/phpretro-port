@@ -156,6 +156,59 @@ class OverlayTest(unittest.TestCase):
             self.assertEqual(alias.resolve(), (host.overlay_dir(root) / "packages/ui").resolve())
             self.assertNotEqual(target.stat().st_ino, (host.overlay_dir(root) / self.PATCHED).stat().st_ino)
 
+    def test_package_dependencies_resolve_overlay_workspaces_and_reject_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, patch = self._fixture(tmp)
+            source = host.canonical_source(root)
+            modules = source / "packages/core/node_modules"
+            (modules / "markdown-it").mkdir(parents=True)
+            (modules / "@elizaos").mkdir()
+            (modules / "@elizaos/ui").symlink_to(source / "packages/ui")
+            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            with mock.patch.object(host.upstream, "UPSTREAM_PIN", pin), \
+                    mock.patch.object(host, "PATCH_SHA256", host.sha256_file(patch)):
+                host.build_overlay(root)
+                self.assertTrue(host.verify_overlay(root))
+                location = host.overlay_dir(root) / "packages/core/node_modules"
+                self.assertEqual((location / "@elizaos/ui").resolve(),
+                                 (host.overlay_dir(root) / "packages/ui").resolve())
+                self.assertEqual((location / "markdown-it").resolve(), (modules / "markdown-it").resolve())
+                (location / "markdown-it").unlink()
+                (location / "markdown-it").symlink_to(root)
+                with self.assertRaises(host.AcceptanceError):
+                    host.verify_overlay(root)
+                with self.assertRaises(host.AcceptanceError):
+                    host.link_dependencies(root, host.overlay_dir(root))
+
+    def test_legacy_scope_migration_rejects_unknown_scope_and_empty_additions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, patch = self._fixture(tmp)
+            source = host.canonical_source(root)
+            scope = source / "node_modules/@types"
+            (scope / "known").mkdir(parents=True)
+            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            with mock.patch.object(host.upstream, "UPSTREAM_PIN", pin), \
+                    mock.patch.object(host, "PATCH_SHA256", host.sha256_file(patch)):
+                host.build_overlay(root)
+                overlay = host.overlay_dir(root)
+                location = overlay / "node_modules/@types"
+                (location / "known").unlink()
+                location.rmdir()
+                location.symlink_to(scope)
+                host.link_dependencies(root, overlay)
+                self.assertFalse(location.is_symlink())
+                self.assertTrue(host.verify_overlay(root))
+                (overlay / "node_modules/@unknown-empty").mkdir()
+                with self.assertRaises(host.AcceptanceError):
+                    host.verify_overlay(root)
+                (location / "known").unlink()
+                location.rmdir()
+                location.symlink_to(root)
+                with self.assertRaises(host.AcceptanceError):
+                    host.link_dependencies(root, overlay)
+
     def test_regular_copy_preserves_canonical_and_overlay_ui(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = self._build(tmp)

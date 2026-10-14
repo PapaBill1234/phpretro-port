@@ -114,3 +114,17 @@ at 1,200 seconds, then a second bounded attempt reached `codex-core` and was
 stopped at 2,806 MiB available RAM, below the 3,072 MiB project floor. Owned group
 cleanup completed and cache/logs were retained. No native build/test success is
 claimed; a reviewed build plan within the resource floor is pending.
+
+G06 dependency-binding correction: the actual first supervised production entry
+failed before runtime initialization on missing package-local `markdown-it`.
+API/UI children were cleaned up. Candidate `3f0be34` repairs all 131 installed
+Bun dependency locations, mapping workspace links to the private overlay and
+retaining external installed cache targets. Exact members/scopes/link targets
+are checked; only known old canonical links can migrate. Independent Sol review
+accepted the repair, and a noted empty-scope gap was additionally closed with a
+passing regression. Actual full binding verification and Bun resolution passed
+without modifying the captured host cutoff. Root adapter suite: 24 tests passed
+in 0.522 seconds. A fresh bounded runtime/browser acceptance remains open.
+Private evidence: `package-resolution.result.json`, `dependency-review.json`,
+`live-start.json.log` and owned supervisor logs under the existing private
+acceptance state. The failed startup is not a passing full-host qualification.

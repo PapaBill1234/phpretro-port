@@ -338,30 +338,87 @@ def _tracked_paths(source, deadline=None):
     return paths
 
 
-def _link_node_modules(source_nm, overlay_nm, overlay, canonical, deadline=None):
-    overlay_nm.mkdir(parents=True, exist_ok=True)
-    for entry in sorted(os.scandir(source_nm), key=lambda e: e.name):
-        _remaining(deadline, "dependency links")
-        if entry.name == "@elizaos":
+def dependency_bindings(source, overlay, deadline=None):
+    """Exact installed dependency locations; workspace links resolve in the overlay."""
+    source, overlay = Path(source).resolve(), Path(overlay)
+    bindings = {}
+    for directory, names, _files in os.walk(source):
+        _remaining(deadline, "dependency inventory")
+        names[:] = [name for name in names if name != ".git"]
+        if "node_modules" not in names:
             continue
-        if entry.name == "@phpretro":
-            continue
-        dst = overlay_nm / entry.name
-        if not dst.exists() and not dst.is_symlink():
-            os.symlink(entry.path, dst)
-    scope = overlay_nm / "@elizaos"
-    scope.mkdir(parents=True, exist_ok=True)
-    for entry in sorted(os.scandir(source_nm / "@elizaos"), key=lambda e: e.name):
-        _remaining(deadline, "workspace links")
-        dst = scope / entry.name
-        if dst.exists() or dst.is_symlink():
-            continue
-        if entry.name == "ui":
-            os.symlink(overlay / "packages" / "ui", dst)  # patched overlay UI
-        else:
-            os.symlink(entry.path, dst)
-    # Drop-ins are NOT linked into node_modules: discovery scans the real
-    # plugins/custom package directories created by install_dropins().
+        names.remove("node_modules")
+        location = Path(directory) / "node_modules"
+        rel = location.relative_to(source)
+        entries = {}
+        for entry in sorted(location.iterdir()):
+            _remaining(deadline, "dependency inventory")
+            if entry.name == "@phpretro":
+                continue
+            members = sorted(entry.iterdir()) if entry.name.startswith("@") and entry.is_dir() else [entry]
+            for member in members:
+                name = str(member.relative_to(location))
+                resolved = member.resolve()
+                target = member
+                if _under(resolved, source):
+                    relative = resolved.relative_to(source)
+                    if "node_modules" not in relative.parts:
+                        target = overlay / relative
+                entries[name] = str(target)
+        bindings[str(rel)] = entries
+    return bindings
+
+
+def link_dependencies(root, overlay, deadline=None):
+    source = canonical_source(root)
+    for rel, entries in dependency_bindings(source, overlay, deadline).items():
+        location = assert_private_path(root, overlay / rel)
+        location.mkdir(parents=True, exist_ok=True)
+        for name, target in entries.items():
+            _remaining(deadline, "dependency links")
+            destination = location / name
+            if destination.parent != location:
+                parent = destination.parent
+                assert_private_path(root, parent.parent)
+                if parent.is_symlink():
+                    if os.readlink(parent) != str(Path(source).resolve() / rel / parent.name):
+                        raise AcceptanceError("unknown existing dependency scope")
+                    parent.unlink()  # replace only the known legacy canonical scope link
+                assert_private_path(root, parent)
+                parent.mkdir(exist_ok=True)
+            if destination.is_symlink():
+                if os.readlink(destination) == target:
+                    continue
+                if os.readlink(destination) != str(Path(source).resolve() / rel / name):
+                    raise AcceptanceError("unknown existing dependency binding")
+                destination.unlink()  # replace only the known old canonical workspace binding
+            elif destination.exists():
+                raise AcceptanceError("unexpected regular dependency entry")
+            os.symlink(target, destination)
+
+
+def verify_dependencies(root, overlay, deadline=None):
+    bindings = dependency_bindings(canonical_source(root), overlay, deadline)
+    for rel, entries in bindings.items():
+        _remaining(deadline, "dependency verification")
+        location = overlay / rel
+        if location.is_symlink() or not location.is_dir():
+            raise AcceptanceError("installed dependency location missing or symlinked")
+        if {item.name for item in location.iterdir()} != {name.split("/")[0] for name in entries}:
+            raise AcceptanceError("unexpected installed dependency scope")
+        found = set()
+        for item in location.iterdir():
+            if item.name.startswith("@") and not item.is_symlink() and item.is_dir():
+                found.update(str(member.relative_to(location)) for member in item.iterdir())
+            else:
+                found.add(item.name)
+        if found != set(entries):
+            raise AcceptanceError("unexpected installed dependency entry")
+        for name, target in entries.items():
+            entry = location / name
+            if not entry.is_symlink() or os.readlink(entry) != target:
+                raise AcceptanceError("installed dependency binding differs from canonical layout")
+    return set(bindings)
 
 
 def build_overlay(root, deadline=None):
@@ -372,6 +429,7 @@ def build_overlay(root, deadline=None):
     if overlay.exists():
         if not _overlay_provenance_matches(root):
             raise AcceptanceError("existing overlay has unknown provenance; refusing to overwrite")
+        link_dependencies(root, overlay, deadline)
         verify_overlay(root, deadline)
         return overlay
     overlay.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +452,7 @@ def build_overlay(root, deadline=None):
             else:
                 shutil.copy2(original, dst)  # regular copy, no shared inode
         _remaining(deadline, "node_modules")
-        _link_node_modules(source / "node_modules", overlay / "node_modules", overlay, root, deadline)
+        link_dependencies(root, overlay, deadline)
         _remaining(deadline, "patch")
         patch = verify_patch(root, deadline)
         _apply_patch(overlay, patch, deadline)
@@ -435,6 +493,7 @@ def verify_overlay(root, deadline=None):
     root = Path(root)
     source = canonical_source(root)
     overlay = assert_private_path(root, overlay_dir(root))
+    dependency_locations = verify_dependencies(root, overlay, deadline)
     tracked = set(_tracked_paths(source, deadline))
     changed, added = set(), set()
     source_links = {rel for rel in tracked if (source / rel).is_symlink()}
@@ -461,8 +520,7 @@ def verify_overlay(root, deadline=None):
             rel = str(directory.relative_to(overlay))
             if directory.is_symlink() and rel not in source_links:
                 raise AcceptanceError("unexpected overlay symlink directory")
-        if Path(dirpath) == overlay:
-            dirnames[:] = [d for d in dirnames if d != "node_modules"]
+        dirnames[:] = [d for d in dirnames if str((Path(dirpath) / d).relative_to(overlay)) not in dependency_locations]
         for name in filenames:
             rel = str(Path(dirpath).relative_to(overlay) / name)
             if rel not in tracked:

@@ -115,3 +115,13 @@ reached `codex-core` before root stopped it when available RAM fell below the
 3 GiB desktop floor. These are time/resource checkpoints, not passing build or
 Rust qualification evidence. Native guard remains false; no completed CLI binary,
 compiled qualification or main-model admission is claimed.
+
+G06 actual startup exposed a package-dependency gap: the supervised production
+entry stopped before runtime initialization because the private core package
+could not resolve `markdown-it`. Both children were cleaned up. The reviewed
+repair now binds all 131 actual installed dependency locations, remaps workspace
+imports into the overlay and verifies exact members/scopes/targets. Actual Bun
+resolution of the missing dependency and overlay UI passed; 24 adapter boundary
+checks pass. The original acceptance cutoff expired and was not extended.
+A fresh bounded configured-host/browser run is still required. Source bindings
+are verified; **G06 remains Partial**, with no runtime or native admission claim.
