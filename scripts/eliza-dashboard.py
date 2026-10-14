@@ -14,8 +14,10 @@ without adding an arbitrary ``--project-root`` option.
 Security notes:
   * state directory is created/validated 0700 and owned by the current user;
   * lock/log/runtime files are validated regular, non-symlink, 0600, owned;
-  * the registerd config source, git pin and runtime versions are validated
-    without installing anything;
+  * the registered config source, git pin and runtime versions are validated
+    without installing anything; the default integration source is checked with
+    the reviewed ``scripts/eliza-upstream.py`` byte-verification helpers, so a
+    runtime version is never read from an unverified or cached binary;
   * the fresh coding-window gate (project ``scripts/coding-window.py``) is
     required and fails closed when absent;
   * the reviewed DeepSeek chat-compat module is embedded verbatim and written
@@ -72,17 +74,25 @@ TEXT_TIERS = ("NANO", "SMALL", "MEDIUM", "LARGE", "MEGA",
               "RESPONSE_HANDLER", "SHOULD_RESPOND", "ACTION_PLANNER", "PLANNER")
 DOTENV_RELATIVE = Path("secrets") / "deepseek.env"
 
-# Explicitly registered config source. The runtime binaries and the pinned
-# upstream checkout are provided by the operator; this CLI never installs them.
+# Explicitly registered config source. The integration ROOT is resolved from this
+# script's location; the pinned upstream checkout and the private pinned runtimes
+# are installed by the reviewed setup installer ``scripts/eliza-upstream.py``
+# (run ``setup`` first). This CLI never installs them. The default (``managed``)
+# source is validated through the installer's own byte-verified
+# ``check``/``verified_runtime`` helpers before any runtime version is executed,
+# so an unverified or cached binary is never run. A test-injected source keeps
+# its explicit paths and is validated directly instead.
+UPSTREAM_SOURCE_REL = Path("builder") / "eliza" / "upstream"
+UPSTREAM_PRIVATE_REL = Path(".builder") / "upstream"
+UPSTREAM_INSTALLER_REL = Path("scripts") / "eliza-upstream.py"
 CONFIG_SOURCE = {
     "name": "eliza-upstream",
-    "path": Path("/home/ubuntu/Documents/Codex/2026-10-11/al/work/research/eliza"),
+    "managed": True,
+    "path": ROOT / UPSTREAM_SOURCE_REL,
     "pin": "28fef47c9d9d3acc7792be0fdaa3070020293cc5",
-    "bun": Path("/home/ubuntu/Documents/Codex/2026-10-11/al/work/research/eliza"
-                "/.phpretro-builder/runtimes/bun/package/bin/bun"),
+    "bun": ROOT / UPSTREAM_PRIVATE_REL / "runtimes" / "bun" / "package" / "bin" / "bun",
     "bun_version": "1.4.2",
-    "node": Path("/home/ubuntu/Documents/Codex/2026-10-11/al/work/research/eliza"
-                 "/.phpretro-builder/runtimes/node/node-v24.15.0-linux-x64/bin/node"),
+    "node": ROOT / UPSTREAM_PRIVATE_REL / "runtimes" / "node" / "node-v24.15.0-linux-x64" / "bin" / "node",
     "node_version": "v24.15.0",
     "api_entry": Path("packages/app/src/entry.ts"),
     "vite": Path("node_modules/vite/bin/vite.js"),
@@ -463,7 +473,85 @@ def cleanup_children(children, term_grace: float = 3.0) -> None:
 # Validation of the registered config source
 # --------------------------------------------------------------------------
 
-def validate_source(source=CONFIG_SOURCE) -> dict:
+def load_eliza_upstream(root):
+    """Import the reviewed pinned-upstream installer, failing closed when absent.
+
+    The default registered source is validated with the installer's own byte
+    verification, so this never reimplements (or weakens) the trust chain.
+    """
+    path = Path(root) / UPSTREAM_INSTALLER_REL
+    if path.is_symlink() or not path.is_file():
+        raise DashboardError("upstream installer is missing")
+    spec = importlib.util.spec_from_file_location("eliza_upstream", path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except DashboardError:
+        raise
+    except Exception:
+        raise DashboardError("upstream installer is invalid") from None
+    for attr in ("check", "verified_runtime"):
+        if not callable(getattr(module, attr, None)):
+            raise DashboardError("upstream installer is invalid")
+    return module
+
+
+def _validate_managed_source(root, source=CONFIG_SOURCE):
+    """Validate the integration source through the reviewed setup installer.
+
+    The pinned checkout, the setup dependencies and each runtime are checked with
+    the installer's ``check`` helper, which only reports a runtime when its bytes
+    match the recorded digest; ``verified_runtime`` then confirms the exact
+    canonical binary that this CLI will execute. A runtime version is therefore
+    never read from an unverified or cached binary.
+    """
+    if Path(source["path"]) != Path(root) / UPSTREAM_SOURCE_REL:
+        raise DashboardError("registered config source path is not the integration checkout")
+    installer = load_eliza_upstream(root)
+    try:
+        state = installer.check(root)
+    except DashboardError:
+        raise
+    except Exception:
+        raise DashboardError("registered config source could not be verified") from None
+    if not isinstance(state, dict):
+        raise DashboardError("registered config source could not be verified")
+    pin = state.get("pin") or {}
+    if not pin.get("ok"):
+        raise DashboardError("registered config source is not the pinned clean checkout")
+    runtime = state.get("runtime") or {}
+    if not runtime.get("ok"):
+        raise DashboardError("a registered runtime binary is missing or unverified")
+    dependencies = state.get("dependencies") or {}
+    if not dependencies.get("ok"):
+        raise DashboardError("upstream setup dependencies are incomplete")
+    for kind in ("node", "bun"):
+        verified = installer.verified_runtime(root, kind)
+        if verified is None or Path(verified) != Path(source[kind]):
+            raise DashboardError("registered runtime path is not the verified canonical binary")
+    if runtime.get("node") != source["node_version"]:
+        raise DashboardError("node runtime version mismatch")
+    if runtime.get("bun") != source["bun_version"]:
+        raise DashboardError("bun runtime version mismatch")
+    src = Path(source["path"])
+    for label, rel in (("api entry", source["api_entry"]), ("vite", source["vite"])):
+        if not (src / rel).is_file():
+            raise DashboardError(f"registered config source is missing {label}")
+    return {"name": source["name"], "pin": pin.get("revision") or source["pin"],
+            "bun": runtime.get("bun"), "node": runtime.get("node"), "readiness": True}
+
+
+def validate_source(source=CONFIG_SOURCE, root=ROOT) -> dict:
+    """Validate a registered config source without installing anything.
+
+    The default (``managed``) source is validated through ``scripts/eliza-upstream.py``
+    so the pinned checkout is checked with the installer's own ``check`` and every
+    runtime binary's bytes are verified by ``verified_runtime`` before its version
+    is executed. An injected/isolated source keeps its explicit paths and is
+    checked directly, so a fixture never touches the private ROOT runtime tree.
+    """
+    if source.get("managed"):
+        return _validate_managed_source(root, source)
     src = Path(source["path"])
     if src.is_symlink() or not src.is_dir():
         raise DashboardError("registered config source is unavailable")
@@ -766,7 +854,7 @@ def cmd_check(root, source=CONFIG_SOURCE) -> int:
         print(json.dumps({"command": "check", "ok": False, "problems": [str(exc)]}))
         return 2
     try:
-        detail["source"] = validate_source(source)
+        detail["source"] = validate_source(source, root)
     except DashboardError as exc:
         problems.append(str(exc))
     try:
@@ -898,7 +986,7 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         # must never extend the deadline.
         original_stop_at = window.get("stop_at")
         try:
-            validate_source(source)
+            validate_source(source, root)
             for port in (API_PORT, UI_PORT):
                 port_free(port)
             secrets = load_secrets(root, state)

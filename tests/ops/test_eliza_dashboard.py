@@ -136,6 +136,57 @@ class DashboardTests(unittest.TestCase):
         env.write_text(f"# comment\nDEEPSEEK_API_KEY={KEY}\nOTHER=ignored\n")
         os.chmod(env, mode)
 
+    # -- managed (integration) source fixtures ------------------------------
+    def _managed_source(self):
+        """A registered source whose paths live only under the isolated root."""
+        private = self.root / ".builder" / "upstream" / "runtimes"
+        return {
+            "name": "eliza-upstream",
+            "managed": True,
+            "path": self.root / "builder" / "eliza" / "upstream",
+            "pin": REPO_PIN,
+            "bun": private / "bun" / "package" / "bin" / "bun",
+            "bun_version": BUN_VERSION,
+            "node": private / "node" / "node-v24.15.0-linux-x64" / "bin" / "node",
+            "node_version": NODE_VERSION,
+            "api_entry": Path("packages/app/src/entry.ts"),
+            "vite": Path("node_modules/vite/bin/vite.js"),
+            "api_cwd": Path("."),
+            "ui_cwd": Path("packages/app"),
+        }
+
+    def _managed_tree(self, source):
+        entry = source["path"] / source["api_entry"]
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text("// entry")
+        vite = source["path"] / source["vite"]
+        vite.parent.mkdir(parents=True, exist_ok=True)
+        vite.write_text("// vite")
+
+    def _managed_state(self, source, pin_ok=True, runtime_ok=True,
+                       deps_ok=True, node_version=None, bun_version=None):
+        return {
+            "pin": {"ok": pin_ok, "revision": REPO_PIN if pin_ok else "b" * 40},
+            "runtime": {"ok": runtime_ok,
+                        "node": NODE_VERSION if node_version is None else node_version,
+                        "bun": BUN_VERSION if bun_version is None else bun_version},
+            "dependencies": {"ok": deps_ok},
+            "readiness": pin_ok and runtime_ok and deps_ok,
+        }
+
+    def _installer(self, state, verified):
+        """Write a fake reviewed installer exposing check/verified_runtime."""
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        body = ("import json\nSTATE = json.loads(%r)\nVERIFIED = json.loads(%r)\n"
+                "def check(root):\n    return STATE\n\n"
+                "def verified_runtime(root, kind):\n    return VERIFIED.get(kind)\n"
+                % (json.dumps(state), json.dumps({k: str(v) for k, v in verified.items()})))
+        (scripts / "eliza-upstream.py").write_text(body)
+
+    def _verified(self, source):
+        return {"node": source["node"], "bun": source["bun"]}
+
     # -- registered config source ------------------------------------------
     def test_validate_source_reports_pin_and_versions(self):
         with self._patch_source():
@@ -169,6 +220,140 @@ class DashboardTests(unittest.TestCase):
         with self._patch_source():
             with self.assertRaises(dash.DashboardError):
                 dash.validate_source(self.source)
+
+    # -- default registered source (integration ROOT/installer) -------------
+    def test_default_source_uses_root_relative_integration_paths(self):
+        self.assertTrue(dash.CONFIG_SOURCE["managed"])
+        self.assertEqual(dash.CONFIG_SOURCE["path"], dash.ROOT / dash.UPSTREAM_SOURCE_REL)
+        self.assertEqual(dash.CONFIG_SOURCE["path"], dash.ROOT / "builder" / "eliza" / "upstream")
+        self.assertEqual(dash.CONFIG_SOURCE["node"],
+                         dash.ROOT / ".builder" / "upstream" / "runtimes" / "node"
+                         / "node-v24.15.0-linux-x64" / "bin" / "node")
+        self.assertEqual(dash.CONFIG_SOURCE["bun"],
+                         dash.ROOT / ".builder" / "upstream" / "runtimes" / "bun"
+                         / "package" / "bin" / "bun")
+        # the absolute research checkout and its private runtime tree are gone
+        for value in dash.CONFIG_SOURCE.values():
+            self.assertNotIn("work/research/eliza", str(value))
+            self.assertNotIn(".phpretro-builder", str(value))
+
+    def test_managed_source_validated_through_installer_not_direct_probes(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        self._installer(self._managed_state(source), self._verified(source))
+        with mock.patch.object(dash.subprocess, "check_output") as probe, \
+                mock.patch.object(dash, "load_eliza_upstream",
+                                  wraps=dash.load_eliza_upstream) as loader:
+            result = dash.validate_source(source, self.root)
+        probe.assert_not_called()  # no raw version probe on an unverified path
+        loader.assert_called_once()
+        self.assertEqual(result["pin"], REPO_PIN)
+        self.assertEqual(result["node"], NODE_VERSION)
+        self.assertEqual(result["bun"], BUN_VERSION)
+        self.assertTrue(result["readiness"])
+
+    def test_managed_source_fails_closed_without_installer(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        with self.assertRaises(dash.DashboardError):
+            dash.validate_source(source, self.root)  # no scripts/eliza-upstream.py
+
+    def test_managed_source_rejects_missing_runtime_pin_or_dependencies(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        cases = {
+            "pin": self._managed_state(source, pin_ok=False),
+            "runtime": self._managed_state(source, runtime_ok=False),
+            "dependencies": self._managed_state(source, deps_ok=False),
+            "node version": self._managed_state(source, node_version="v0.0.0"),
+            "bun version": self._managed_state(source, bun_version="0.0.0"),
+        }
+        for label, state in cases.items():
+            with self.subTest(case=label):
+                self._installer(state, self._verified(source))
+                with self.assertRaises(dash.DashboardError):
+                    dash.validate_source(source, self.root)
+
+    def test_managed_source_rejects_unverified_runtime_bytes(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        # installer check passes, but verified_runtime returns None (bytes do
+        # not match the recorded digest) -> the binary must never be trusted
+        self._installer(self._managed_state(source), {})
+        with self.assertRaises(dash.DashboardError) as ctx:
+            dash.validate_source(source, self.root)
+        self.assertIn("verified", str(ctx.exception))
+
+    def test_managed_source_rejects_non_canonical_runtime_path(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        elsewhere = self.root / "elsewhere-bun"
+        self._installer(self._managed_state(source),
+                        {"node": source["node"], "bun": elsewhere})
+        with self.assertRaises(dash.DashboardError) as ctx:
+            dash.validate_source(source, self.root)
+        self.assertIn("canonical", str(ctx.exception))
+
+    def test_managed_source_rejects_foreign_source_path(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        source["path"] = self.root / "somewhere" / "else"
+        self._installer(self._managed_state(source), self._verified(source))
+        with self.assertRaises(dash.DashboardError):
+            dash.validate_source(source, self.root)
+
+    def test_injected_source_stays_isolated_from_installer(self):
+        # a managed installer present in the tree must never be consulted for an
+        # injected fixture; the fixture keeps its own explicit paths
+        (self.root / "scripts").mkdir(exist_ok=True)
+        (self.root / "scripts" / "eliza-upstream.py").write_text(
+            "def check(root):\n    raise AssertionError('consulted')\n")
+        with self._patch_source(), \
+                mock.patch.object(dash, "load_eliza_upstream") as loader:
+            result = dash.validate_source(self.source, self.root)
+        loader.assert_not_called()
+        self.assertEqual(result["pin"], REPO_PIN)
+        self.assertEqual(result["bun"], BUN_VERSION)
+
+    def test_check_truthfully_requires_setup_prereqs_for_managed_source(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        self._gate()
+        self._secrets()
+        # missing setup dependencies -> check reports not-ok and does not launch
+        self._installer(self._managed_state(source, deps_ok=False), self._verified(source))
+        with mock.patch.object(dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_check(self.root, source)
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+        self.assertIn("dependencies", output.call_args.args[0])
+
+    def test_check_ok_for_fully_set_up_managed_source(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        self._gate()
+        self._secrets()
+        self._installer(self._managed_state(source), self._verified(source))
+        with mock.patch.object(dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_check(self.root, source)
+        self.assertEqual(code, 0)
+        popen.assert_not_called()
+        self.assertIn('"onboarding": "ready"', output.call_args.args[0])
+
+    def test_start_blocks_when_managed_prereqs_are_missing(self):
+        source = self._managed_source()
+        self._managed_tree(source)
+        self._gate()
+        self._secrets()
+        self._installer(self._managed_state(source, runtime_ok=False), self._verified(source))
+        with mock.patch.object(dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print") as output:
+            code = dash.cmd_start(self.root, source)
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+        self.assertIn('"status": "blocked"', output.call_args.args[0])
 
     # -- coding gate --------------------------------------------------------
     def test_gate_missing_fails_closed(self):

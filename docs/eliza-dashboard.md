@@ -10,27 +10,46 @@ tests.
 ## External prerequisites (no installation performed)
 
 `check`/`start` validate an **explicitly registered config source**; they never
-install anything:
+install anything. The registered default source is the integration tree, which
+is provisioned by the reviewed setup installer `scripts/eliza-upstream.py`:
 
-- Pinned upstream checkout
-  `/home/ubuntu/Documents/Codex/2026-10-11/al/work/research/eliza` at git pin
-  `28fef47c9d9d3acc7792be0fdaa3070020293cc5` (exact `git rev-parse HEAD` match).
-- Operator-provided runtimes under that checkout's `.phpretro-builder/runtimes`:
-  Bun `1.4.2` and Node `v24.15.0` (exact `--version` match).
+- Pinned upstream checkout `builder/eliza/upstream` (relative to the integration
+  `ROOT`) at git pin `28fef47c9d9d3acc7792be0fdaa3070020293cc5`.
+- Private pinned runtimes installed under `ROOT/.builder/upstream`:
+  `runtimes/node/node-v24.15.0-linux-x64/bin/node` (Node `v24.15.0`) and
+  `runtimes/bun/package/bin/bun` (Bun `1.4.2`).
+- Setup dependencies: the upstream `node_modules` install recorded by the
+  installer's provenance.
 - Prerequisite source files: `packages/app/src/entry.ts` and
   `node_modules/vite/bin/vite.js`.
 - The project coding-window gate `scripts/coding-window.py`. This script does
   **not** own or copy that gate (a pending readiness task owns it); when the
   gate is absent or closed, `check`/`start` **fail closed**.
 
-The registered source path, pin and versions live in `CONFIG_SOURCE`. The
-integration `ROOT` is resolved from the script location; there is no arbitrary
+Install the prerequisites once with the installer, then run this CLI:
+
+```sh
+python3 scripts/eliza-upstream.py setup     # once: pinned source + runtimes
+python3 scripts/eliza-dashboard.py check    # truthful readiness (no launch)
+python3 scripts/eliza-dashboard.py start    # foreground supervisor
+```
+
+For the default (`managed`) source, `check` validates the pinned checkout and
+the setup dependencies with the installer's own `check` helper, and confirms each
+runtime binary's bytes with `verified_runtime` **before** its version is
+executed, so an unverified or cached binary is never run. `check` reports not-ok
+when any setup prerequisite (pin, runtimes, dependencies) is missing. The
+registered source path, pin and versions live in `CONFIG_SOURCE`. The integration
+`ROOT` is resolved from the script location; there is no arbitrary
 `--project-root` option — tests inject an isolated tree through the pure helper
-functions instead.
+functions instead, and an injected source keeps its own explicit paths without
+consulting the private runtime tree.
 
 ## Commands
 
-- `check` — validates the source pin/runtimes/prereqs, runs a **fresh**
+- `check` — validates the source pin/runtimes/setup-prereqs (the default
+  registered source through the installer's byte-verified
+  `check`/`verified_runtime` helpers), runs a **fresh**
   coding-window gate check, tests that the loopback ports are bindable, reports
   lock state, onboarding state, the local compat-module state and the saved
   model-routing compatibility. Routing verification **fails closed**: only a
@@ -95,7 +114,11 @@ This does not mark full Eliza complete.
 
 `python3 -m unittest discover -s tests/ops -p test_eliza_dashboard.py` exercises
 the pure helpers and real behaviour: registered-source pin/version/prereq
-validation, missing gate, denied gate, gate re-check after slow validation and
+validation, the default root source resolved to integration-relative paths and
+validated through the installer's byte-verified helpers (rejecting a missing
+installer, an unverified runtime, a non-canonical runtime path, an incomplete
+setup or a foreign source path, with no raw version probe), injected-source
+isolation from the installer, missing gate, denied gate, gate re-check after slow validation and
 before each spawn, no launch within five seconds of the cutoff, cleanup bounded
 by the original recorded cutoff, unsafe secret/symlink rejection, a FIFO log
 target rejected promptly without a reader, UI environment isolation, lock busy
