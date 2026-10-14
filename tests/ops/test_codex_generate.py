@@ -633,6 +633,98 @@ class GenerateTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "unsupported_executable")
             run.assert_not_called()
 
+    def _valid_thread_bundle(self):
+        """A valid experimental bundle built from the declared isolation shapes."""
+        properties = {}
+        for name, expected in generate.THREAD_FIELD_SHAPES.items():
+            types = sorted(expected["types"])
+            prop = {"type": types[0] if len(types) == 1 else types}
+            if expected["items"] is not None:
+                prop["items"] = {"$ref": "#/definitions/" + expected["items"]}
+            properties[name] = prop
+        return {"title": generate.THREAD_SCHEMA_TITLE, "properties": properties}
+
+    def _run_metadata_helper(self, name, deadline, now):
+        """Run one offline metadata helper at its real subprocess boundary under a
+        captured work deadline and a controlled monotonic clock. Every helper's
+        process call is replaced by a valid stand-in, so no native binary, account,
+        model or network is touched; the returned mock records what it was called
+        with. ``deadline`` of ``None`` leaves the work budget unset (plain cap)."""
+        binary = sys.executable
+        if name in ("probe_feature_list", "thread_params_supported"):
+            elf = self.root / ("codex-elf-" + name)
+            elf.write_bytes(b"\x7fELF" + b"\x00" * 8)
+            binary = str(elf)
+
+        def fake_run(command, **kwargs):
+            if name == "verify_version":
+                return generate.subprocess.CompletedProcess(
+                    command, 0, b"codex-cli " + generate.CODEX_VERSION.encode() + b"\n", b"")
+            if name == "probe_feature_list":
+                return generate.subprocess.CompletedProcess(
+                    command, 0, b"shell_tool  stable  true\n", b"")
+            out = Path(command[command.index("--out") + 1])
+            (out / "v2").mkdir(parents=True)
+            (out / "v2" / "ThreadStartParams.json").write_text(json.dumps(self._valid_thread_bundle()))
+            return generate.subprocess.CompletedProcess(command, 0, b"", b"")
+
+        helper = getattr(generate, name)
+        with patch.object(generate.subprocess, "run", side_effect=fake_run) as run, patch.object(
+                generate.time, "monotonic", return_value=now):
+            token = generate._DEADLINE.set(deadline)
+            try:
+                try:
+                    result = helper(binary)
+                except generate.bridge.BridgeError as error:
+                    result = error.code
+            finally:
+                generate._DEADLINE.reset(token)
+        return run, result
+
+    def _expected_metadata_result(self, name):
+        if name == "verify_version":
+            return generate.CODEX_VERSION
+        if name == "probe_feature_list":
+            return {"shell_tool": {"stage": "stable", "state": True}}
+        return True  # thread_params_supported
+
+    def test_metadata_probe_timeout_is_positive_and_capped_by_work_deadline(self):
+        now = 1000.0
+        for name in ("verify_version", "probe_feature_list", "thread_params_supported"):
+            with self.subTest(helper=name):
+                expected = self._expected_metadata_result(name)
+                # Unset budget: the helper's own cap is the timeout it passes on.
+                plain, result = self._run_metadata_helper(name, None, now)
+                self.assertEqual(plain.call_count, 1)  # the process ran exactly once
+                self.assertEqual(result, expected)
+                cap = plain.call_args.kwargs["timeout"]
+                self.assertGreater(cap, 0)
+                # A generous captured deadline must NOT extend the helper's own cap.
+                roomy, result = self._run_metadata_helper(name, now + 10000.0, now)
+                self.assertEqual(roomy.call_count, 1)
+                self.assertEqual(result, expected)
+                timeout = roomy.call_args.kwargs["timeout"]
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 10000.0)
+                self.assertEqual(timeout, cap)
+                # A tighter captured deadline shortens the timeout to what remains.
+                remaining = 3.0
+                tight, result = self._run_metadata_helper(name, now + remaining, now)
+                self.assertEqual(tight.call_count, 1)
+                self.assertEqual(result, expected)  # a setup/parse failure cannot pass
+                timeout = tight.call_args.kwargs["timeout"]
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, remaining)
+                self.assertAlmostEqual(timeout, remaining)
+
+    def test_expired_work_deadline_blocks_metadata_before_subprocess(self):
+        now = 1000.0
+        for name in ("verify_version", "probe_feature_list", "thread_params_supported"):
+            with self.subTest(helper=name):
+                run, result = self._run_metadata_helper(name, now - 1.0, now)
+                run.assert_not_called()
+                self.assertEqual(result, "timeout")
+
     def test_effective_config_with_retained_mcp_connector_is_refused(self):
         _, events = self.run_generate("connectors")
         self.assertEqual(events[-1]["type"], "error")
