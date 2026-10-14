@@ -24,6 +24,13 @@ fields were absent.
   registration and hosted-spec retain — including Code Mode `exec`/`wait` and
   hosted/extension tools. See [tool_policy.rs][tp], [registry.rs][reg],
   [spec_plan.rs][sp], [session.rs][se].
+- **Thread-level startup hook.** Public
+  `StartThreadOptions.thread_extension_init` reaches `Session::new` through
+  `ThreadManager.start_thread`. An explicit policy takes precedence over the
+  guardian fallback and is captured before extension initialization. This
+  proves one source path; propagation to every new session remains to be
+  implemented and tested. `WithTurnExtensionData` supplies turn-level data
+  and does not supply this thread policy. See [thread_manager.rs][tm].
 - **Offline controls.** 31 generator/transport/contract tests plus 19 controlled
   JS fixtures pass. GitHub CI on `e540a9c` is green for all six jobs, push **and**
   pull_request.
@@ -33,9 +40,15 @@ fields were absent.
 - **No supported stock policy input (not yet proven).** The reviewed public
   startup signatures (`cli/src/main.rs`, app-server `lib.rs`/`extensions.rs`)
   expose no `ExtensionDataInit`/`ToolPolicy` argument, and no supported stock
-  config route was found. Public types alone do not establish a supported shim;
-  the supported path remains unresolved and unproven. See [cli/main.rs][cli],
+  config route was found. The core thread hook above does not establish a
+  working app-server host. Constructor plumbing and a qualified build remain
+  open. See [cli/main.rs][cli],
   [app-server/lib.rs][app].
+- **Hard-parent cleanup.** The pinned stdio EOF path starts a 45-second
+  watchdog while asynchronous teardown continues. Source inspection supplies
+  no proof that killing the Python parent promptly kills its detached native
+  child. A controlled process test and bounded cleanup are still required.
+  See [stdio.rs][stdio].
 - Feature/config flags, prompts and a single model turn are **not** isolation
   proof.
 - No accepted configured full-host startup, project browser, live queue or
@@ -46,7 +59,9 @@ fields were absent.
 Each step is gated; no inference runs until every prerequisite is proven.
 
 1. **Immutable ceiling.** Supply `Some(empty)` at thread start, re-supply it on
-   resume/fork and to helper roles; only then attempt a turn.
+   resume/fork and to helper roles. Preserve the pinned app-server's native
+   JSON-RPC/authentication/configuration stack, with an immutable host ceiling
+   enforced centrally rather than an RPC option that can relax it.
 2. **Positive runtime/source proof.** Qualify the exact host build against the
    empty ceiling. Verify that the complete registered registry, including
    nested/deferred tools and hosted specifications, is empty, as are its
@@ -69,3 +84,5 @@ and [known gaps](gaps.md).
 [se]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/core/src/session/session.rs
 [cli]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/cli/src/main.rs
 [app]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/app-server/src/lib.rs
+[tm]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/core/src/thread_manager.rs
+[stdio]: https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/app-server-transport/src/transport/stdio.rs
