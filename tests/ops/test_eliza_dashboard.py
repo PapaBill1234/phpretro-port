@@ -409,6 +409,7 @@ class DashboardTests(unittest.TestCase):
         self._secrets()
         outside = self.root / "outside"
         outside.mkdir(mode=0o755)
+        outside.chmod(0o755)
         (self.state / "upstream-state").symlink_to(outside)
         with self.assertRaises(dash.DashboardError):
             dash.load_secrets(self.root, self.state)
@@ -593,6 +594,7 @@ class DashboardTests(unittest.TestCase):
     def test_open_private_log_rejects_fifo_without_reader_promptly(self):
         fifo = self.state / "api.log"
         os.mkfifo(fifo, 0o640)
+        fifo.chmod(0o640)
         self.assertTrue(stat.S_ISFIFO(os.stat(fifo).st_mode))
         started = time.monotonic()
         with self.assertRaises(dash.DashboardError):
