@@ -108,11 +108,16 @@ def provenance_path(root):
 
 
 # --- ownership containment (no symlink ancestors) ---------------------------
+def assert_anchor(root, action="provision"):
+    """Reject a symlinked ``ROOT/.builder`` before any private write or delete."""
+    if (Path(root) / ".builder").is_symlink() or private_root(root).is_symlink():
+        raise SetupError("private tree root is a symlink; refusing %s" % action, code=1)
+
+
 def assert_private(root, target, action):
     """Refuse a delete/install path that escapes, or crosses, a private symlink."""
+    assert_anchor(root, action)
     base = Path(private_root(root))
-    if base.is_symlink():
-        raise SetupError("private tree root is a symlink; refusing %s" % action, code=1)
     target = Path(target)
     try:
         rel = target.relative_to(base)
@@ -152,13 +157,26 @@ def enforce_gate(now=None):
     return decision
 
 
-def remaining(stop_at, floor=1):
-    if not stop_at:
-        return None
+def past_deadline(deadline):
+    if not deadline:
+        return False
     try:
-        return max(floor, dt.datetime.fromisoformat(stop_at).timestamp() - time.time())
+        return dt.datetime.fromisoformat(deadline).timestamp() <= time.time()
     except (TypeError, ValueError):
-        return None
+        return False
+
+
+def time_budget(deadline, cap):
+    """Fresh seconds left before the immutable cutoff, capped, fail closed past it."""
+    if not deadline:
+        return cap
+    try:
+        seconds = dt.datetime.fromisoformat(deadline).timestamp() - time.time()
+    except (TypeError, ValueError):
+        return cap
+    if seconds <= 1:
+        raise SetupError("off-peak deadline reached; refusing to start work", code=75)
+    return max(1.0, min(seconds, cap))
 
 
 # --- integrity helpers ------------------------------------------------------
@@ -200,28 +218,42 @@ def load_integrity(root):
         return {}
 
 
+def canonical_binary(root, kind):
+    return node_bin(root) if kind == "node" else bun_bin(root)
+
+
 def record_runtime(root, kind, binary):
-    """Record verified runtime bytes so future reuse re-checks before execution."""
+    """Record the canonical binary's bytes so reuse re-checks before execution."""
+    canonical = canonical_binary(root, kind)
+    if Path(binary) != Path(canonical):
+        raise SetupError("runtime integrity must record the canonical binary", code=1)
     data = load_integrity(root)
-    data[kind] = {"path": str(Path(binary)), "sha256": sha256_file(binary)}
+    data[kind] = {"path": str(canonical), "sha256": sha256_file(canonical)}
     integrity_path(root).parent.mkdir(parents=True, exist_ok=True)
     integrity_path(root).write_text(json.dumps(data, indent=2) + "\n")
 
 
 def verified_runtime(root, kind):
-    """Return the runtime binary only if its bytes match the recorded digest."""
+    """Return the canonical binary only if its bytes match the recorded digest.
+
+    The manifest is never trusted for *which* path to use: it must name exactly
+    the derived canonical binary, whose bytes are then re-hashed. An entry that
+    points anywhere else is rejected rather than hashed and returned unchecked.
+    """
     entry = load_integrity(root).get(kind)
-    if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
+    if not isinstance(entry, dict) or not entry.get("sha256"):
         return None
-    binary = Path(entry["path"])
-    if not binary.is_file():
+    canonical = canonical_binary(root, kind)
+    if Path(entry.get("path", "")) != Path(canonical):
+        return None
+    if not canonical.is_file():
         return None
     try:
-        if sha256_file(binary) != entry["sha256"]:
+        if sha256_file(canonical) != entry["sha256"]:
             return None
     except OSError:
         return None
-    return binary
+    return canonical
 
 
 # --- bounded, fail-closed extraction ----------------------------------------
@@ -377,7 +409,7 @@ def _truncate_log(path):
 
 
 # --- network (allowlisted, verified before use) -----------------------------
-def fetch(url, dest, timeout=300):
+def fetch(url, dest, deadline=None, cap=300):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
         raise SetupError("refusing off-host URL: %s" % url, code=1)
@@ -386,8 +418,18 @@ def fetch(url, dest, timeout=300):
     tmp = dest.with_suffix(dest.suffix + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "phpretro-eliza-upstream"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response, open(tmp, "wb") as out:
-            shutil.copyfileobj(response, out, length=1024 * 1024)
+        with urllib.request.urlopen(request, timeout=time_budget(deadline, cap)) as response, \
+                open(tmp, "wb") as out:
+            while True:
+                if past_deadline(deadline):
+                    raise SetupError("off-peak deadline reached during download: %s" % url, code=75)
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except SetupError:
+        tmp.unlink(missing_ok=True)
+        raise
     except (OSError, urllib.error.URLError) as error:
         tmp.unlink(missing_ok=True)
         raise SetupError("download failed: %s (%s)" % (url, error), code=1)
@@ -395,7 +437,7 @@ def fetch(url, dest, timeout=300):
     return dest
 
 
-def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, timeout=300):
+def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, deadline=None):
     dest = Path(dest)
     if dest.exists():
         if sha256 and not verify_sha256(dest, sha256):
@@ -404,14 +446,18 @@ def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, timeout=300)
             dest.unlink()
         else:
             return dest
-    fetch(url, dest, timeout=timeout)
+    if past_deadline(deadline):
+        raise SetupError("off-peak deadline reached before download: %s" % url, code=75)
+    fetch(url, dest, deadline=deadline)
     if sri and not verify_sri(dest, sri):
         raise SetupError("download failed SRI verification: %s" % url, code=1)
     if sha256 and not verify_sha256(dest, sha256):
         raise SetupError("download failed SHA256 verification: %s" % url, code=1)
     if shasums:
         shasums_file = dest.with_name(dest.name + ".SHASUMS256.txt")
-        text = fetch(shasums, shasums_file, timeout=timeout).read_text()
+        if past_deadline(deadline):
+            raise SetupError("off-peak deadline reached before SHASUMS fetch: %s" % url, code=75)
+        text = fetch(shasums, shasums_file, deadline=deadline).read_text()
         expected = parse_shasums(text, dest.name)
         if not expected or not verify_sha256(dest, expected):
             raise SetupError("download failed official SHASUMS check: %s" % url, code=1)
@@ -435,12 +481,12 @@ def _version(binary, timeout=30):
     return text.split()[0] if text else None
 
 
-def validate_provided_runtime(path, kind):
+def validate_provided_runtime(path, kind, deadline=None):
     binary = Path(path)
     if not binary.is_file() or not os.access(str(binary), os.X_OK):
         raise SetupError("provided %s runtime is not an executable file" % kind, code=1)
     want = ("v%s" % NODE_VERSION) if kind == "node" else BUN_VERSION
-    if _version(binary) != want:
+    if _version(binary, timeout=time_budget(deadline, 30)) != want:
         raise SetupError("provided %s runtime failed version validation" % kind, code=1)
     return binary
 
@@ -453,22 +499,23 @@ def _link_runtime(root, dest, source):
     dest.symlink_to(Path(source))
 
 
-def ensure_node(root, provided=None):
+def ensure_node(root, provided=None, deadline=None):
+    assert_anchor(root, "install node")
     private_root(root).mkdir(parents=True, exist_ok=True)
     if provided is not None:
-        _link_runtime(root, node_bin(root), validate_provided_runtime(provided, "node"))
+        _link_runtime(root, node_bin(root), validate_provided_runtime(provided, "node", deadline))
         record_runtime(root, "node", node_bin(root))
         return node_bin(root)
     if verified_runtime(root, "node") is not None:
         return node_bin(root)
     assert_private(root, node_dir(root), "install node")
     archive = _ensure_archive(NODE_URL, cache_dir(root) / NODE_ARCHIVE,
-                              sha256=NODE_SHA256, shasums=NODE_SHASUMS_URL)
+                              sha256=NODE_SHA256, shasums=NODE_SHASUMS_URL, deadline=deadline)
     tmp = Path(tempfile.mkdtemp(prefix="node-", dir=str(private_root(root))))
     try:
         safe_extract(archive, tmp)
         source = tmp / ("node-v%s-%s" % (NODE_VERSION, NODE_ARCH))
-        if _version(source / "bin" / "node") != "v%s" % NODE_VERSION:
+        if _version(source / "bin" / "node", timeout=time_budget(deadline, 30)) != "v%s" % NODE_VERSION:
             raise SetupError("extracted Node failed version check", code=1)
         assert_private(root, node_dir(root), "replace node")
         if node_dir(root).exists() or node_dir(root).is_symlink():
@@ -481,21 +528,23 @@ def ensure_node(root, provided=None):
     return node_bin(root)
 
 
-def ensure_bun(root, provided=None):
+def ensure_bun(root, provided=None, deadline=None):
+    assert_anchor(root, "install bun")
     private_root(root).mkdir(parents=True, exist_ok=True)
     if provided is not None:
-        _link_runtime(root, bun_bin(root), validate_provided_runtime(provided, "bun"))
+        _link_runtime(root, bun_bin(root), validate_provided_runtime(provided, "bun", deadline))
         record_runtime(root, "bun", bun_bin(root))
         return bun_bin(root)
     if verified_runtime(root, "bun") is not None:
         return bun_bin(root)
     assert_private(root, bun_dir(root), "install bun")
-    archive = _ensure_archive(BUN_URL, cache_dir(root) / BUN_ARCHIVE, sri=BUN_SRI, sha256=BUN_SHA256)
+    archive = _ensure_archive(BUN_URL, cache_dir(root) / BUN_ARCHIVE, sri=BUN_SRI,
+                              sha256=BUN_SHA256, deadline=deadline)
     tmp = Path(tempfile.mkdtemp(prefix="bun-", dir=str(private_root(root))))
     try:
         safe_extract(archive, tmp)
         source = tmp / "package"
-        if _version(source / "bin" / "bun") != BUN_VERSION:
+        if _version(source / "bin" / "bun", timeout=time_budget(deadline, 30)) != BUN_VERSION:
             raise SetupError("extracted Bun failed version check", code=1)
         destination = bun_bin(root).parent.parent  # runtimes/bun/package
         assert_private(root, destination, "replace bun")
@@ -538,16 +587,17 @@ def source_state(root):
     return {"present": True, "ok": True, "reason": "pinned_clean", "revision": revision}
 
 
-def ensure_source(root, stop_at=None):
+def ensure_source(root, deadline=None):
     src = source_dir(root)
     if not src.exists():
         src.parent.mkdir(parents=True, exist_ok=True)
-        timeout = remaining(stop_at) or 600
-        clone = _git(["clone", UPSTREAM_REPO, str(src)], timeout=timeout)
+        # Fresh remaining budget per command; the original cutoff is never reset.
+        clone = _git(["clone", UPSTREAM_REPO, str(src)], timeout=time_budget(deadline, 600))
         if clone.returncode != 0:
             shutil.rmtree(src, ignore_errors=True)
             raise SetupError("source clone failed: %s" % clone.stderr.strip(), code=1)
-        checkout = _git(["checkout", "--detach", UPSTREAM_PIN], cwd=str(src), timeout=timeout)
+        checkout = _git(["checkout", "--detach", UPSTREAM_PIN], cwd=str(src),
+                        timeout=time_budget(deadline, 600))
         if checkout.returncode != 0:
             raise SetupError("pin checkout failed: %s" % checkout.stderr.strip(), code=1)
     state = source_state(root)
@@ -693,33 +743,34 @@ def command_check(root):
 
 def command_setup(root, node_path=None, bun_path=None):
     require_platform()
+    assert_anchor(root, "setup")
     private_root(root).mkdir(parents=True, exist_ok=True)
     phases = {}
     with setup_lock(root):
-        gate = enforce_gate()
-        ensure_node(root, provided=node_path)
-        ensure_bun(root, provided=bun_path)
+        # One fresh gate check yields the immutable cutoff for every later phase.
+        deadline = enforce_gate()["stop_at"]
+        if not deadline:
+            raise SetupError("off-peak gate has no verified cutoff; refusing setup", code=75)
+        ensure_node(root, provided=node_path, deadline=deadline)
+        ensure_bun(root, provided=bun_path, deadline=deadline)
         phases["runtimes"] = {"node": str(node_bin(root)), "bun": str(bun_bin(root))}
-        gate = enforce_gate()
-        src = ensure_source(root, stop_at=gate["stop_at"])
+        src = ensure_source(root, deadline=deadline)
         phases["source"] = {"revision": UPSTREAM_PIN}
         assert_private(root, logs_dir(root), "write logs")
         steps = [("install", frozen_install_argv(bun_bin(root)), "install.log"),
                  ("symlinks", symlink_argv(bun_bin(root)), "symlinks.log")]
         for label, argv, log in steps:
-            gate = enforce_gate()
             code = run_supervised(argv, cwd=src, env=build_env(root),
-                                  log_path=logs_dir(root) / log, stop_at=gate["stop_at"])
+                                  log_path=logs_dir(root) / log, stop_at=deadline)
             if code != 0:
                 raise SetupError("%s failed (exit %s)" % (label, code), code=1)
             phases[label] = {"argv": [str(part) for part in argv], "exit": code}
         packages = select_registration_packages(src / "plugins")
         for name, package_dir in packages:
-            gate = enforce_gate()
             code = run_supervised(registration_argv(bun_bin(root), package_dir), cwd=src,
                                   env=build_env(root),
                                   log_path=logs_dir(root) / ("registration-%s.log" % name.replace("/", "_")),
-                                  stop_at=gate["stop_at"])
+                                  stop_at=deadline)
             if code != 0:
                 raise SetupError("registration build failed for %s (exit %s)" % (name, code), code=1)
         phases["registrations"] = [name for name, _ in packages]

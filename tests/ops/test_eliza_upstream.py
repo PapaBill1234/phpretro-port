@@ -410,6 +410,90 @@ class AncestorSafety(unittest.TestCase):
                 upstream._ensure_archive = original
             self.assertTrue((external / "marker.txt").is_file())
 
+    def test_builder_symlink_preserves_external_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            external = root / "external"
+            external.mkdir()
+            (external / "marker.txt").write_text("keep")
+            (root / ".builder").symlink_to(external)
+            archive = root / "bun.tgz"
+            make_archive(archive, files=[("package/bin/bun", "#!/bin/sh\necho 1.4.2\n", 0o755)],
+                         dirs=["package", "package/bin"])
+            original = upstream._ensure_archive
+            upstream._ensure_archive = lambda *a, **k: archive
+            try:
+                with self.assertRaises(upstream.SetupError):
+                    upstream.ensure_bun(root)
+            finally:
+                upstream._ensure_archive = original
+            self.assertTrue((external / "marker.txt").is_file())
+            self.assertFalse((external / "upstream").exists())
+
+
+class ManifestTrust(unittest.TestCase):
+    def test_manifest_path_must_equal_canonical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            foreign = root / "foreign.bin"
+            foreign.write_bytes(b"#!/bin/sh\necho 1.4.2\n")
+            foreign.chmod(0o755)
+            manifest = upstream.integrity_path(root)
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(json.dumps(
+                {"bun": {"path": str(foreign), "sha256": upstream.sha256_file(foreign)}}))
+            # Names a foreign path: rejected, never hashed-and-returned unchecked.
+            self.assertIsNone(upstream.verified_runtime(root, "bun"))
+            self.assertFalse(upstream.runtime_state(root)["ok"])
+
+    def test_canonical_path_wrong_digest_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            foreign = root / "foreign.bin"
+            foreign.write_bytes(b"copied-digest")
+            canonical = upstream.bun_bin(root)
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_bytes(b"actual-tampered-bytes")
+            manifest = upstream.integrity_path(root)
+            manifest.write_text(json.dumps(
+                {"bun": {"path": str(canonical), "sha256": upstream.sha256_file(foreign)}}))
+            self.assertIsNone(upstream.verified_runtime(root, "bun"))
+
+
+class DeadlineBudget(unittest.TestCase):
+    def test_clone_consumes_remaining_and_blocks_next(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            original_git = upstream._git
+            original_state = upstream.source_state
+            upstream._git = lambda args, cwd=None, timeout=600: (
+                calls.append(timeout) or subprocess.CompletedProcess(args, 0, "", ""))
+            upstream.source_state = lambda r: {"ok": True, "reason": "pinned_clean"}
+            try:
+                deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3)).isoformat()
+                upstream.ensure_source(root, deadline=deadline)
+                self.assertEqual(len(calls), 2)  # clone then checkout
+                self.assertLessEqual(calls[0], 3)
+                self.assertLessEqual(calls[1], calls[0])  # fresh, decreasing budget
+            finally:
+                upstream._git = original_git
+                upstream.source_state = original_state
+
+    def test_expired_deadline_blocks_clone_and_provisioning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deadline = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=5)).isoformat()
+            self.assertTrue(upstream.past_deadline(deadline))
+            with self.assertRaises(upstream.SetupError):
+                upstream.ensure_source(root, deadline=deadline)
+            with self.assertRaises(upstream.SetupError):
+                upstream.ensure_node(root, deadline=deadline)
+            with self.assertRaises(upstream.SetupError):
+                upstream.time_budget(deadline, 30)
+            # version phase cap can never exceed the remaining budget
+            self.assertLessEqual(upstream.time_budget(None, 30), 30)
+
 
 if __name__ == "__main__":
     unittest.main()

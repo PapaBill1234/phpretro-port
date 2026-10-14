@@ -61,9 +61,14 @@ python3 scripts/eliza-upstream.py cli start
   Environment is built from scratch (private PATH/cache, `LANG=C.UTF-8`); no
   arbitrary provider or cloud credential is inherited. Verified archives are
   reused from the private cache; a cached runtime binary is re-hashed against its
-  recorded digest before reuse, and a hash mismatch re-installs or fails closed.
-  Every phase (clone, download, each subprocess) is bounded by the off-peak
-  cutoff.
+  recorded digest before reuse, but only after the recorded manifest path is
+  confirmed equal to the exact derived canonical binary (`runtimes/node/…/bin/node`
+  or `runtimes/bun/package/bin/bun`). A manifest that names any other path is
+  rejected rather than hashed-and-returned, and a hash mismatch re-installs or
+  fails closed. Every phase — clone, checkout, each HTTP read and each
+  `--version` probe — receives the original off-peak cutoff and a freshly
+  recomputed remaining budget; the cutoff is captured once and never extended by
+  a later phase, and work is refused once it has elapsed.
 - **cli** runs the actual pinned Bun entry point
   `bun --no-install --conditions=eliza-source packages/app/src/entry.ts <argv>`
   with a clean private environment (`ELIZA_STATE_DIR` under `.builder/upstream`,
@@ -77,13 +82,19 @@ only after a matching `--version` check; otherwise setup fails closed. There is
 no fallback to global `node`/`bun`.
 
 Every delete or install first asserts the target stays inside `.builder/upstream`
-and crosses no symlinked ancestor, so a planted symlink cannot delete or write
-outside the private tree. Long-running steps run in their own process group and
-are TERM/KILL bounded with orphan cleanup on failure, cancellation or the
-off-peak cutoff; a helper that dies by signal is reported as a failure
-(`128+signum`), never success. Setup holds one `fcntl` advisory lock with no PID
-file and no stale-PID unlink. The off-peak decision is imported from the
-canonical `scripts/coding-window.py`.
+and crosses no symlinked ancestor, beginning at `ROOT/.builder` itself: a
+symlinked `.builder` or `.builder/upstream` is rejected before any write or
+delete, so a planted ancestor symlink cannot delete or write outside the private
+tree. Long-running steps run in their own process group and are TERM/KILL bounded
+with orphan cleanup on failure, cancellation or the off-peak cutoff; a helper that
+dies by signal is reported as a failure (`128+signum`), never success. Setup holds
+one `fcntl` advisory lock with no PID file and no stale-PID unlink.
+
+The off-peak decision is imported from the canonical `scripts/coding-window.py`.
+That file is intentionally **not** committed or edited here — it is owned by the
+integration branch (Root `cd69db8`), so this worker's checkout carries it only as
+an untracked dependency until integration provides it. If it is absent the script
+fails closed rather than guessing a schedule.
 
 ## Integration seam (future work, not this task)
 
