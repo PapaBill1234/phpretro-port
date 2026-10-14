@@ -1156,6 +1156,25 @@ class DashboardTests(unittest.TestCase):
             dash.create_credentials(self.state)
         self.assertEqual(stat.S_IMODE((self.state / "vault.passphrase").lstat().st_mode), 0o644)
 
+    def test_load_credential_rejects_fifo_without_blocking(self):
+        fifo = self.state / "api.token"
+        os.mkfifo(fifo, 0o600)
+        self.assertTrue(stat.S_ISFIFO(os.stat(fifo).st_mode))
+        # O_NONBLOCK must make the open return promptly so fstat can refuse it;
+        # a bounded subprocess watch-dog proves the rejection cannot hang.
+        code = ("import importlib.util,sys\n"
+                "spec=importlib.util.spec_from_file_location('d',%r)\n"
+                "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+                "from pathlib import Path\n"
+                "try:\n"
+                "    m.load_credential(Path(%r),'api.token');sys.exit(9)\n"
+                "except m.DashboardError:\n"
+                "    sys.exit(0)\n" % (str(SCRIPT), str(fifo)))
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(fifo).st_mode), 0o600)  # untouched
+
 
 if __name__ == "__main__":
     unittest.main()

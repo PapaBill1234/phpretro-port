@@ -220,14 +220,21 @@ read-only loading:
   an unsafe or malformed file is refused, never repaired.
 - `start` (the `load_secrets` callback → `_acceptance_secrets` →
   `dash.load_local_credentials`) only validates and reads: the credential
-  directory must already be owned `0700`; each file is opened descriptor-anchored
-  (`O_NOFOLLOW`) and must be a regular file, owned by the user, with exactly
-  `0600`. Nothing is created, chmod-ed or replaced.
+  directory and every intermediate private directory (`state`, `runtime`,
+  `runtime/db`, `runtime/workspace`, `home`) must already be owned `0700`; each
+  file is opened descriptor-anchored (`O_NOFOLLOW | O_NONBLOCK`) and must be a
+  regular file, owned by the user, with exactly `0600`. `O_NONBLOCK` is
+  required so an unwritten FIFO cannot block before the type check. Nothing is
+  created, chmod-ed or replaced.
 
-Before `_Admission` or `dash.ensure_state_dir` can `chmod` the namespace,
-`_prevalidate_private_parents` refuses a pre-existing namespace parent that is
-not owned `0700` (and `_ensure_private_chain` creates only missing parents
-`0700`), so no inherited helper can silently repair an unsafe directory.
+Before `_Admission` or `dash.ensure_state_dir` can `chmod`/`mkdir` the
+namespace, `_prevalidate_private_parents` refuses a pre-existing parent that is
+not owned `0700`, checking **both** the selected namespace chain (including
+intermediate directories) **and** the fixed shared `.builder/eliza-acceptance-runs`
+parent even for the default namespace; `_ensure_private_chain` likewise creates
+only missing parents `0700` and refuses (never repairs) an existing parent with
+a foreign owner or wrong mode. The regular-copy `source` overlay is not a
+credential parent and keeps its canonical modes.
 
 A missing `vault.passphrase` is refused when persisted vault state exists
 (`<runtime>/.vault-pglite` or legacy `vault.json`), so a regenerated key can
@@ -237,8 +244,12 @@ salt `eliza.vault.masterKey.v1`, scrypt cost `2^15`, 32-byte key) therefore keep
 the same vault identity.
 
 Tests add negative-path coverage (malformed/`0600`-violating/symlink/non-regular
-refusal, non-`0700` parent refusal without repair, missing-passphrase-with-vault-
-state refusal, setup reuse/reuse-refusal) plus a real pinned-crypto probe: the
+refusal, a bounded-subprocess FIFO refusal that proves a fast non-blocking
+failure holds no admission and logs no path/secret, non-`0700` parent refusal —
+including the intermediate `state` directory and the default namespace's shared
+`.builder/eliza-acceptance-runs` parent — without repair, and unchanged unsafe
+bytes/modes, missing-passphrase-with-vault-state refusal, setup
+reuse/reuse-refusal) plus a real pinned-crypto probe: the
 pinned exported `master-key.ts`/`crypto.ts` encrypt a value in one Bun process
 and recover it in a fresh process from the same persisted passphrase. Public
 probe output is booleans/status only; no plaintext credential is logged or

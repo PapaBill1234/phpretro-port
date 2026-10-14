@@ -246,8 +246,9 @@ def _ensure_private_chain(root, target):
     """Create the missing owned 0700 components of ``target`` under ``root``.
 
     Only directories that do not yet exist are created (mode 0700); an existing
-    component is validated as an owned directory and is never re-moded or
-    repaired.  A symlinked or non-directory component is refused.
+    component must already be an owned ``0700`` directory and is never re-moded
+    or repaired.  A symlink, foreign owner, wrong mode or non-directory
+    component is refused.
     """
     root, target = Path(root), Path(target)
     try:
@@ -265,31 +266,37 @@ def _ensure_private_chain(root, target):
             continue
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise AcceptanceError("acceptance namespace parent is unsafe")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise AcceptanceError("acceptance namespace parent is not owned 0700")
     return target
 
 
 def _prevalidate_private_parents(root):
     """Read-only refusal of a pre-existing namespace parent that is not owned 0700.
 
-    Runs *before* ``_Admission`` and ``dash.ensure_state_dir`` — both of which
-    ``chmod`` the namespace — so an unsafe or foreign-owned pre-existing parent
-    is refused instead of being silently repaired.  A parent that does not yet
-    exist is left to the safe creator.
+    Runs *before* ``_Admission`` (which creates/chmods the fixed shared
+    ``.builder/eliza-acceptance-runs`` parent and the namespace) and before
+    ``dash.ensure_state_dir`` (which chmods the selected namespace), so an unsafe
+    or foreign-owned pre-existing parent is refused instead of being silently
+    repaired.  Both the selected namespace chain and the fixed shared run parent
+    are checked, so the default namespace cannot bypass the shared parent's
+    validation.  A parent that does not yet exist is left to the safe creator.
     """
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise AcceptanceError("project root is not a safe directory")
-    current = root
-    for part in _current_rel().parts:
-        current = current / part
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            continue  # not created yet; the creator creates it 0700
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise AcceptanceError("acceptance namespace parent is unsafe")
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-            raise AcceptanceError("acceptance namespace parent is not owned 0700")
+    for rel in (Path(_current_rel()), RUNS_REL):
+        current = root
+        for part in rel.parts:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue  # not created yet; the creator creates it 0700
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise AcceptanceError("acceptance namespace parent is unsafe")
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise AcceptanceError("acceptance namespace parent is not owned 0700")
     return root
 
 
@@ -415,8 +422,12 @@ LEGACY_VAULT_REL = Path("vault.json")
 
 
 def _private_runtime_dirs(root):
-    runtime = state_dir(root) / "runtime"
-    return (runtime, runtime / "db", runtime / "workspace", state_dir(root) / "home")
+    """Every intermediate and leaf private directory that holds credentials or
+    runtime state (never the regular-copy ``source`` overlay, whose copied files
+    keep their canonical modes)."""
+    state = state_dir(root)
+    runtime = state / "runtime"
+    return (state, runtime, runtime / "db", runtime / "workspace", state / "home")
 
 
 def vault_state_present(runtime) -> bool:

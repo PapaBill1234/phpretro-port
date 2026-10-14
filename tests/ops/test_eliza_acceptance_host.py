@@ -1061,6 +1061,57 @@ class CredentialTest(unittest.TestCase):
                 host._prevalidate_private_parents(root)
         self.assertEqual(stat.S_IMODE(parent.lstat().st_mode), 0o755)  # untouched
 
+    def test_prevalidate_checks_intermediate_state_and_default_shared_parent(self):
+        root = self._root()
+        state = self._setup(root)
+        shared = root / host.RUNS_REL
+        shared.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(shared, 0o755)
+        with host._Namespace(host.ACCEPTANCE_REL):
+            # the default namespace still validates the fixed shared run parent
+            with self.assertRaises(host.AcceptanceError):
+                host._prevalidate_private_parents(root)
+        self.assertEqual(stat.S_IMODE(shared.lstat().st_mode), 0o755)  # untouched
+        os.chmod(shared, 0o700)
+        os.chmod(state / "state", 0o755)  # intermediate private state dir
+        with host._Namespace(host.ACCEPTANCE_REL):
+            with self.assertRaises(host.DashboardError):
+                host._acceptance_secrets(root)  # read-only load validates it
+        self.assertEqual(stat.S_IMODE((state / "state").lstat().st_mode), 0o755)
+
+    def test_loader_refuses_fifo_credential_without_blocking(self):
+        host_path = str(REPO / "scripts/eliza-acceptance-host.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = self._setup(root)
+            fifo = state / "api.token"
+            fifo.unlink()
+            os.mkfifo(fifo, 0o600)
+            os.chmod(fifo, 0o600)
+            child = (
+                "import importlib.util\n"
+                "spec = importlib.util.spec_from_file_location('h', %r)\n"
+                "h = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(h)\n"
+                "with h._Namespace(h.ACCEPTANCE_REL):\n"
+                "    try:\n"
+                "        h._acceptance_secrets(%r)\n"
+                "        print('LOADED', flush=True)\n"
+                "    except h.DashboardError:\n"
+                "        print('REFUSED', flush=True)\n"
+            ) % (host_path, str(root))
+            started = time.monotonic()
+            proc = subprocess.run([sys.executable, "-c", child], capture_output=True,
+                                  text=True, timeout=15)
+            self.assertLess(time.monotonic() - started, 10.0)
+            self.assertEqual(proc.stdout.strip(), "REFUSED", proc.stderr)
+            self.assertNotIn(str(state), proc.stdout + proc.stderr)  # no path/secret log
+            # the refusal never held admission
+            with host._Namespace(host.ACCEPTANCE_REL):
+                held = host.require_admission(root)
+                held.__enter__()
+                held.__exit__(None, None, None)
+
 
 class VaultRecoveryTest(unittest.TestCase):
     """Real pinned vault crypto: an encrypted value survives a stop/restart.
