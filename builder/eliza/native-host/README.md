@@ -13,6 +13,7 @@ qualification gap.
 | `text-only.patch` | The single-hunk source patch against the pinned upstream commit. |
 | `provenance.json` | Pin, toolchain, license, digests and change description. |
 | `LICENSE` | Apache-2.0, copied verbatim from the pin. |
+| `NOTICE` | Upstream attribution, copied verbatim from the pin; carry applicable notices with a future binary distribution. |
 | `README.md` | This file. |
 
 ## What the patch does
@@ -40,7 +41,7 @@ once, before extension initialization.
 ### Why this insertion point
 
 Production session creation is a single funnel:
-`ThreadManager::spawn_thread` → `Session::spawn` → `Session::spawn_internal` →
+`ThreadManagerState::spawn_thread` → `Session::spawn` → `Session::spawn_internal` →
 `Session::new`. `Session::new` has exactly one production caller
 (`Session::spawn_internal`); the other `Session::new` references are tests. The
 guardian reviewer is started as a thread through the thread manager
@@ -69,14 +70,15 @@ than duplicate test-only clamp logic.
   across: new, cold-resume, fork, internal, legacy, and guardian reviewer
   sessions, each with **absent**, **unrestricted**, and **conflicting** caller
   init, asserting the effective policy is the empty ceiling in every case.
-- A **warm** existing session must stay constrained on resume (the ceiling is
-  re-supplied, not relaxed).
+- A **warm** resume retains the already constrained live session; it does not
+  create a new session or re-supply its captured policy.
 - After startup, the **finalized registry** rejects trusted, external, dynamic,
   MCP, direct, hidden, deferred, Code Mode and hosted tools.
 - The completed registry exposes **zero** complete tool entries, zero model-visible
   specs, and zero mappings; the dispatch executor is **never** invoked.
 - Reuse narrow existing in-tree Rust fixtures; use **only** a controlled local
-  mock server — no paid model, no real account, no network.
+  mock server — loopback-only traffic, no external/provider requests, paid model
+  or real account.
 
 ## Validation performed in this phase
 

@@ -12,7 +12,11 @@
   },
   "toolchain": {
     "rust_channel": "1.95.0",
-    "components": ["clippy", "rustfmt", "rust-src"],
+    "components": [
+      "clippy",
+      "rustfmt",
+      "rust-src"
+    ],
     "source": "codex-rs/rust-toolchain.toml"
   },
   "license": {
@@ -43,11 +47,17 @@
       "require_unified_exec": false,
       "expose_additional_permissions": false
     },
-    "rationale": "SessionIsolation is inserted once in the single production spawn funnel; ThreadManager -> Session::spawn -> Session::new is the sole production caller of Session::new. Inserting the ceiling here overwrites any caller-supplied ToolPolicy (including the Guardian reviewer init) with no role exception and no manager/config/RPC knob that could relax it. Session::new captures the policy once, before extension initialization."
+    "rationale": "SessionIsolation is inserted once in the single production spawn funnel; ThreadManagerState::spawn_thread -> Session::spawn -> Session::spawn_internal -> Session::new is the sole production caller of Session::new. Inserting the ceiling here overwrites any caller-supplied ToolPolicy (including the Guardian reviewer init) with no role exception and no manager/config/RPC knob that could relax it. Session::new captures the policy once, before extension initialization."
   },
   "not_done": [
     "No compile, test, or build was run in this phase (toolchain not installed here).",
     "Runtime registry-emptiness qualification is not claimed; the finalized registry must still be measured on a real build.",
     "The planned real Rust startup/router qualification tests are specified in README.md but are not yet implemented, compiled, or passing."
-  ]
+  ],
+  "notice": {
+    "file": "NOTICE",
+    "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+    "source_path_at_pin": "NOTICE",
+    "distribution_requirement": "Preserve applicable upstream and dependency notices with any future CLI binary distribution."
+  }
 }
