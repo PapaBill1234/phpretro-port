@@ -218,11 +218,23 @@ and an independent read-only DeepSeek review of the repair found no confirmed
 defects (it also flagged, as a non-blocking latent pattern, the same
 missing-directory assumption at `scripts/native-host.py:1527`, which
 `ensure_toolchain` currently masks). The repaired tip `fbad50b` is pushed;
-exact-SHA standard Verify CI passed (`38643807820`) and the hosted native
-qualification run `38643808015` advanced past the preflight stage that had
-failed in 9s, but was still running at handoff and is unverified. No compiled
-binary, artifact import or compiled qualification has been verified.
-**G05/G06 remain Partial.**
+exact-SHA standard Verify CI passed (`38643807820`). Two hosted runs then reached
+the **next** stage and failed there: `38643808015` (`fbad50b`) and `38645240448`
+(`a09be6d`) each ran ~29 minutes and refused with
+`"reason": "locked online test preparation failed (exit 101)"` — the supervised
+`cargo test --no-run -p codex-core --lib` at `scripts/native-host-ci.py:776-788`.
+Because the failure artifact is receipt-only, the compiler text never leaves the
+runner. The fix therefore makes the diagnostic observable rather than guessing:
+the failure receipt now carries a bounded, sanitized excerpt of the failing
+stage's own log (`DIAGNOSTIC_MAX_LINES=40`, `DIAGNOSTIC_MAX_CHARS=4000`, URL →
+`$HOME` → absolute-path → `KEY=value` redaction, ≤256 KiB tail read), and
+`stage_log` is now assigned per stage boundary so a `test-patches` failure can
+never inherit the build log. An independent DeepSeek review **rejected the first
+revision** for exactly that stale-`stage_log` mis-attribution and passed the
+amended revision; `tests.ops.test_native_host_ci` Ran 72 tests OK and
+`tests.ops.test_native_host_setup` Ran 103 tests OK. No compiled binary,
+artifact import or compiled qualification has been verified, and no admission
+follows. **G05/G06 remain Partial.**
 
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
@@ -240,7 +252,27 @@ with 401, an empty bearer with 401, a foreign `Origin` with 403, the owner beare
 with 200, and **owner bearer + the same UI origin** with 200 — the case that
 previously returned 403 `origin-not-configured` — while the foreign origin stayed
 403. The run was stopped cleanly (`terminated: ["api","ui","supervisor"]`) and no
-listener remained. Still unqualified: browser/UI mounting, the USER
+listener remained. A second probe in the same window found the **UI never served
+a document** (`mounted:false`, one failed request, `TimeoutError`) because the
+overlay copies only pinned tracked source (`_tracked_paths` → `git ls-files`), so
+a workspace member whose `exports` declare no source condition resolved its
+`./register` leaf to a `dist/*.js` the overlay never contains
+(`ui.log:101` `Failed to resolve import
+"@elizaos/plugin-native-settings/register"`). `dependency_bindings` now keeps
+such a built-output member on its verified canonical binding while every
+source-complete member still binds to the private overlay copy; a focused
+regression test fails against the pre-fix binding. An independent DeepSeek review
+passed the direction and narrowed behaviour but recorded two **latent**
+predicate gaps — a bare `"source"` condition (never passed by the children) and
+array/string-form `exports` are not covered — so the docstring overstates the
+case. A live re-probe in the next namespace (`acceptance-20261014-v41c`) then
+**confirmed the first of those predictions**: the original
+`plugin-native-settings` resolution error is gone, but the identical failure now
+appears for `@elizaos/plugin-trajectory-logger/register` (`ui.log`), and the UI
+still serves no document (`mounted:false`, `TimeoutError`); the API matrix stayed
+correct (unauth 401, foreign origin 403, owner 200, owner+same-UI-origin 200).
+Still unqualified: browser/UI mounting (blocked at that next member), the USER
 (non-owner) boundary, chat/two-room history and reload (generation is not
-admitted), and any native/compiled claim; no native/generation admission follows.
-The native CI-wrapper repair is integrated separately (see the paragraph above).
+admitted), and any native/compiled claim; no native/generation admission
+follows. The native CI-wrapper repair is integrated separately (see the
+paragraph above).
