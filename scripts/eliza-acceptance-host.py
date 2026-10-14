@@ -6,20 +6,28 @@ This does not reimplement supervision.  It registers one immutable
 ``ACCEPTANCE_PROFILE`` and delegates ``start``/``stop``/``status``/``check`` to
 the reviewed ``eliza-dashboard`` helpers, so the OS lock, captured cutoff,
 partial-startup group cleanup, PID start-tick signalling and private filesystem
-are shared, not duplicated.  It owns only ``.builder/eliza-acceptance``.
+are shared, not duplicated.  It owns only the fixed acceptance trees:
+``.builder/eliza-acceptance`` (the retained default) and the fresh run
+namespaces ``.builder/eliza-acceptance-runs/<run-id>``.  A run id is validated
+against a strict pattern before any filesystem access; the selected namespace is
+scoped to one command and restored in ``finally``.
 
 No install, download, build, launch, browser, model, account or credential call
-happens here; ``check`` is read-only and ``start`` is where the root later runs
-the real host after review.
+happens here; ``check``/``status`` are read-only and ``start`` is where the root
+later runs the real host after review.
 """
 
 import argparse
+import contextvars
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import time
@@ -44,7 +52,16 @@ UPSTREAM_PIN = upstream.UPSTREAM_PIN
 SOURCE_REL = upstream.SOURCE_REL
 
 ROOT = Path(__file__).resolve().parents[1]  # fixed; no arbitrary CLI root
-ACCEPTANCE_REL = Path(".builder") / "eliza-acceptance"
+ACCEPTANCE_REL = Path(".builder") / "eliza-acceptance"  # retained default namespace
+RUNS_REL = Path(".builder") / "eliza-acceptance-runs"  # fresh run namespaces live here
+# One acceptance-wide admission lock, shared by the default tree and every run.
+ADMISSION_REL = RUNS_REL / "admission.lock"
+# A run id is validated with a full match before any path is built from it.
+RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
+# The command-scoped selected namespace.  A ContextVar keeps it isolated per
+# thread/context so concurrent callers cannot corrupt one another's selection;
+# it is always restored in ``finally``.
+_NAMESPACE = contextvars.ContextVar("acceptance_namespace", default=ACCEPTANCE_REL)
 PATCH_REL = Path("builder") / "eliza" / "patches" / "new-chat.patch"
 PATCH_SHA256 = "caf755bed336361427796f1d33d088013c097f8dbc99c497cc0b27b52804ffb9"
 ENTRY_REL = Path("packages") / "app" / "src" / "entry.ts"
@@ -108,9 +125,48 @@ class AcceptanceError(DashboardError):
         self.code = code
 
 
+# --- namespace selection (command-scoped, restored in ``finally``) ----------
+class _Namespace:
+    """Select one fixed acceptance namespace for the duration of a command."""
+
+    def __init__(self, rel):
+        self.rel = Path(rel)
+        self.token = None
+
+    def __enter__(self):
+        self.token = _NAMESPACE.set(self.rel)
+        return self.rel
+
+    def __exit__(self, *exc):
+        _NAMESPACE.reset(self.token)
+        self.token = None
+        return False
+
+
+def _current_rel():
+    return _NAMESPACE.get()
+
+
+def run_namespace(run_id):
+    """Return the fixed namespace for a validated run id, or the default."""
+    if run_id is None:
+        return ACCEPTANCE_REL
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise AcceptanceError("run id must match [a-z0-9][a-z0-9-]{0,47}")
+    return RUNS_REL / run_id
+
+
+def _bound(ns, fn):
+    """Bind a profile callback to the namespace captured when it was built."""
+    def wrapped(*args, **kwargs):
+        with _Namespace(ns):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 # --- private layout ---------------------------------------------------------
 def acceptance_root(root):
-    return Path(root) / ACCEPTANCE_REL
+    return Path(root) / _current_rel()
 
 
 def overlay_dir(root):
@@ -129,6 +185,10 @@ def cutoff_path(root):
     return acceptance_root(root) / "cutoff.json"
 
 
+def operation_lock_path(root):
+    return acceptance_root(root) / "operation.lock"
+
+
 def provenance_path(root):
     return acceptance_root(root) / "overlay-provenance.json"
 
@@ -137,26 +197,54 @@ def canonical_source(root):
     return Path(root) / SOURCE_REL
 
 
-def assert_private_path(root, target):
-    """Reject escaping or symlinked acceptance paths before reads or mutations."""
+def assert_fixed_path(root, target, rel):
+    """Containment for a fixed owned path prefix, with symlink ancestor checks.
+
+    The **entire** prefix is compared (not a fixed component count), so sibling
+    trees such as ``.builder/eliza-acceptance-runs`` are never mistaken for the
+    retained ``.builder/eliza-acceptance`` default.
+    """
     root, target = Path(root), Path(target)
+    rel = Path(rel)
     try:
         relative = target.relative_to(root)
     except ValueError:
         raise AcceptanceError("acceptance path escapes project")
-    if relative.parts[:2] != ACCEPTANCE_REL.parts or ".." in relative.parts:
+    prefix = rel.parts
+    if (len(relative.parts) < len(prefix) or ".." in relative.parts
+            or relative.parts[:len(prefix)] != prefix):
         raise AcceptanceError("acceptance path escapes owned tree")
+    if root.is_symlink():
+        raise AcceptanceError("symlink in acceptance path")
     current = root
-    for part in (None, *relative.parts):
-        if part is not None:
-            current = current / part
+    for part in relative.parts:
+        current = current / part
         if current.is_symlink():
             raise AcceptanceError("symlink in acceptance path")
     return target
 
 
+def assert_private_path(root, target, rel=None):
+    """Contain ``target`` in the currently selected acceptance namespace."""
+    return assert_fixed_path(root, target, _current_rel() if rel is None else rel)
+
+
+def _reject_namespace_symlinks(root):
+    """Read-only: reject symlinked ancestors of the selected namespace."""
+    root = Path(root)
+    if root.is_symlink():
+        raise AcceptanceError("project root is a symlink")
+    current = root
+    for part in _current_rel().parts:
+        current = current / part
+        if current.is_symlink():
+            raise AcceptanceError("symlink in acceptance namespace")
+    return current
+
+
 # --- source / profile -------------------------------------------------------
-def _acceptance_source(root):
+def _acceptance_source(root, ns=None):
+    ns = _current_rel() if ns is None else Path(ns)
     return {
         "name": "eliza-acceptance-overlay",
         "managed": False,
@@ -171,7 +259,7 @@ def _acceptance_source(root):
         "api_cwd": Path("."),
         "ui_cwd": Path("packages") / "app",
         # Registered validator: overlay vs canonical runtimes; never a caller value.
-        "validate": lambda root: validate_overlay_source(root, launch_deadline(root)),
+        "validate": _bound(ns, lambda root: validate_overlay_source(root, launch_deadline(root))),
     }
 
 
@@ -194,12 +282,9 @@ def _verify_canonical_source(root, deadline=None):
 
 
 def launch_deadline(root):
-    path = assert_private_path(root, cutoff_path(root))
-    if not path.exists():
+    stop = read_cutoff(root)
+    if stop is None:
         return None
-    stop = datetime.fromisoformat(str(json.loads(path.read_text())["stop_at"]))
-    if stop.tzinfo is None:
-        raise AcceptanceError("saved cutoff is not timezone-aware")
     deadline = time.monotonic() + stop.timestamp() - time.time() - 5
     _remaining(deadline, "launch prerequisites")
     return deadline
@@ -232,17 +317,22 @@ def validate_overlay_source(root, deadline=None):
 
 
 def acceptance_profile(root, window_s=DEFAULT_WINDOW_S):
-    """The single immutable acceptance launch profile."""
+    """The single immutable acceptance launch profile.
+
+    Every callback is bound to the namespace selected when the profile was
+    built, so a later namespace restore cannot move a running launch.
+    """
+    ns = _current_rel()
     state = state_dir(root)
     return dash.LaunchProfile(
         name="eliza-acceptance",
-        state_relative=ACCEPTANCE_REL,
+        state_relative=ns,
         api_host=API_HOST,
         api_port=API_PORT,
         ui_port=UI_PORT,
         allowed_origins=ALLOWED_ORIGINS,
         allowed_hosts=API_HOST,
-        source=_acceptance_source(root),
+        source=_acceptance_source(root, ns),
         run_path=overlay_dir(root),
         secrets=(),
         dotenv=None,
@@ -251,9 +341,9 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S):
         routing=False,
         home=state / "home",
         window_seconds=window_s,
-        gate=lambda r: acceptance_gate(r, window_s),
-        load_secrets=lambda r, s: _acceptance_secrets(r),
-        verify=lambda r, s: launch_problems(r),
+        gate=_bound(ns, lambda r: acceptance_gate(r, window_s)),
+        load_secrets=_bound(ns, lambda r, s: _acceptance_secrets(r)),
+        verify=_bound(ns, lambda r, s: launch_problems(r)),
     )
 
 
@@ -268,33 +358,198 @@ def _acceptance_secrets(root, deadline=None):
 
 
 # --- bounded cutoff (captured once, never extended) -------------------------
+def read_cutoff(root):
+    """Read the immutable saved cutoff without creating or modifying anything."""
+    path = assert_private_path(root, cutoff_path(root))
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    stop = datetime.fromisoformat(str(data["stop_at"]))
+    if stop.tzinfo is None:
+        raise AcceptanceError("saved cutoff is not timezone-aware")
+    return stop
+
+
+def _canonical_stop(root):
+    canonical = dash.require_window(root)
+    stop = datetime.fromisoformat(str(canonical["stop_at"]))
+    if stop.tzinfo is None:
+        raise AcceptanceError("canonical cutoff is not timezone-aware")
+    return stop
+
+
+def effective_cutoff(root, window_s=DEFAULT_WINDOW_S):
+    """Effective stop time, computed in memory only.
+
+    A stricter canonical or caller window can only bring the deadline forward;
+    the saved cutoff is never rewritten or extended.
+    """
+    limit = _canonical_stop(root)
+    saved = read_cutoff(root)
+    if saved is not None:
+        limit = min(limit, saved)
+    return min(limit, datetime.now(timezone.utc) + timedelta(seconds=window_s))
+
+
+def preflight_expired(root, window_s=DEFAULT_WINDOW_S):
+    """Read-only expiry refusal, safe to run before any lock or state write."""
+    return datetime.now(timezone.utc) >= effective_cutoff(root, window_s)
+
+
+def _ensure_cutoff(root, stop_at):
+    """Create cutoff.json once, exclusively; never rewrite an existing file."""
+    path = assert_private_path(root, cutoff_path(root))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    payload = (json.dumps({"stop_at": stop_at.isoformat()}) + "\n").encode()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(payload)
+
+
 def acceptance_gate(root, window_s=DEFAULT_WINDOW_S):
     root = Path(root)
-    canonical = dash.require_window(root)
-    canonical_stop = datetime.fromisoformat(str(canonical["stop_at"]))
-    if canonical_stop.tzinfo is None:
-        raise AcceptanceError("canonical cutoff is not timezone-aware")
-    path = assert_private_path(root, cutoff_path(root))
-    if path.exists():
-        data = json.loads(path.read_text())
-        stop_at = datetime.fromisoformat(str(data["stop_at"]))
-        if stop_at.tzinfo is None:
-            raise AcceptanceError("saved cutoff is not timezone-aware")
-        stop_at = min(stop_at, canonical_stop, datetime.now(timezone.utc) + timedelta(seconds=window_s))
-    else:
-        stop_at = min(canonical_stop, datetime.now(timezone.utc) + timedelta(seconds=window_s))
+    stop_at = effective_cutoff(root, window_s)  # memory-only clamp
     if datetime.now(timezone.utc) >= stop_at:
         raise AcceptanceError("acceptance cutoff reached; no launch")
-    if not path.exists() or data["stop_at"] != stop_at.isoformat():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"stop_at": stop_at.isoformat()}) + "\n")
-        os.chmod(path, 0o600)
+    _ensure_cutoff(root, stop_at)  # created once, exclusively, under the run lock
     return {"stop_at": stop_at.isoformat(), "allowed": True}
 
 
 def _remaining(deadline, stage):
     if deadline is not None and time.monotonic() >= deadline:
         raise AcceptanceError("acceptance %s exceeded the shared deadline" % stage, code=2)
+
+
+# --- admission (fixed acceptance-wide lock + per-run operation lock) --------
+class _AdmissionBusy(Exception):
+    """Another setup/start already holds admission."""
+
+
+def _acquire_operation_lock(path):
+    """Non-blocking exclusive lock on a host lock file.
+
+    O_CLOEXEC keeps the descriptor out of every child, so the delegated
+    dashboard supervisor and its children never inherit admission.  On
+    contention the descriptor is closed exactly once before raising.
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        raise AcceptanceError("operation lock is unsafe")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise AcceptanceError("operation lock is unsafe")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise _AdmissionBusy()
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _unlock(fd):
+    if fd is None:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return None
+
+
+class _Admission:
+    """Admission for setup/start, held through supervision and cleanup.
+
+    Acquires the fixed acceptance-wide lock first (shared by the default tree
+    and every run) and then the per-run operation lock; releases in reverse
+    order.
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.shared_fd = None
+        self.fd = None
+
+    def __enter__(self):
+        _reject_namespace_symlinks(self.root)
+        # 1) fixed acceptance-wide admission lock (never namespace-scoped)
+        shared = assert_fixed_path(self.root, self.root / ADMISSION_REL, RUNS_REL)
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(shared.parent, 0o700)
+        self.shared_fd = _acquire_operation_lock(shared)
+        try:
+            # 2) per-run operation lock
+            root_dir = assert_private_path(self.root, acceptance_root(self.root))
+            root_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(root_dir, 0o700)
+            path = assert_private_path(self.root, operation_lock_path(self.root))
+            self.fd = _acquire_operation_lock(path)
+        except BaseException:
+            self.shared_fd = _unlock(self.shared_fd)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.fd = _unlock(self.fd)
+        self.shared_fd = _unlock(self.shared_fd)
+        return False
+
+
+def require_admission(root):
+    """Enter admission or raise ``_AdmissionBusy`` (never leaks the fd)."""
+    return _Admission(root)
+
+
+def _namespace_active(root):
+    """Read-only: refuse overlap when this namespace already has a live child.
+
+    Reads the dashboard runtime record at the acceptance namespace root (where
+    the delegated supervisor writes ``runtime.json``).  An unknown pid identity
+    is treated as gone, never as a match; a live but unverified ownership is
+    refused rather than assumed safe.
+    """
+    try:
+        runtime = dash.read_runtime(acceptance_root(root))
+    except DashboardError:
+        return True  # unsafe runtime state is treated as active
+    if not runtime:
+        return False
+    for name in ("api", "ui"):
+        pid = runtime.get(f"{name}Pid")
+        if pid is None:
+            continue
+        identity = dash.pid_identity(pid)
+        if identity is None:
+            continue  # recorded pid no longer exists; not active
+        start = runtime.get(f"{name}Start")
+        if start is None or str(identity) != str(start):
+            return True  # live but unverified ownership; refuse overlap
+        return True
+    return False
+
+
+def _reserve_ports():
+    """Check both loopback ports are free under admission, holding them briefly."""
+    sockets = []
+    try:
+        for port in (API_PORT, UI_PORT):
+            sock = socket.socket()
+            sockets.append(sock)  # close even if this bind fails
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((API_HOST, port))
+    except OSError:
+        raise AcceptanceError("a loopback port is busy")
+    finally:
+        for sock in sockets:
+            sock.close()
 
 
 def sha256_file(path, deadline=None):
@@ -721,6 +976,7 @@ def cmd_check(root, _argv=None):
     problems = []
     overlay_ready = False
     try:
+        _reject_namespace_symlinks(root)
         validate_overlay_source(root)
         overlay_ready = True
         dash.require_window(root)
@@ -757,34 +1013,80 @@ def operation_budget(args, cap):
 
 
 def cmd_setup(root, _argv=None):
+    root = Path(root)
     budget = operation_budget(_argv, SETUP_BUDGET_S)
-    gate = acceptance_gate(root)
-    seconds = datetime.fromisoformat(gate["stop_at"]).timestamp() - time.time() - 5
-    if seconds <= 0:
-        raise AcceptanceError("acceptance setup has no cleanup budget")
-    deadline = time.monotonic() + min(budget, seconds)
-    build_overlay(root, deadline)
-    _acceptance_secrets(root, deadline)
-    install_dropins(root, deadline)
-    write_config(root, deadline)
-    _remaining(deadline, "setup completion")
-    print(json.dumps({"overlay": str(overlay_dir(root)),
-                      "plugins": [str(dropin_dir(root, p)) for p in DROPINS],
-                      "patch_sha256": PATCH_SHA256, "ready": True}, indent=2))
-    return 0
+    # Read-only preflight: refuse an expired run before any lock/state write.
+    if preflight_expired(root, DEFAULT_WINDOW_S):
+        raise AcceptanceError("acceptance cutoff reached; no launch")
+    try:
+        admission = require_admission(root)
+        admission.__enter__()
+    except _AdmissionBusy:
+        print(json.dumps({"command": "setup", "status": "busy"}))
+        return 1
+    try:
+        # Revalidate under serialization before the first write.
+        if preflight_expired(root, DEFAULT_WINDOW_S):
+            raise AcceptanceError("acceptance cutoff reached; no launch")
+        if _namespace_active(root):
+            print(json.dumps({"command": "setup", "status": "busy",
+                              "reason": "namespace active"}))
+            return 1
+        gate = acceptance_gate(root)  # creates cutoff once, under admission
+        seconds = datetime.fromisoformat(gate["stop_at"]).timestamp() - time.time() - 5
+        if seconds <= 0:
+            raise AcceptanceError("acceptance setup has no cleanup budget")
+        deadline = time.monotonic() + min(budget, seconds)
+        build_overlay(root, deadline)
+        _acceptance_secrets(root, deadline)
+        install_dropins(root, deadline)
+        write_config(root, deadline)
+        _remaining(deadline, "setup completion")
+        print(json.dumps({"overlay": str(overlay_dir(root)),
+                          "plugins": [str(dropin_dir(root, p)) for p in DROPINS],
+                          "patch_sha256": PATCH_SHA256, "ready": True}, indent=2))
+        return 0
+    finally:
+        admission.__exit__(None, None, None)
 
 
 def cmd_start(root, _argv=None):
-    profile = acceptance_profile(root, operation_budget(_argv, DEFAULT_WINDOW_S))
-    return dash.cmd_start(Path(root), profile.source, profile)
+    root = Path(root)
+    window_s = operation_budget(_argv, DEFAULT_WINDOW_S)
+    # Read-only preflight: refuse an expired run before lock/state creation.
+    if preflight_expired(root, window_s):
+        raise AcceptanceError("acceptance cutoff reached; no launch")
+    try:
+        admission = require_admission(root)
+        admission.__enter__()
+    except _AdmissionBusy:
+        print(json.dumps({"command": "start", "status": "busy"}))
+        return 1
+    try:
+        # Revalidate under serialization, then refuse overlap with an active run.
+        if preflight_expired(root, window_s):
+            raise AcceptanceError("acceptance cutoff reached; no launch")
+        if _namespace_active(root):
+            print(json.dumps({"command": "start", "status": "busy",
+                              "reason": "namespace active"}))
+            return 1
+        _reserve_ports()  # both ports checked under admission
+        profile = acceptance_profile(root, window_s)
+        return dash.cmd_start(root, profile.source, profile)
+    finally:
+        admission.__exit__(None, None, None)
 
 
 def cmd_stop(root, _argv=None):
-    return dash.cmd_stop(Path(root), acceptance_profile(root))
+    root = Path(root)
+    _reject_namespace_symlinks(root)
+    return dash.cmd_stop(root, acceptance_profile(root))
 
 
 def cmd_status(root, _argv=None):
-    return dash.cmd_status(Path(root), acceptance_profile(root))
+    root = Path(root)
+    _reject_namespace_symlinks(root)
+    return dash.cmd_status(root, acceptance_profile(root))
 
 
 COMMANDS = {"check": cmd_check, "setup": cmd_setup, "start": cmd_start,
@@ -796,12 +1098,20 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="check", choices=list(COMMANDS))
     parser.add_argument("--yes", action="store_true", help="confirm a gated action")
     parser.add_argument("--deadline", type=int, default=None, help="maximum operation seconds (setup capped at 240, start at 3600)")
+    parser.add_argument("--run-id", default=None,
+                        help="select an isolated run namespace under .builder/eliza-acceptance-runs/<id>")
     args = parser.parse_args(argv)
+    try:
+        rel = run_namespace(args.run_id)  # strict full-match before any filesystem access
+    except AcceptanceError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
     if args.command in ("setup", "start") and not args.yes:
         print("error: %s is gated; pass --yes" % args.command, file=sys.stderr)
         return 1
     try:
-        return COMMANDS[args.command](ROOT, args)
+        with _Namespace(rel):
+            return COMMANDS[args.command](ROOT, args)
     except subprocess.TimeoutExpired:
         print("error: acceptance subprocess exceeded the shared deadline", file=sys.stderr)
         return 2

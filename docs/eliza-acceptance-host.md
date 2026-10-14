@@ -21,15 +21,43 @@ arbitrary CLI path/root flag: the profile is constructed only in reviewed code.
 ## Commands
 
 ```
-python3 scripts/eliza-acceptance-host.py check            # read-only
-python3 scripts/eliza-acceptance-host.py setup  --yes     # build private copy + drop-ins
-python3 scripts/eliza-acceptance-host.py start  --yes     # foreground (dashboard supervisor)
-python3 scripts/eliza-acceptance-host.py stop
-python3 scripts/eliza-acceptance-host.py status
+python3 scripts/eliza-acceptance-host.py check                       # read-only, default tree
+python3 scripts/eliza-acceptance-host.py setup  --yes [--run-id ID]   # build private copy + drop-ins
+python3 scripts/eliza-acceptance-host.py start  --yes [--run-id ID]   # foreground (dashboard supervisor)
+python3 scripts/eliza-acceptance-host.py stop   [--run-id ID]
+python3 scripts/eliza-acceptance-host.py status [--run-id ID]
 ```
 
+`--run-id ID` selects one fixed fresh namespace
+`.builder/eliza-acceptance-runs/ID`; without it the retained default
+`.builder/eliza-acceptance` is used. The id is validated with
+`re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", value)` **before** any filesystem
+access, so no arbitrary root or path can be supplied; unknown `--root` flags are
+rejected. The selected namespace is command-scoped and restored in `finally`
+(including on exceptions); profile callbacks are bound to the captured
+namespace. Containment compares the **entire** selected prefix, so sibling trees
+such as `.builder/eliza-acceptance-runs` are never treated as the default, and
+symlinked ancestors are rejected for every command (including delegated
+`status`/`stop` reads).
+
 `check` reports, separately: `prerequisites` (pin/runtimes/ports and existing-lock safety), `overlay_ready`, `dropins_ready`, and `host:"pending"` /
-`browser:"pending"`.
+`browser:"pending"`. `check` and `status` create nothing.
+
+## Admission, cutoff and overlap
+
+Setup and start share one **fixed acceptance-wide** admission lock at
+`.builder/eliza-acceptance-runs/admission.lock` (used by the default tree too),
+then a **per-run** `operation.lock`, released in reverse order. Both descriptors
+are `O_CLOEXEC` and never inherited; contention yields a clean refusal, not an
+error. Admission is held across the whole delegated foreground supervision and
+cleanup, so a second start (any namespace) is refused while the first runs, and
+setup cannot race a start of the same run. Both loopback ports are checked under
+admission, and a run whose namespace already records a live child refuses
+overlap. An expired run is refused by a **read-only** preflight before any lock
+or state write, then revalidated under admission: `cutoff.json` is created
+**once**, exclusively, under admission and is never rewritten; stricter canonical
+or caller limits are computed in memory only, and `check` never captures a
+cutoff.
 
 ## Private copy and provenance
 
@@ -138,3 +166,26 @@ This is dependency-binding evidence. The captured host cutoff expired without a
 qualified runtime; it was not extended. Full-host initialization, owner/user
 transport, plugin view mounting and browser behavior still require a fresh
 bounded acceptance run. Native generation remains blocked.
+
+## Fresh acceptance runs and admission — 2026-10-14
+
+Task G06-fresh-acceptance-runs adds fixed run namespaces
+(`.builder/eliza-acceptance-runs/<id>` via strict `--run-id`, default
+`.builder/eliza-acceptance` retained), command-scoped namespace selection
+restored in `finally` (a `ContextVar` so concurrent callers cannot corrupt the
+selection), full-prefix containment with symlink-ancestor rejection, a
+create-once `cutoff.json` under admission with memory-only clamping and a
+read-only expired preflight, and a fixed acceptance-wide admission lock plus a
+distinct per-run operation lock (`O_CLOEXEC`, consistent ordering). The expired
+run/operator default data is untouched and no host, service, model, build or
+download runs here.
+
+Behavioral tests cover invalid ids before dispatch, sibling-prefix and symlink
+escapes, context restoration after failure, isolated run state,
+serialized/immutable cutoff capture across real processes, expired-run refusal
+with unchanged bytes, default/operator preservation, cross-process overlapping
+starts (delayed binding), same-run setup/start contention, namespace-bound
+callbacks and exact-namespace stop/status. `python3 -m unittest` adapter and
+adjacent dashboard suites pass (46 adapter, 59 dashboard, one skip). This is a
+source-and-behavior checkpoint: the configured host, browser and native
+generation remain unqualified and **G06 stays Partial**.

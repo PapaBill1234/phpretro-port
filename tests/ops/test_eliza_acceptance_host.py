@@ -10,9 +10,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -301,12 +305,13 @@ class DeadlinePropagationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(host, "ROOT", root), \
-                    mock.patch.object(host, "acceptance_gate", return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host.dash, "require_window", return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
                     mock.patch.object(host, "build_overlay"), \
                     mock.patch.object(host.time, "monotonic", side_effect=[0, 2]), \
                     mock.patch("builtins.print") as output:
                 self.assertEqual(host.main(["setup", "--yes", "--deadline", "1"]), 2)
-            self.assertFalse(host.acceptance_root(root).exists())
+            self.assertFalse(host.overlay_dir(root).exists())
+            self.assertFalse(host.state_dir(root).exists())
             self.assertNotIn("ready", " ".join(str(call) for call in output.call_args_list))
 
     def test_start_validator_uses_captured_cutoff_before_source_work(self):
@@ -424,6 +429,447 @@ class GatedTest(unittest.TestCase):
                 self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
             with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
                 self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
+
+
+class RunNamespaceTest(unittest.TestCase):
+    def test_invalid_run_ids_are_refused_before_dispatch(self):
+        root = Path(tempfile.mkdtemp())
+        stub = mock.Mock(return_value=0)
+        with mock.patch.object(host, "ROOT", root), \
+                mock.patch.dict(host.COMMANDS, {"check": stub}), \
+                mock.patch("builtins.print"):
+            for bad in ("", "-lead", "Upper", "a/b", "a b", "a.b", ".x",
+                        "x" * 49, "run_id", "naïve", "a" * 48 + "-"):
+                self.assertEqual(host.main(["check", "--run-id=" + bad]), 2)
+        stub.assert_not_called()
+        self.assertEqual(list(root.iterdir()), [])  # no filesystem access
+
+    def test_run_namespace_is_fixed_and_default_is_preserved(self):
+        self.assertEqual(host.run_namespace(None), host.ACCEPTANCE_REL)
+        self.assertEqual(host.run_namespace("keep-me"), host.RUNS_REL / "keep-me")
+        self.assertEqual(host.RUNS_REL, Path(".builder") / "eliza-acceptance-runs")
+        with self.assertRaises(host.AcceptanceError):
+            host.run_namespace("Bad/Id")
+
+
+class ContainmentTest(unittest.TestCase):
+    def test_full_prefix_containment_rejects_sibling_and_prefix_escapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.ACCEPTANCE_REL):
+                host.assert_private_path(root, root / ".builder/eliza-acceptance/state")
+                for escaped in (".builder/eliza-acceptance-runs/x/cutoff.json",
+                                ".builder/eliza-acceptance-evil/f",
+                                ".builder/elsewhere/f",
+                                ".builder/eliza-acceptance/../escape"):
+                    with self.assertRaises(host.AcceptanceError):
+                        host.assert_private_path(root, root / escaped)
+            with host._Namespace(host.RUNS_REL / "run-a"):
+                host.assert_private_path(root, root / ".builder/eliza-acceptance-runs/run-a/cutoff.json")
+                for escaped in (".builder/eliza-acceptance-runs/run-b/cutoff.json",
+                                ".builder/eliza-acceptance/cutoff.json"):
+                    with self.assertRaises(host.AcceptanceError):
+                        host.assert_private_path(root, root / escaped)
+
+    def test_symlink_ancestors_are_rejected_for_every_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            foreign = Path(tmp) / "foreign"
+            foreign.mkdir()
+            (root / ".builder").symlink_to(foreign, target_is_directory=True)
+            with host._Namespace(host.RUNS_REL / "run-a"), \
+                    mock.patch.object(host.dash, "require_window",
+                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch("builtins.print"):
+                self.assertNotEqual(host.cmd_check(root), 0)
+                for command in (host.cmd_setup, host.cmd_start, host.cmd_stop, host.cmd_status):
+                    with self.assertRaises(host.AcceptanceError):
+                        command(root)
+            self.assertEqual(list(foreign.iterdir()), [])
+
+    def test_fixed_admission_path_is_contained_and_symlink_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            foreign = Path(tmp) / "foreign"
+            foreign.mkdir()
+            (root / ".builder").symlink_to(foreign, target_is_directory=True)
+            with host._Namespace(host.RUNS_REL / "run-a"):
+                with self.assertRaises(host.AcceptanceError):
+                    host.require_admission(root).__enter__()
+            self.assertEqual(list(foreign.iterdir()), [])
+
+
+class ContextRestorationTest(unittest.TestCase):
+    def test_selected_namespace_is_restored_after_success_and_failure(self):
+        before = host._current_rel()
+        with host._Namespace(host.RUNS_REL / "ok"):
+            self.assertEqual(host._current_rel(), host.RUNS_REL / "ok")
+        self.assertEqual(host._current_rel(), before)
+        with self.assertRaises(host.AcceptanceError):
+            with host._Namespace(host.RUNS_REL / "boom"):
+                raise host.AcceptanceError("boom")
+        self.assertEqual(host._current_rel(), before)
+
+    def test_main_restores_namespace_when_a_command_raises(self):
+        before = host._current_rel()
+
+        def boom(_root, _args):
+            raise host.AcceptanceError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(host, "ROOT", Path(tmp)), \
+                    mock.patch.dict(host.COMMANDS, {"check": boom}), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(host.main(["check", "--run-id", "run-a"]), 1)
+        self.assertEqual(host._current_rel(), before)
+
+
+class IsolationTest(unittest.TestCase):
+    def test_run_namespaces_are_distinct_and_default_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / host.ACCEPTANCE_REL / "operator.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("operator\n")
+            before = marker.read_bytes()
+            with host._Namespace(host.RUNS_REL / "run-a"):
+                a_root, a_state = host.acceptance_root(root), host.state_dir(root)
+            with host._Namespace(host.RUNS_REL / "run-b"):
+                b_root, b_state = host.acceptance_root(root), host.state_dir(root)
+            with host._Namespace(host.ACCEPTANCE_REL):
+                default_root = host.acceptance_root(root)
+            self.assertEqual(a_root, root / ".builder/eliza-acceptance-runs/run-a")
+            self.assertEqual(default_root, root / ".builder/eliza-acceptance")
+            self.assertNotEqual(a_root, b_root)
+            self.assertNotEqual(a_state, b_state)
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertEqual([p.name for p in (root / host.ACCEPTANCE_REL).iterdir()],
+                             ["operator.json"])
+
+
+class CallbackBindingTest(unittest.TestCase):
+    def test_profile_callbacks_are_bound_to_the_captured_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "bind"):
+                profile = host.acceptance_profile(root)
+                bound_rel = profile.state_relative
+                gate = profile.gate
+                validate = profile.source["validate"]
+            # ambient namespace is restored; the bound callbacks still target it
+            self.assertEqual(host._current_rel(), host.ACCEPTANCE_REL)
+            self.assertEqual(bound_rel, host.RUNS_REL / "bind")
+            with mock.patch.object(host.dash, "require_window",
+                                   return_value={"stop_at": "2099-01-01T00:00:00+00:00"}):
+                gate(root)
+            self.assertTrue((root / host.RUNS_REL / "bind" / "cutoff.json").exists())
+            self.assertFalse((root / host.ACCEPTANCE_REL).exists())
+            self.assertTrue(callable(validate))
+
+
+class CutoffTest(unittest.TestCase):
+    def test_cutoff_is_created_once_exclusively_and_never_rewritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "once"):
+                first = datetime.now(timezone.utc) + timedelta(seconds=60)
+                later = datetime.now(timezone.utc) + timedelta(seconds=600)
+                host._ensure_cutoff(root, first)
+                after_first = host.cutoff_path(root).read_bytes()
+                host._ensure_cutoff(root, later)  # must not overwrite
+                self.assertEqual(host.cutoff_path(root).read_bytes(), after_first)
+                self.assertEqual(json.loads(after_first)["stop_at"], first.isoformat())
+
+    def test_canonical_and_caller_clamps_are_memory_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "clamp"):
+                first = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+                later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": first}):
+                    self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
+                saved = host.cutoff_path(root).read_bytes()
+                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
+                    self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
+                # a smaller caller window can only tighten, never rewrite the file
+                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
+                    self.assertLess(host.effective_cutoff(root, 5),
+                                    datetime.now(timezone.utc) + timedelta(seconds=10))
+                self.assertEqual(host.cutoff_path(root).read_bytes(), saved)
+
+    def test_serialized_capture_under_admission_is_single_and_immutable(self):
+        host_path = str(REPO / "scripts/eliza-acceptance-host.py")
+        canonical = (datetime.now(timezone.utc) + timedelta(seconds=900)).isoformat()
+        later = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            winner = (
+                "import importlib.util, time\n"
+                "spec = importlib.util.spec_from_file_location('h', %r)\n"
+                "h = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(h)\n"
+                "h.dash.require_window = lambda r: {'stop_at': %r}\n"
+                "with h._Namespace(h.RUNS_REL / 'race'):\n"
+                "    adm = h.require_admission(%r)\n"
+                "    adm.__enter__()\n"
+                "    try:\n"
+                "        res = h.acceptance_gate(%r)\n"
+                "        print('captured', res['stop_at'], flush=True)\n"
+                "        time.sleep(2.5)\n"
+                "    finally:\n"
+                "        adm.__exit__(None, None, None)\n"
+            ) % (host_path, canonical, str(root), str(root))
+            holder = subprocess.Popen([sys.executable, "-c", winner],
+                                      stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.wait)
+            first = holder.stdout.readline().strip()
+            self.assertTrue(first.startswith("captured "), first)
+            self.assertEqual(first.split(" ", 1)[1], canonical)
+            # a same-id process cannot capture concurrently (real file lock)
+            challenger = (
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('h', %r)\n"
+                "h = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(h)\n"
+                "with h._Namespace(h.RUNS_REL / 'race'):\n"
+                "    try:\n"
+                "        h.require_admission(%r).__enter__()\n"
+                "    except h._AdmissionBusy:\n"
+                "        print('busy', flush=True); sys.exit(0)\n"
+                "print('acquired', flush=True)\n"
+            ) % (host_path, str(root))
+            busy = subprocess.run([sys.executable, "-c", challenger],
+                                  capture_output=True, text=True, timeout=15)
+            self.assertEqual(busy.stdout.strip(), "busy", busy.stderr)
+            holder.wait(timeout=10)
+            # same-id recheck under admission returns the saved value and the
+            # saved cutoff file is byte-identical (created once, never rewritten)
+            cutoff = root / host.RUNS_REL / "race" / "cutoff.json"
+            saved = cutoff.read_bytes()
+            with host._Namespace(host.RUNS_REL / "race"), \
+                    mock.patch.object(host.dash, "require_window",
+                                      return_value={"stop_at": later}):
+                admission = host.require_admission(root)
+                admission.__enter__()
+                try:
+                    self.assertEqual(host.acceptance_gate(root)["stop_at"], canonical)
+                finally:
+                    admission.__exit__(None, None, None)
+            self.assertEqual(cutoff.read_bytes(), saved)
+
+    def test_expired_run_refuses_before_any_write_and_leaves_bytes_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "expired"):
+                path = host.cutoff_path(root)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}) + "\n")
+                before = path.read_bytes()
+                with mock.patch.object(host.dash, "require_window",
+                                       return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                        mock.patch.object(host, "build_overlay") as build, \
+                        mock.patch("builtins.print"):
+                    for command in (host.cmd_setup, host.cmd_start):
+                        with self.assertRaises(host.AcceptanceError):
+                            command(root)
+                build.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse(host.operation_lock_path(root).exists())
+                self.assertFalse(host.state_dir(root).exists())
+
+
+class ActiveNamespaceTest(unittest.TestCase):
+    def _runtime(self, root, payload):
+        path = host.acceptance_root(root) / "runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload))
+        os.chmod(path, 0o600)
+
+    def test_active_namespace_refuses_start_and_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "live"):
+                self._runtime(root, {"apiPid": 4242, "apiStart": "55"})
+                with mock.patch.object(host.dash, "require_window",
+                                       return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                        mock.patch.object(host.dash, "pid_identity", return_value="55"), \
+                        mock.patch.object(host.dash, "cmd_start") as dash_start, \
+                        mock.patch("builtins.print") as out:
+                    self.assertEqual(host.cmd_start(root), 1)
+                    dash_start.assert_not_called()
+                    self.assertEqual(host.cmd_setup(root), 1)
+                self.assertIn("active", " ".join(str(c) for c in out.call_args_list))
+
+    def test_unknown_pid_identity_is_not_treated_as_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "stale"):
+                self._runtime(root, {"apiPid": 4242})  # no recorded start tick
+                with mock.patch.object(host.dash, "pid_identity", return_value=None):
+                    self.assertFalse(host._namespace_active(root))
+                with mock.patch.object(host.dash, "pid_identity", return_value="99"):
+                    self.assertTrue(host._namespace_active(root))
+
+
+class AdmissionTest(unittest.TestCase):
+    def test_same_run_contention_is_busy_not_ebadf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "shared"):
+                first = host.require_admission(root)
+                first.__enter__()
+                try:
+                    second = host.require_admission(root)
+                    with self.assertRaises(host._AdmissionBusy):
+                        second.__enter__()
+                finally:
+                    first.__exit__(None, None, None)
+                third = host.require_admission(root)
+                third.__enter__()
+                third.__exit__(None, None, None)
+
+    def test_setup_and_start_content_on_the_same_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "shared"), \
+                    mock.patch.object(host.dash, "require_window",
+                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "build_overlay") as build, \
+                    mock.patch("builtins.print"):
+                held = host.require_admission(root)
+                held.__enter__()
+                try:
+                    self.assertEqual(host.cmd_start(root), 1)  # busy, no delegation
+                    self.assertEqual(host.cmd_setup(root), 1)
+                finally:
+                    held.__exit__(None, None, None)
+                build.assert_not_called()
+
+    def test_fixed_admission_lock_is_shared_across_namespaces(self):
+        host_path = str(REPO / "scripts/eliza-acceptance-host.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = (
+                "import importlib.util, sys, time\n"
+                "spec = importlib.util.spec_from_file_location('h', %r)\n"
+                "h = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(h)\n"
+                "adm = h.require_admission(%r)\n"
+                "adm.__enter__()\n"
+                "print('held', flush=True)\n"
+                "time.sleep(3.0)\n"
+                "adm.__exit__(None, None, None)\n"
+            ) % (host_path, str(root))
+            holder = subprocess.Popen([sys.executable, "-c", child],
+                                      stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.wait)
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            # a different namespace must still contend on the fixed shared lock
+            with host._Namespace(host.RUNS_REL / "other"):
+                with self.assertRaises(host._AdmissionBusy):
+                    host.require_admission(root).__enter__()
+            holder.wait(timeout=10)
+
+
+class StartOverlapTest(unittest.TestCase):
+    def test_busy_port_refuses_start_under_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blocker = socket.socket()
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            blocker.bind((host.API_HOST, 0))
+            blocked_port = blocker.getsockname()[1]
+            blocker.listen(1)
+            self.addCleanup(blocker.close)
+            probe = socket.socket()
+            probe.bind((host.API_HOST, 0))
+            free_port = probe.getsockname()[1]
+            probe.close()
+            with host._Namespace(host.RUNS_REL / "ports"), \
+                    mock.patch.object(host, "API_PORT", blocked_port), \
+                    mock.patch.object(host, "UI_PORT", free_port), \
+                    mock.patch.object(host.dash, "require_window",
+                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host.dash, "cmd_start") as dash_start, \
+                    mock.patch("builtins.print"):
+                with self.assertRaises(host.AcceptanceError):
+                    host.cmd_start(root)
+                dash_start.assert_not_called()
+
+    def test_delayed_binding_start_refuses_overlap_until_released(self):
+        host_path = str(REPO / "scripts/eliza-acceptance-host.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "foreground.ready"
+            child = (
+                "import importlib.util, time\n"
+                "spec = importlib.util.spec_from_file_location('h', %r)\n"
+                "h = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(h)\n"
+                "h.dash.require_window = lambda r: {'stop_at': '2099-01-01T00:00:00+00:00'}\n"
+                "h._reserve_ports = lambda: None\n"
+                "def foreground(root, source, profile):\n"
+                "    open(%r, 'w').write('ready')\n"
+                "    time.sleep(2.5)\n"
+                "    return 0\n"
+                "h.dash.cmd_start = foreground\n"
+                "with h._Namespace(h.RUNS_REL / 'run-x'):\n"
+                "    print('rc', h.cmd_start(%r), flush=True)\n"
+            ) % (host_path, str(marker), str(root))
+            holder = subprocess.Popen([sys.executable, "-c", child],
+                                      stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.wait)
+            deadline = time.time() + 5
+            while not marker.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists())
+            # a different namespace cannot start while admission is held
+            with host._Namespace(host.RUNS_REL / "run-y"), \
+                    mock.patch.object(host.dash, "require_window",
+                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host.dash, "cmd_start") as dash_start, \
+                    mock.patch("builtins.print"):
+                self.assertEqual(host.cmd_start(root), 1)
+                dash_start.assert_not_called()
+            self.assertEqual(holder.stdout.readline().strip(), "rc 0")
+            holder.wait(timeout=10)
+            # admission is available again once the first start released
+            available = host.require_admission(root)
+            available.__enter__()
+            available.__exit__(None, None, None)
+
+
+class ExactCommandTest(unittest.TestCase):
+    def test_stop_and_status_target_the_exact_selected_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seen = {}
+
+            def fake_status(_root, profile):
+                seen["status"] = profile.state_relative
+                return 0
+
+            def fake_stop(_root, profile):
+                seen["stop"] = profile.state_relative
+                return 0
+
+            with host._Namespace(host.RUNS_REL / "exact"), \
+                    mock.patch.object(host.dash, "cmd_status", side_effect=fake_status), \
+                    mock.patch.object(host.dash, "cmd_stop", side_effect=fake_stop):
+                host.cmd_status(root)
+                host.cmd_stop(root)
+            self.assertEqual(seen["status"], host.RUNS_REL / "exact")
+            self.assertEqual(seen["stop"], host.RUNS_REL / "exact")
+
+    def test_stop_and_status_create_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with host._Namespace(host.RUNS_REL / "readonly"), mock.patch("builtins.print"):
+                self.assertEqual(host.cmd_status(root), 0)
+                self.assertEqual(host.cmd_stop(root), 0)
+            self.assertFalse((root / host.RUNS_REL / "readonly").exists())
 
 
 if __name__ == "__main__":
