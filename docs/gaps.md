@@ -207,10 +207,16 @@ first real hosted Ubuntu 24.04 run (`38641368461`), which refused in 9s with
 `shutil.disk_usage` on a private build root that a fresh checkout has not
 created yet. Creating that root (idempotent, before any heavy work) is repaired
 in the following commit; `tests.ops.test_native_host_ci` Ran 59 tests OK and
-`tests.ops.test_native_host_setup` Ran 103 tests OK against the repaired source.
-No compiled binary, artifact import or compiled qualification has been verified,
-and the hosted runner has not re-run since the repair. **G05/G06 remain
-Partial.**
+`tests.ops.test_native_host_setup` Ran 103 tests OK against the repaired source,
+and an independent read-only DeepSeek review of the repair found no confirmed
+defects (it also flagged, as a non-blocking latent pattern, the same
+missing-directory assumption at `scripts/native-host.py:1527`, which
+`ensure_toolchain` currently masks). The repaired tip `fbad50b` is pushed;
+exact-SHA standard Verify CI passed (`38643807820`) and the hosted native
+qualification run `38643808015` advanced past the preflight stage that had
+failed in 9s, but was still running at handoff and is unverified. No compiled
+binary, artifact import or compiled qualification has been verified.
+**G05/G06 remain Partial.**
 
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
