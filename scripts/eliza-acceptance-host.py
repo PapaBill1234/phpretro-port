@@ -733,49 +733,98 @@ def _tracked_paths(source, deadline=None):
     return paths
 
 
-def _exports_declare_source_condition(exports):
-    """True when an ``exports`` map offers a source condition target anywhere.
+# The pinned children are launched with only ``--conditions=eliza-source``
+# (``scripts/eliza-dashboard.py``); no other source condition is requested, so a
+# bare ``"source"`` or ``"bun"`` key never qualifies a member as source-complete.
+_EXPORT_CONDITION_ORDER = ("eliza-source", "import", "default")
 
-    The pinned children run with ``--conditions=eliza-source``; a package whose
-    ``exports`` declare ``eliza-source``/``source`` resolves to ``src/*.ts`` and
-    can be served by the overlay's source-only copy.
+
+def _resolve_export_target(value):
+    """The pinned resolution target of one ``exports`` value.
+
+    Mirrors the pinned app's condition preference over the only source condition
+    the children request: ``eliza-source`` first, then ``import``/``default``.
+    Array fallbacks and nested condition maps are followed.
     """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        for entry in value:
+            target = _resolve_export_target(entry)
+            if target is not None:
+                return target
+        return None
+    if isinstance(value, dict):
+        for condition in _EXPORT_CONDITION_ORDER:
+            if condition in value:
+                target = _resolve_export_target(value[condition])
+                if target is not None:
+                    return target
+    return None
+
+
+def _exports_resolve_to_built_output(exports):
+    """Whether any export key resolves through built ``dist/`` output.
+
+    Accepts the ``exports`` shapes Node allows: a plain string target, an array
+    of fallback targets, or a key map whose values are strings, arrays or nested
+    condition maps.  Not covered (and absent upstream today): a member with no
+    ``exports`` at all, whose ``main`` alone points at built output.
+    """
+    if isinstance(exports, str):
+        return exports.startswith("./dist/")
+    if isinstance(exports, list):
+        return any(_exports_resolve_to_built_output(entry) for entry in exports)
     if isinstance(exports, dict):
-        if "eliza-source" in exports or "source" in exports:
-            return True
-        return any(_exports_declare_source_condition(value) for value in exports.values())
+        for value in exports.values():
+            if isinstance(value, (str, list)):
+                if _exports_resolve_to_built_output(value):
+                    return True
+            else:
+                target = _resolve_export_target(value)
+                if target is not None and target.startswith("./dist/"):
+                    return True
     return False
 
 
 def _workspace_package_needs_built_output(package_dir):
     """Whether a workspace package resolves only through its built ``dist/``.
 
-    The overlay copies pinned *tracked* source only, so a package that ships
-    build output and declares no source condition cannot resolve from the
-    overlay copy: its ``exports`` (e.g. a boot-registered ``./register`` leaf)
-    point at ``dist/*.js``, which the overlay never contains.  Such a member
-    must keep its complete verified canonical package binding.
+    The overlay copies pinned *tracked* source only, so it never contains the
+    build output a package's ``exports`` may resolve to.  When the pinned
+    ``eliza-source`` condition set cannot serve the package (some export key
+    pins ``dist/*.js``), the member must keep its complete verified canonical
+    package binding; otherwise the source-only overlay copy drops that built
+    target and Vite's import analysis fails for the app's plugin-registration
+    seam (``@elizaos/plugin-native-settings/register``,
+    ``@elizaos/plugin-trajectory-logger/register``).
     """
     package_dir = Path(package_dir)
     try:
         manifest = json.loads((package_dir / "package.json").read_text())
     except (OSError, ValueError):
         return False
-    exports = manifest.get("exports")
-    if not isinstance(exports, dict):
+    if not isinstance(manifest, dict) or not (package_dir / "dist").is_dir():
         return False
-    if _exports_declare_source_condition(exports):
-        return False
-    return (package_dir / "dist").is_dir()
+    return "exports" in manifest and _exports_resolve_to_built_output(manifest["exports"])
+
+
+def _workspace_package_is_overlay_required(relative):
+    """The reviewed patch's own package must always resolve from the overlay."""
+    relative = str(relative)
+    prefix = relative.rstrip("/") + "/"
+    return any(rel == relative or rel.startswith(prefix)
+               for rel in EXPECTED_CHANGED | EXPECTED_ADDED)
 
 
 def dependency_bindings(source, overlay, deadline=None):
     """Exact installed dependency locations; workspace links resolve in the overlay.
 
-    A source-complete workspace member binds to the private overlay copy.  A
-    member that resolves only through built output (no source export condition,
-    but a canonical ``dist/``) keeps its verified canonical binding, because the
-    source-only overlay would otherwise drop that built subpath.
+    A member the pinned ``eliza-source`` conditions can serve from source binds
+    to the private overlay copy, as does the reviewed patch's own package.  A
+    member that resolves through built ``dist/`` output (the overlay never
+    carries build output) keeps its complete verified canonical package binding,
+    because the source-only overlay would otherwise drop that built subpath.
     """
     source, overlay = Path(source).resolve(), Path(overlay)
     bindings = {}
@@ -799,7 +848,9 @@ def dependency_bindings(source, overlay, deadline=None):
                 target = member
                 if _under(resolved, source):
                     relative = resolved.relative_to(source)
-                    if "node_modules" not in relative.parts and not _workspace_package_needs_built_output(resolved):
+                    if "node_modules" not in relative.parts and (
+                            _workspace_package_is_overlay_required(relative)
+                            or not _workspace_package_needs_built_output(resolved)):
                         target = overlay / relative
                 entries[name] = str(target)
         bindings[str(rel)] = entries

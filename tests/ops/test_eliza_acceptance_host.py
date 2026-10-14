@@ -259,6 +259,56 @@ class OverlayTest(unittest.TestCase):
                 self.assertEqual((overlay / "node_modules/@elizaos/plugin-with-source").resolve(),
                                  (overlay / "plugins/plugin-with-source").resolve())
 
+    def test_source_only_condition_member_keeps_canonical_binding(self):
+        """Only the pinned `eliza-source` condition may qualify a member as
+        source-complete: a member declaring a bare `"source"` key (never
+        requested by the children), or a wildcard subpath pinning `dist/*.js`
+        (the `plugin-trajectory-logger` shape), must keep its canonical binding,
+        while an `eliza-source` member still resolves to the overlay copy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, patch = self._fixture(tmp)
+            source = host.canonical_source(root)
+            (source / ".gitignore").write_text("node_modules/\ndist/\n")
+            members = {
+                # bare "source" is not a condition the children request
+                "plugin-source-only": {".": {"source": "./src/index.ts",
+                                             "import": "./dist/index.js"}},
+                # wildcard subpath (the boot `./register` leaf) pins built output
+                "plugin-wild-dist": {".": {"eliza-source": "./src/index.ts",
+                                           "import": "./dist/index.js"},
+                                     "./*": {"import": "./dist/*.js"}},
+                # fully source-served: root and every subpath have eliza-source
+                "plugin-source-complete": {".": {"eliza-source": "./src/index.ts",
+                                                 "import": "./dist/index.js"},
+                                           "./register": {"eliza-source": "./src/register.ts",
+                                                          "import": "./dist/register.js"}},
+            }
+            for name, exports in members.items():
+                pkg = source / "plugins" / name
+                (pkg / "src").mkdir(parents=True)
+                (pkg / "src/index.ts").write_text("export const x = 1;\n")
+                (pkg / "dist").mkdir()
+                (pkg / "dist/index.js").write_text("export const x = 1;\n")
+                (pkg / "package.json").write_text(json.dumps(
+                    {"name": "@elizaos/" + name, "exports": exports}, indent=2) + "\n")
+                (source / "node_modules/@elizaos" / name).symlink_to("../../plugins/" + name)
+            _git(source, "add", "-A")
+            _git(source, "commit", "-m", "plugins")
+            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            with mock.patch.object(host.upstream, "UPSTREAM_PIN", pin), \
+                    mock.patch.object(host, "PATCH_SHA256", host.sha256_file(patch)):
+                host.build_overlay(root)
+                self.assertTrue(host.verify_overlay(root))
+                overlay = host.overlay_dir(root)
+                for name in ("plugin-source-only", "plugin-wild-dist"):
+                    bound = overlay / "node_modules/@elizaos" / name
+                    self.assertEqual(bound.resolve(), (source / "plugins" / name).resolve())
+                    self.assertTrue((bound / "dist/index.js").is_file())
+                self.assertEqual(
+                    (overlay / "node_modules/@elizaos/plugin-source-complete").resolve(),
+                    (overlay / "plugins/plugin-source-complete").resolve())
+
     def test_legacy_scope_migration_rejects_unknown_scope_and_empty_additions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
