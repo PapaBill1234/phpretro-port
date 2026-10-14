@@ -25,7 +25,7 @@ Everything installs under `ROOT/.builder/upstream` and never touches global
 runtimes or ancestor directories:
 
 ```
-.builder/upstream/runtimes/node/node-v24.15.0-linux-x64/bin/node
+.builder/upstream/runtimes/node-v24.15.0-linux-x64/bin/node
 .builder/upstream/runtimes/bun/package/bin/bun
 .builder/upstream/cache/       # verified download archives (reused)
 .builder/upstream/logs/        # bounded, truncating build/CLI logs

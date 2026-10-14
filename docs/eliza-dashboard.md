@@ -16,7 +16,7 @@ is provisioned by the reviewed setup installer `scripts/eliza-upstream.py`:
 - Pinned upstream checkout `builder/eliza/upstream` (relative to the integration
   `ROOT`) at git pin `28fef47c9d9d3acc7792be0fdaa3070020293cc5`.
 - Private pinned runtimes installed under `ROOT/.builder/upstream`:
-  `runtimes/node/node-v24.15.0-linux-x64/bin/node` (Node `v24.15.0`) and
+  `runtimes/node-v24.15.0-linux-x64/bin/node` (Node `v24.15.0`) and
   `runtimes/bun/package/bin/bun` (Bun `1.4.2`).
 - Setup dependencies: the upstream `node_modules` install recorded by the
   installer's provenance.

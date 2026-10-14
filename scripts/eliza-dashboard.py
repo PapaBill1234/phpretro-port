@@ -92,7 +92,7 @@ CONFIG_SOURCE = {
     "pin": "28fef47c9d9d3acc7792be0fdaa3070020293cc5",
     "bun": ROOT / UPSTREAM_PRIVATE_REL / "runtimes" / "bun" / "package" / "bin" / "bun",
     "bun_version": "1.4.2",
-    "node": ROOT / UPSTREAM_PRIVATE_REL / "runtimes" / "node" / "node-v24.15.0-linux-x64" / "bin" / "node",
+    "node": ROOT / UPSTREAM_PRIVATE_REL / "runtimes" / "node-v24.15.0-linux-x64" / "bin" / "node",
     "node_version": "v24.15.0",
     "api_entry": Path("packages/app/src/entry.ts"),
     "vite": Path("node_modules/vite/bin/vite.js"),

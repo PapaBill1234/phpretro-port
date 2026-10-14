@@ -147,7 +147,7 @@ class DashboardTests(unittest.TestCase):
             "pin": REPO_PIN,
             "bun": private / "bun" / "package" / "bin" / "bun",
             "bun_version": BUN_VERSION,
-            "node": private / "node" / "node-v24.15.0-linux-x64" / "bin" / "node",
+            "node": private / "node-v24.15.0-linux-x64" / "bin" / "node",
             "node_version": NODE_VERSION,
             "api_entry": Path("packages/app/src/entry.ts"),
             "vite": Path("node_modules/vite/bin/vite.js"),
@@ -223,11 +223,14 @@ class DashboardTests(unittest.TestCase):
 
     # -- default registered source (integration ROOT/installer) -------------
     def test_default_source_uses_root_relative_integration_paths(self):
+        installer = dash.load_eliza_upstream(dash.ROOT)
+        self.assertEqual(dash.CONFIG_SOURCE["node"], installer.node_bin(dash.ROOT))
+        self.assertEqual(dash.CONFIG_SOURCE["bun"], installer.bun_bin(dash.ROOT))
         self.assertTrue(dash.CONFIG_SOURCE["managed"])
         self.assertEqual(dash.CONFIG_SOURCE["path"], dash.ROOT / dash.UPSTREAM_SOURCE_REL)
         self.assertEqual(dash.CONFIG_SOURCE["path"], dash.ROOT / "builder" / "eliza" / "upstream")
         self.assertEqual(dash.CONFIG_SOURCE["node"],
-                         dash.ROOT / ".builder" / "upstream" / "runtimes" / "node"
+                         dash.ROOT / ".builder" / "upstream" / "runtimes"
                          / "node-v24.15.0-linux-x64" / "bin" / "node")
         self.assertEqual(dash.CONFIG_SOURCE["bun"],
                          dash.ROOT / ".builder" / "upstream" / "runtimes" / "bun"

@@ -49,7 +49,7 @@ verified by offline/controlled tests from what still needs an actual host.
 
 ## Checks run (offline / controlled)
 
-- `node --conditions=eliza-source <pinned tsx> --test tests/` → 20 pass, 0 fail.
+- From the plugin directory, `NODE_OPTIONS=--conditions=eliza-source <Node24> <pinned tsx> --tsconfig <upstream>/tsconfig.json --test tests/unit.test.js tests/integration.test.js` → 20 pass, 0 fail. `NODE_OPTIONS` forwards the source condition to the child process that the tsx CLI starts; putting it only on the parent Node command does not. Dependencies must resolve to the pinned source workspace. This command and the view bundle also passed using the integration tree's own frozen source installation.
 - Real pinned loader: `scanDropInPlugins` + `findRuntimePluginExport`
   (`@elizaos/agent/runtime/plugin-types`) discover the package from a temp directory.
 - Real pinned dispatcher: `tryHandleRuntimePluginRoute`
