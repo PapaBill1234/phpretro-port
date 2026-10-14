@@ -882,6 +882,10 @@ def build_env(source, secrets, profile=DASHBOARD_PROFILE):
         base["PGLITE_DATA_DIR"] = str(secrets["profile"] / "db")
         base["ELIZA_WORKSPACE_DIR"] = str(secrets["profile"] / "workspace")
         api_env.update(base)
+        # The pinned companion plugin (API child) reads its own trusted-origin
+        # env var; export the immutable profile allowlist to the API child only.
+        # Never sourced from ambient os.environ, never widened, never sent to UI.
+        api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"] = profile.allowed_origins
         # Acceptance profile: no model credential, no autonomy, no cloud keys.
         api_env["ENABLE_AUTONOMY"] = "false"
         api_env["ELIZA_AGENT_ORCHESTRATOR"] = "0"
@@ -903,6 +907,9 @@ def build_env(source, secrets, profile=DASHBOARD_PROFILE):
     api_env["OPENAI_BASE_URL"] = DEEPSEEK_BASE_URL
     for tier in TEXT_TIERS:
         api_env[f"OPENAI_{tier}_MODEL"] = DEEPSEEK_MODEL
+    # Companion plugin (API child) trusted origins: same immutable profile
+    # allowlist as ELIZA_ALLOWED_ORIGINS, API child only, never ambient-widened.
+    api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"] = profile.allowed_origins
     return api_env, dict(base)
 
 
