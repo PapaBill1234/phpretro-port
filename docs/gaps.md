@@ -46,6 +46,8 @@ The installed raw ELF `codex-cli 0.162.0` matches the official release from sour
 
 The G06 `proc <X> dead` terminate-group assertion repair (`2ac672d`) is **test-only** and does not close G06.
 
+The native provider now captures one deadline before metadata and caps its subprocesses and account/thread/turn RPCs by the remaining budget. Five seconds are reserved from the gate for normal cleanup; a short caller timeout remains usable. Forty-three generator tests pass, including capped metadata arguments and no subprocess launch after expiry. Hard-parent cleanup and the complete native tool-registry proof remain unqualified, so generation stays blocked.
+
 ## Entry update format
 
 For each completed slice append: task/issue ID; exact changed behavior; source/reference revision; checks run and results; commit/PR; remaining limitation; status (`missing`, `partial`, `verified`, `blocked-external`). A passing mock or a code-text assertion cannot close an integration gap. Store verbose test artifacts privately or in a sanitized evidence index rather than pasting transcripts here.

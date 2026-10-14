@@ -209,7 +209,7 @@ proven, so the generator blocks. The controls it evaluates:
 ## Verification (this slice)
 
 ```
-python3 -m unittest tests.ops.test_codex_generate   # 41 tests, process boundary + FakeRPC + contract/schema qualification + shared deadline
+python3 -m unittest tests.ops.test_codex_generate   # 43 tests, process boundary + FakeRPC + contract/schema qualification + shared deadline
 node builder/eliza/native-model/native-model.fixture.mjs   # 19/19 controlled checks (draft handlers)
 python3 -m unittest tests.ops.test_codex_bridge      # 13 tests, dependency unchanged
 ```
