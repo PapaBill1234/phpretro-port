@@ -75,9 +75,9 @@ python3 scripts/native-host.py build
   `nice -n 19 cargo build --release --locked -p codex-cli --bin codex --jobs 1`.
   Before Cargo, the pinned release-local lock mismatch is repaired as described
   below, while retaining `--locked`.
-  Debuginfo is disabled, the Cargo cache/target are private and the environment
-  is built from scratch (no inherited provider or cloud credential, no account
-  or OAuth copy).
+  The Cargo cache/target are private and the environment is built from scratch
+  (no inherited provider or cloud credential, no account or OAuth copy), with
+  the fixed low-memory release profile described below.
 
 ## Reviewed public patch (read-only dependency)
 
@@ -142,13 +142,17 @@ budget stops mid-run, the worktree checkpoints at the precise stage (`source`,
 
 ## Acceptance status
 
-The helper is verified by its own isolated tests (64 focused tests: source/patch/
+The helper is verified by its own isolated tests (87 focused tests: source/patch/
 digest/tar/path/deadline/resource refusal, containment dotdot/symlink refusal
 before any write, bounded downloads and archive members, tampered-cache
 refetch, stale-build binding, no-signal-after-reap ordering, cutoff-clamped
 probes and extraction, blocked archive scanning/member extraction with no
-installation or provenance publication, nested alarm restoration, unknown-RAM
-refusal, and the real public manifest schema
+installation or provenance publication, nested alarm restoration, strict
+MemAvailable unit/value parsing, fixed release-profile env/contract and
+per-field profile freshness rejection, a real controlled compiler that proves
+the actual argv and profile environment it receives, owned-group resource stops
+on low and unknown RAM after real children recorded their PIDs, and the real
+public manifest schema
 probed offline) against controlled fixtures; there are no public-network,
 install or build calls, and the tests do not assert that a real build succeeded.
 The upstream regression suite (30 tests) and the repository public-file/
@@ -193,3 +197,42 @@ floor (compiler RSS about 3 GiB, swap nearly full). The supervised group exited;
 no build processes remain. Cache/logs are retained privately. No completed CLI
 binary or compiled qualification is claimed. A reviewed build approach that
 fits available resources remains necessary before native admission.
+
+## G05 resource-fit contract — 2026-10-14
+
+To fit the reviewed build into the available RAM, the `build` command now uses
+**one fixed low-memory release-profile contract** defined once and consumed two
+ways so they can never drift:
+
+| Profile field | Value | Cargo environment override |
+| --- | --- | --- |
+| `opt-level` | `0` | `CARGO_PROFILE_RELEASE_OPT_LEVEL=0` |
+| `lto` | `false` | `CARGO_PROFILE_RELEASE_LTO=false` |
+| `codegen-units` | `256` | `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256` |
+| `debug` | `0` | `CARGO_PROFILE_RELEASE_DEBUG=0` |
+| `incremental` | `false` | `CARGO_PROFILE_RELEASE_INCREMENTAL=false` |
+
+These override the source release profile (thin LTO, four codegen units) while
+retaining `CARGO_INCREMENTAL=0`, `--release --locked --jobs 1` and `nice 19`.
+The whole contract is also recorded under `build.inputs.profile`; `status`
+requires **exact equality** against the current contract, so a missing setting,
+an altered value or a different profile invalidates provenance even when the
+binary hash still matches. Source, patch, lock and toolchain bindings are
+unchanged. 256 codegen units is a candidate sizing setting, **not a memory
+ceiling**: monitoring can still overshoot between samples.
+
+RAM monitoring is **opt-in** on the existing supervisor, so every other caller
+keeps its current semantics. When the build supplies the 3,072 MiB floor,
+available RAM is checked immediately before launch and re-sampled at a fixed,
+bounded interval while the owned child runs. `MemAvailable` is trusted only in
+its canonical `MemAvailable: <non-negative int> kB` form: a missing line, a
+non-integer or negative value, a wrong field count or an unrecognized unit all
+fail closed. A reading below the floor, or any unusable reading, stops the owned
+process group with the same unreaped-leader TERM/KILL cleanup and the original
+cutoff, and reports a **nonzero resource stop even if the child later exits
+zero**; no success provenance is written. The stop is bounded by the same
+immutable cutoff as every other step.
+
+A real Root build of the exact resulting binary is still pending, so `qualified`
+stays `false` and the guard stays `false`; this is a build-input/resource-fit
+change, not native runtime admission.

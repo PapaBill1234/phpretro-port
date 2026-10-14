@@ -433,6 +433,51 @@ class ProcessBounds(unittest.TestCase):
             self.assertLessEqual(len(text), 4096 + 128)
             self.assertIn("truncated at limit", text)
 
+    def _resource_stop(self, later):
+        """Run a real leader+TERM-resistant descendant, then feed a bad reading."""
+        readings = iter([host.RAM_MIN_AVAILABLE_BYTES + 1, *later])
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            pidfile = d / "pids"
+            started = time.monotonic()
+            code = host.run_supervised(
+                [sys.executable, "-c", self.GRANDCHILD, str(pidfile)],
+                cwd=d, env={"PATH": "/usr/bin:/bin"}, log_path=d / "run.log",
+                stop_at=future_deadline(20), ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
+                ram_probe=lambda: next(readings), ram_interval=0.2)
+            self.assertEqual(code, host.RESOURCE_STOP_EXIT)  # failure, never the child's 0
+            pids = self._pids(pidfile)  # real children recorded their pids first
+            self.assertTrue(pids)
+            for pid in pids:
+                self._assert_gone(pid)
+            self.assertLess(time.monotonic() - started, 20)  # stopped before cutoff
+            return pids
+
+    def test_resource_stop_cleans_group_on_low_ram(self):
+        self._resource_stop([1])  # below the floor after launch
+
+    def test_resource_stop_cleans_group_on_unknown_ram(self):
+        self._resource_stop([None])  # unusable reading after launch
+
+    def test_resource_stop_pre_launch_fails_closed(self):
+        # A bad reading before launch refuses without starting any child.
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(host.SetupError):
+                host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                    env={"PATH": "/usr/bin:/bin"},
+                                    log_path=Path(directory) / "run.log",
+                                    stop_at=future_deadline(20),
+                                    ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
+                                    ram_probe=lambda: None)
+
+    def test_no_ram_floor_leaves_other_callers_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code = host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                       env={"PATH": "/usr/bin:/bin"},
+                                       log_path=Path(directory) / "run.log",
+                                       stop_at=future_deadline(20))
+            self.assertEqual(code, 0)
+
 
 class ProcStatStrictness(unittest.TestCase):
     def _proc(self, base, entries):
@@ -610,6 +655,43 @@ class ManifestIntegrity(unittest.TestCase):
                     host._ensure_manifest(root, host.RUST_MANIFEST_URL, dest, future_deadline())
 
 
+class RamParsing(unittest.TestCase):
+    def _read(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            meminfo = Path(directory) / "meminfo"
+            meminfo.write_text(text)
+            return host.available_ram_bytes(meminfo)
+
+    def test_canonical_kb_value_parsed(self):
+        self.assertEqual(self._read("MemTotal: 1 kB\nMemAvailable: 3072 kB\n"), 3072 * 1024)
+
+    def test_unknown_unit_fails_closed(self):
+        self.assertIsNone(self._read("MemAvailable: 3072 MB\n"))
+
+    def test_missing_unit_fails_closed(self):
+        self.assertIsNone(self._read("MemAvailable: 3072\n"))
+
+    def test_negative_value_fails_closed(self):
+        self.assertIsNone(self._read("MemAvailable: -1 kB\n"))
+
+    def test_non_integer_value_fails_closed(self):
+        self.assertIsNone(self._read("MemAvailable: many kB\n"))
+
+    def test_missing_line_fails_closed(self):
+        self.assertIsNone(self._read("MemTotal: 4096 kB\n"))
+
+    def test_unreadable_file_fails_closed(self):
+        self.assertIsNone(host.available_ram_bytes(Path("/nonexistent/meminfo")))
+
+    def test_require_available_ram_refuses_none_and_low(self):
+        with self.assertRaises(host.SetupError):
+            host.require_available_ram(None, host.RAM_MIN_AVAILABLE_BYTES)
+        with self.assertRaises(host.SetupError):
+            host.require_available_ram(host.RAM_MIN_AVAILABLE_BYTES - 1,
+                                       host.RAM_MIN_AVAILABLE_BYTES)
+        host.require_available_ram(host.RAM_MIN_AVAILABLE_BYTES, host.RAM_MIN_AVAILABLE_BYTES)
+
+
 class ResourcePreflight(unittest.TestCase):
     def test_low_disk_refused(self):
         low = SimpleNamespace(free=host.DISK_MIN_FREE_BYTES - 1)
@@ -705,9 +787,13 @@ class BuildContract(unittest.TestCase):
             compiler = root / "cargo-fixture"
             compiler.write_text(
                 '#!' + sys.executable + '\n'
-                'import os\nfrom pathlib import Path\n'
+                'import json,os,sys\nfrom pathlib import Path\n'
                 'assert Path("Cargo.toml").is_file(), "missing nested workspace"\n'
-                'target=Path(os.environ["CARGO_TARGET_DIR"])/"release"/"codex"\n'
+                'obs=Path(os.environ["CARGO_TARGET_DIR"])\n'
+                'obs.mkdir(parents=True,exist_ok=True)\n'
+                '(obs/"fixture-observation.json").write_text(\n'
+                '    json.dumps({"argv":sys.argv[1:],"env":dict(os.environ)}))\n'
+                'target=obs/"release"/"codex"\n'
                 'target.parent.mkdir(parents=True,exist_ok=True)\n'
                 'target.write_bytes(b"controlled-build-result")\n'
             )
@@ -721,7 +807,22 @@ class BuildContract(unittest.TestCase):
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
                     patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
                 self.assertEqual(host.command_build(root), 0)
+                # The real subprocess proves the actual argv and profile env it
+                # received, not just the helpers we called.
+                observed = json.loads((host.target_dir(root) / "fixture-observation.json").read_text())
+                self.assertEqual(observed["argv"],
+                                 ["build", "--release", "--locked", "-p", "codex-cli",
+                                  "--bin", "codex", "--jobs", "1"])
+                env = observed["env"]
+                self.assertEqual(env["CARGO_PROFILE_RELEASE_OPT_LEVEL"], "0")
+                self.assertEqual(env["CARGO_PROFILE_RELEASE_LTO"], "false")
+                self.assertEqual(env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"], "256")
+                self.assertEqual(env["CARGO_PROFILE_RELEASE_DEBUG"], "0")
+                self.assertEqual(env["CARGO_PROFILE_RELEASE_INCREMENTAL"], "false")
+                self.assertEqual(env["CARGO_INCREMENTAL"], "0")
                 recorded = host.load_provenance(root)
+                self.assertEqual(recorded["build"]["inputs"]["profile"],
+                                 host.build_profile_contract())
                 compiler.write_text(compiler.read_text() + 'Path("Cargo.lock").write_bytes(b"tampered")\n')
                 with self.assertRaisesRegex(host.SetupError, "lockfile changed"):
                     host.command_build(root)
@@ -747,9 +848,70 @@ class BuildContract(unittest.TestCase):
             self.assertEqual(env["CARGO_HOME"], str(host.cargo_home(root)))
             self.assertEqual(env["CARGO_TARGET_DIR"], str(host.target_dir(root)))
             self.assertEqual(env["HOME"], str(host.home_dir(root)))
-            self.assertEqual(env["CARGO_PROFILE_RELEASE_DEBUG"], "0")
             for banned in ("OPENAI_API_KEY", "CODEX_HOME", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY"):
                 self.assertNotIn(banned, env)
+
+    def test_build_env_carries_the_fixed_profile_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = host.build_env(root)
+            # The env and the recorded contract come from one definition.
+            expected = {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
+                        "CARGO_PROFILE_RELEASE_LTO": "false",
+                        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "256",
+                        "CARGO_PROFILE_RELEASE_DEBUG": "0",
+                        "CARGO_PROFILE_RELEASE_INCREMENTAL": "false"}
+            for name, value in expected.items():
+                self.assertEqual(env[name], value, name)
+            self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+            self.assertEqual(host.build_profile_contract(),
+                             {"opt-level": "0", "lto": "false", "codegen-units": "256",
+                              "debug": "0", "incremental": "false"})
+
+    def test_profile_contract_is_a_single_source_of_truth(self):
+        # Env and provenance contract cannot drift: both derive from RELEASE_PROFILE.
+        self.assertEqual(set(host.build_profile_env()),
+                         {"CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_LTO",
+                          "CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "CARGO_PROFILE_RELEASE_DEBUG",
+                          "CARGO_PROFILE_RELEASE_INCREMENTAL"})
+        for key, value in host.RELEASE_PROFILE:
+            self.assertEqual(host.build_profile_contract()[key], value)
+
+    def test_resource_stop_during_build_writes_no_success_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = host.build_dir(root)
+            workspace = build / "codex-rs"
+            workspace.mkdir(parents=True)
+            (workspace / "Cargo.toml").write_text('[workspace]\n')
+            (workspace / "Cargo.lock").write_bytes(b"fixture lock")
+            compiler = root / "cargo-fixture"
+            # A TERM-resistant long runner, so RAM is sampled while it is alive.
+            compiler.write_text(
+                '#!' + sys.executable + '\n'
+                'import signal,time\n'
+                'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                'time.sleep(120)\n')
+            compiler.chmod(0o700)
+            patch_path = root / "reviewed.patch"
+            patch_path.write_text("controlled patch")
+            deadline = future_deadline(30)
+
+            def readings():
+                yield host.RAM_MIN_AVAILABLE_BYTES + 1  # pre-launch passes
+                while True:
+                    yield 1  # then drops below the floor
+
+            seq = readings()
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "available_ram_bytes", lambda *a, **k: next(seq)), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
+                with self.assertRaises(host.SetupError):
+                    host.command_build(root)
+            self.assertFalse(host.provenance_path(root).exists())  # no success provenance
 
     def test_state_never_claims_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -775,7 +937,8 @@ class BuildBinding(unittest.TestCase):
                       "inputs": {"source": host.CODEX_PIN, "patch": patch or digest,
                                  "lock_sha256": host.LOCK_BUILD_SHA256,
                                  "toolchain": host.RUST_VERSION, "cargo_sha256": cargo or cargo_hash,
-                                 "rustc_sha256": rustc or rustc_hash}},
+                                 "rustc_sha256": rustc or rustc_hash,
+                                 "profile": host.build_profile_contract()}},
         })
         return digest
 
@@ -805,6 +968,45 @@ class BuildBinding(unittest.TestCase):
                 data["build"]["inputs"]["lock_sha256"] = value
                 host.save_provenance(root, data)
                 self.assertFalse(host.build_state(root)["ok"])
+
+    def test_each_profile_field_mutation_or_removal_is_stale(self):
+        # Every field is bound: altering one value, dropping the key or the whole
+        # profile, or recording another profile must invalidate provenance even
+        # though the binary hash still matches.
+        base = host.build_profile_contract()
+        for field in list(base):
+            for mutated in ({**base, field: base[field] + "x"}, {**base, field: "MUTATED"},
+                            {k: v for k, v in base.items() if k != field}):
+                with self.subTest(field=field, mutated=mutated):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        self._write(root)
+                        data = host.load_provenance(root)
+                        data["build"]["inputs"]["profile"] = mutated
+                        host.save_provenance(root, data)
+                        state = host.build_state(root)
+                        self.assertFalse(state["ok"])
+                        self.assertTrue(state["stale"])
+
+    def test_missing_or_other_profile_is_stale(self):
+        for mutated in (None, {"release": True}, {}, {"opt-level": "0"}):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self._write(root)
+                data = host.load_provenance(root)
+                if mutated is None:
+                    del data["build"]["inputs"]["profile"]
+                else:
+                    data["build"]["inputs"]["profile"] = mutated
+                host.save_provenance(root, data)
+                self.assertFalse(host.build_state(root)["ok"], mutated)
+
+    def test_unaltered_profile_stays_fresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root)
+            self.assertTrue(host.build_state(root)["ok"])
+            self.assertFalse(host.build_state(root)["stale"])
 
 
 class LockAndProvenance(unittest.TestCase):
