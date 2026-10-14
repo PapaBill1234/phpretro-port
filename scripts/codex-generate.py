@@ -67,27 +67,105 @@ ALLOWED_ROLES = ("system", "developer", "user", "assistant", "tool")
 # Exact installed event method for a provisional assistant delta. Nothing is
 # inferred from a substring: only this named method, matching the turn, is read.
 DELTA_METHOD = "item/agentMessage/delta"
-# Launch-config overrides that remove native side-effect authority BEFORE a turn
-# (isolation is established at launch, not by rejecting events afterwards).
-GENERATION_CONFIG_OVERRIDES = (
-    ("model_provider", '"openai"'),
-    ("forced_login_method", '"chatgpt"'),
-    ("model", '"' + MODEL + '"'),
-    ("sandbox_mode", '"read-only"'),
-    ("approval_policy", '"never"'),
-    ("mcp_servers", "{}"),
-    ("features.shell_tool", "false"),
-    ("features.multi_agent", "false"),
-    ("features.hooks", "false"),
-    ("tools.web_search", "false"),
-    ("tools.view_image", "false"),
-    ("tools.apply_patch", "false"),
-    ("tools.unified_exec", "false"),
-    ("project_doc_max_bytes", "0"),
+# Side-effecting features that must be effectively DISABLED before a turn. Every
+# name is a recognized feature in the installed CLI's `features list` (verified
+# offline). We disable each with `-c features.<name>=false` (the documented
+# equivalent of `features disable`); an unrecognized name would be a silent
+# no-op, so `verify_tool_policy` refuses when any of these is not recognized.
+SIDE_EFFECTING_FEATURES = (
+    "shell_tool",
+    "shell_snapshot",
+    "unified_exec",
+    "unified_exec_tty",
+    "apply_patch_freeform",
+    "view_image",
+    "image_generation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "browser_annotation_api",
+    "in_app_browser",
+    "computer_use",
+    "in_app_local_automation",
+    "apps",
+    "enable_mcp_apps",
+    "plugins",
+    "plugin_sharing",
+    "remote_plugin",
+    "plugin_hooks",
+    "hooks",
+    "multi_agent",
+    "multi_agent_v2",
+    "tool_call_mcp_elicitation",
+    "standalone_web_search",
 )
-# Feature keys whose absence on the installed CLI means isolation can NOT be
-# established at the config layer. A missing/unverifiable key blocks dispatch.
-REQUIRED_FEATURE_KEYS = ("shell_tool", "multi_agent", "hooks")
+# Additional relevant capabilities the installed audit identified outside a
+# keyword-based guard: they must ALSO be provably inactive before a turn.
+EXTRA_RELEVANT_FEATURES = (
+    "code_mode_host",
+    "skill_search",
+    "sleep_tool",
+    "goals",
+    "worktrees",
+    "workspace_dependencies",
+)
+# Every capability that must be provably inactive before a turn.
+RELEVANT_FEATURES = SIDE_EFFECTING_FEATURES + EXTRA_RELEVANT_FEATURES
+# Candidate overrides probed against the real installed metadata (never assumed).
+FEATURE_OVERRIDES = tuple(("features." + name, "false") for name in RELEVANT_FEATURES)
+# ThreadStartParams fields the design once relied on for isolation. The installed
+# generated schema (v2) does NOT define them, so they cannot isolate a turn.
+REQUIRED_THREAD_FIELDS = (
+    "environments",
+    "dynamicTools",
+    "selectedCapabilityRoots",
+    "allowProviderModelFallback",
+)
+# Recognized, currently-true features that merely CONTAIN a side-effect keyword
+# but are not model-invokable tools; excluding them avoids false blocks.
+BENIGN_TRUE_FEATURES = frozenset({"skill_mcp_dependency_install", "compaction_image_budget"})
+# Keyword patterns used to detect a NEW/unknown side-effecting feature that is
+# active but not in the disabled set (an "unknown critical" flag => refuse).
+_SIDE_EFFECT_PATTERNS = (
+    "shell",
+    "exec",
+    "apply_patch",
+    "view_image",
+    "image_generation",
+    "browser",
+    "web_search",
+    "computer_use",
+    "mcp",
+    "multi_agent",
+    "hooks",
+    "plugin",
+    "apps",
+)
+
+
+def generation_config_overrides():
+    """Launch-config overrides that remove native side-effect authority BEFORE a turn.
+
+    These are recognized installed config keys only: the base sandbox/approval/
+    MCP/project-doc controls, the top-level ``web_search`` mode, and a
+    ``features.<name>=false`` override for every side-effecting feature.
+    """
+    overrides = [
+        ("model_provider", '"openai"'),
+        ("forced_login_method", '"chatgpt"'),
+        ("model", '"' + MODEL + '"'),
+        ("sandbox_mode", '"read-only"'),
+        ("approval_policy", '"never"'),
+        ("mcp_servers", "{}"),
+        ("project_doc_max_bytes", "0"),
+        ("web_search", '"disabled"'),
+    ]
+    for name in RELEVANT_FEATURES:
+        overrides.append(("features." + name, "false"))
+    return tuple(overrides)
+
+
+GENERATION_CONFIG_OVERRIDES = generation_config_overrides()
 # Item types that are not text generation. Any other item type fails the turn,
 # because this slice is text-only and must never let the model drive host
 # execution/editing/search through a native tool.
@@ -106,10 +184,10 @@ def generation_codex_command(binary: str = "codex"):
     """App-server launch config that disables side-effecting builtins.
 
     Every override here removes native side-effect authority BEFORE a turn:
-    read-only sandbox, never-approve, no MCP connectors, and the shell/agent/
-    hook/web/apply-patch/view-image/unified-exec tools off. A key the installed
-    CLI does not recognize must not be silently ignored — ``verify_feature_keys``
-    blocks dispatch when a required feature key is unverifiable.
+    read-only sandbox, never-approve, no MCP connectors, ``web_search=disabled``,
+    and a ``features.<name>=false`` override for every side-effecting feature.
+    A key the installed CLI does not recognize must not be silently ignored —
+    ``verify_tool_policy`` blocks dispatch when a required feature is unverifiable.
     """
     binary = bridge.resolve_codex_binary(binary) if binary == "codex" else binary
     command = [binary, "app-server", "--listen", "stdio://"]
@@ -118,54 +196,114 @@ def generation_codex_command(binary: str = "codex"):
     return command
 
 
-def _feature_probe_environment():
-    """Return an allowlisted env with EMPTY HOME/CODEX_HOME (offline, no login)."""
-    home = tempfile.mkdtemp(prefix="codex-empty-home-")
-    env = bridge.child_environment()
-    env["HOME"] = home
-    env["CODEX_HOME"] = os.path.join(home, ".codex")
-    return env
+def probe_feature_list(binary: str, overrides=()):
+    """Offline `features list` metadata probe (EMPTY HOME/CODEX_HOME, no login).
 
-
-def probe_feature_keys(binary: str) -> str:
-    """Offline `features list` metadata probe. Never authenticates or runs a model."""
-    try:
-        completed = subprocess.run(
-            [binary, "features", "list"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=15,
-            env=_feature_probe_environment(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise bridge.BridgeError(
-            "feature_policy", "Installed Codex feature list cannot be read; refusing to dispatch."
-        ) from None
-    text = (completed.stdout or b"").decode("utf-8", "replace") + (completed.stderr or b"").decode(
-        "utf-8", "replace"
-    )
-    if completed.returncode != 0 or not text.strip():
-        raise bridge.BridgeError(
-            "feature_policy", "Installed Codex feature list is unavailable; refusing to dispatch."
-        )
-    return text
-
-
-def verify_feature_keys(binary: str, probe=probe_feature_keys) -> bool:
-    """Fail closed unless the installed CLI recognizes every required key.
-
-    An unsupported key would be silently ignored, leaving a side-effecting
-    builtin enabled, so this must block before a turn. ``probe`` is injectable
-    for tests; the production probe is offline and never logs in or calls a model.
+    Runs the RAW installed binary (never the PATH wrapper, which rewrites
+    ``CODEX_HOME``) and parses STDOUT only with the installed CLI's exact line
+    format ``<name>  <stage>  <true|false>``. stderr warnings are ignored so a
+    key name mentioned only in a warning can never satisfy a check. ``overrides``
+    are ``(key, value)`` pairs applied as ``-c key=value`` BEFORE the subcommand,
+    so the returned states are the ACTUAL effective states, not assumed ones.
+    The temp dir is always cleaned up.
     """
-    text = probe(binary)
-    missing = [key for key in REQUIRED_FEATURE_KEYS if key not in text]
-    if missing:
-        raise bridge.BridgeError(
-            "feature_policy",
-            "Installed Codex does not recognize the required isolation features; refusing to dispatch.",
-        )
-    return True
+    home = tempfile.mkdtemp(prefix="codex-empty-home-")
+    try:
+        codex_home = os.path.join(home, ".codex")
+        os.makedirs(codex_home, mode=0o700, exist_ok=True)
+        env = bridge.child_environment()
+        env["HOME"] = home
+        env["CODEX_HOME"] = codex_home
+        command = [binary]
+        for key, value in overrides:
+            command += ["-c", key + "=" + value]
+        command += ["features", "list"]
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=20,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise bridge.BridgeError(
+                "feature_policy", "Installed Codex feature list cannot be read; refusing to dispatch."
+            ) from None
+        if completed.returncode != 0:
+            raise bridge.BridgeError(
+                "feature_policy", "Installed Codex feature list is unavailable; refusing to dispatch."
+            )
+        features = {}
+        for line in completed.stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] in ("true", "false"):
+                features[parts[0]] = {"stage": parts[1], "state": parts[-1] == "true"}
+        if not features:
+            raise bridge.BridgeError(
+                "feature_policy", "Installed Codex feature list is empty; refusing to dispatch."
+            )
+        return features
+    finally:
+        import shutil
+
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _is_side_effecting(name: str) -> bool:
+    return any(pattern in name for pattern in _SIDE_EFFECT_PATTERNS)
+
+
+def thread_params_supported(binary: str) -> bool:
+    """Whether the installed ThreadStartParams schema defines the isolation fields.
+
+    The installed generated schema (v2) does not, so this is fail-closed False:
+    empty/ignored thread fields cannot isolate a turn. Injectable for tests.
+    """
+    return False
+
+
+def qualify_native_contract(
+    binary: str,
+    probe=probe_feature_list,
+    thread_probe=thread_params_supported,
+) -> dict:
+    """Qualify the installed contract for a tool-free turn, or report why not.
+
+    Probes the ACTUAL candidate overrides (never manufactures state): runs
+    ``features list`` once at baseline and once with ``FEATURE_OVERRIDES``
+    applied, then requires every ``RELEVANT_FEATURES`` capability to read
+    ``false`` in the CANDIDATE output. Also rejects a recognized, active
+    side-effecting feature outside the guarded set, and any unsupported
+    ThreadStartParams isolation field. ``qualified`` is True only when every
+    condition holds; otherwise generation MUST block.
+    """
+    baseline = probe(binary, overrides=())
+    candidate = probe(binary, overrides=FEATURE_OVERRIDES)
+    reasons = []
+    for name in RELEVANT_FEATURES:
+        info = candidate.get(name)
+        if info is None:
+            reasons.append("unrecognized:" + name)
+        elif info["state"]:
+            reasons.append("active:" + name)
+    for name, info in candidate.items():
+        if (
+            info["state"]
+            and info["stage"] not in ("removed", "deprecated")
+            and name not in RELEVANT_FEATURES
+            and name not in BENIGN_TRUE_FEATURES
+            and _is_side_effecting(name)
+        ):
+            reasons.append("unknown_active:" + name)
+    if not thread_probe(binary):
+        reasons.append("thread_params_unsupported")
+    return {
+        "qualified": not reasons,
+        "reasons": tuple(reasons),
+        "baseline": baseline,
+        "candidate": candidate,
+    }
 
 
 def verify_version(binary: str, expected: str = CODEX_VERSION) -> str:
@@ -321,6 +459,12 @@ def _delta_text(params):
 
 def run_turn(client, request, emit, workspace: Path):
     """Drive one native turn; yield deltas; return the validated final payload."""
+    # NOTE: the installed generated ThreadStartParams schema (v2) does NOT define
+    # `environments`, `dynamicTools`, `selectedCapabilityRoots` or
+    # `allowProviderModelFallback`. They are omitted rather than sent as empty
+    # no-ops, because sending them implies isolation they do not provide. Tool
+    # isolation is established (or the turn is blocked) by the pre-turn contract
+    # qualification, not by these fields.
     thread_params = {
         "model": MODEL,
         "modelProvider": PROVIDER,
@@ -329,10 +473,6 @@ def run_turn(client, request, emit, workspace: Path):
         "sandbox": "read-only",
         "baseInstructions": "",
         "developerInstructions": GENERATION_DEVELOPER_INSTRUCTIONS,
-        "environments": [],
-        "dynamicTools": [],
-        "selectedCapabilityRoots": [],
-        "allowProviderModelFallback": False,
         "ephemeral": True,
     }
     thread = client.request("thread/start", thread_params)
@@ -457,8 +597,8 @@ def _empty_workspace(directory: Path) -> Path:
     return workspace
 
 
-def execute(args, command=None, emit=None):
-    """Run one generation. ``command``/``emit`` are injectable for tests."""
+def execute(args, command=None, emit=None, qualify=None):
+    """Run one generation. ``command``/``emit``/``qualify`` are injectable for tests."""
     directory = bridge.private_directory(args.state_dir)
     _empty_workspace(directory)
     result = {"schema": SCHEMA, "ok": True, "provider": "codex-chatgpt-subscription", "model": MODEL}
@@ -480,11 +620,24 @@ def execute(args, command=None, emit=None):
                     "off_peak_paused",
                     "Generation is paused outside the verified off-peak window.",
                 ) from None
-            if command is None:
+            # Contract qualification runs BEFORE the app-server (account/model/
+            # thread/turn) is ever started: an unprovable tool-isolation contract
+            # must block without touching the account or a model.
+            if qualify is not None:
+                qualification = qualify()
+            elif command is None:
                 binary = bridge.resolve_codex_binary(args.codex_bin)
                 verify_version(binary)
-                verify_feature_keys(binary)
-                command = generation_codex_command(binary)
+                qualification = qualify_native_contract(binary)
+            else:
+                qualification = {"qualified": True}  # caller-emulated qualified host
+            if not qualification.get("qualified"):
+                raise bridge.BridgeError(
+                    "unsupported_contract",
+                    "Native generation is blocked: the installed contract cannot prove tool isolation.",
+                )
+            if command is None:
+                command = generation_codex_command(bridge.resolve_codex_binary(args.codex_bin))
             client = bridge.RpcClient(command, args.timeout)
         except bridge.BridgeError as error:
             emit({"type": "error", "code": error.code, "message": str(error)})
