@@ -64,7 +64,7 @@ class FakeHost:
 
     def __init__(self, tmp, prereq=True, build_code=0, prep_code=0, test_code=0,
                  test_output=None, patch_dir=None, fail_apply=False, fail_source=None,
-                 mutate_binary=False):
+                 mutate_binary=False, build_log_text="", prep_log_text=""):
         self.tmp = Path(tmp)
         self.calls = []
         self.applied = []
@@ -83,6 +83,8 @@ class FakeHost:
         self._fail_apply = fail_apply
         self._fail_source = fail_source
         self._mutate_binary = mutate_binary
+        self._build_log_text = build_log_text
+        self._prep_log_text = prep_log_text
         self._gate_calls = 0
         self._gate_cutoff_calls = 0
 
@@ -192,9 +194,9 @@ class FakeHost:
                 self._binary.write_bytes(b"mutated-after-tests")
             return self._test_code
         if stage == "prepare-tests":
-            Path(log_path).write_text("")
+            Path(log_path).write_text(self._prep_log_text)
             return self._prep_code
-        Path(log_path).write_text("")
+        Path(log_path).write_text(self._build_log_text)
         return self._build_code
 
     # --- stop-receipt prerequisite ---
@@ -501,6 +503,102 @@ class ResultEvaluationTests(unittest.TestCase):
         self.assertTrue(ci.evaluate_qualification(ci.parse_cargo_test_output(output))["ok"])
 
 
+COMPILER_LOG_SAMPLE = """\
+   Compiling codex-core v0.1.0 (/home/runner/work/repo/repo/build/codex-rs/core)
+warning: unused import: `std::fmt::Write`
+  --> /home/runner/work/repo/repo/build/codex-rs/core/src/tools/registry.rs:12:5
+   |
+12 | use std::fmt::Write;
+   |     ^^^^^^^^^^^^^^^
+error[E0308]: mismatched types
+  --> /home/runner/work/repo/repo/build/codex-rs/core/src/tools/spec_plan_tests.rs:88:9
+   |
+88 |     let n: u8 = "twelve";
+   |            ^^ expected `u8`, found `&str`
+error: could not compile `codex-core` (lib test) due to 1 previous error
+Finished `test` profile [release] in 402.1s
+"""
+
+
+class FailureDiagnosticTests(unittest.TestCase):
+    """The bounded, sanitized compiler-diagnostic excerpt for a failure receipt."""
+
+    def test_only_diagnostic_shaped_lines_are_kept(self):
+        excerpt = ci.sanitize_compiler_excerpt(COMPILER_LOG_SAMPLE)
+        self.assertEqual(excerpt["lines"], [
+            "warning: unused import: `std::fmt::Write`",
+            "--> <path>:12:5",
+            "error[E0308]: mismatched types",
+            "--> <path>:88:9",
+            "error: could not compile `codex-core` (lib test) due to 1 previous error",
+        ])
+        self.assertFalse(excerpt["truncated"])
+
+    def test_absolute_paths_home_and_env_values_are_redacted(self):
+        blob = json.dumps(ci.sanitize_compiler_excerpt(COMPILER_LOG_SAMPLE))
+        self.assertNotIn("/home/runner", blob)
+        self.assertNotIn("repo/build", blob)
+        env_line = ci.sanitize_compiler_excerpt(
+            "error: could not read CARGO_HOME=/home/runner/.cargo\n"
+            "error: HOME is $HOME/hidden\n")
+        self.assertEqual(env_line["lines"], [
+            "error: could not read CARGO_HOME=<redacted>",
+            "error: HOME is <home><path>",
+        ])
+        self.assertNotIn("runner", json.dumps(env_line))
+        url_line = ci.sanitize_compiler_excerpt(
+            "error: failed to fetch https://crates.io/api/v1/crates\n")
+        self.assertEqual(url_line["lines"], ["error: failed to fetch <url>"])
+
+    def test_relative_paths_are_preserved(self):
+        excerpt = ci.sanitize_compiler_excerpt("--> core/src/tools/registry.rs:12:5\n")
+        self.assertEqual(excerpt["lines"], ["--> core/src/tools/registry.rs:12:5"])
+
+    def test_line_cap_is_hard(self):
+        text = "".join("error: e%d\n" % i for i in range(100))
+        excerpt = ci.sanitize_compiler_excerpt(text)
+        self.assertEqual(len(excerpt["lines"]), ci.DIAGNOSTIC_MAX_LINES)
+        self.assertTrue(excerpt["truncated"])
+        self.assertEqual(excerpt["lines"][0], "error: e0")
+        self.assertEqual(excerpt["lines"][-1], "error: e39")
+
+    def test_character_cap_is_hard(self):
+        text = "".join("error: %s\n" % ("x" * 200) for _ in range(40))
+        excerpt = ci.sanitize_compiler_excerpt(text)
+        self.assertTrue(excerpt["truncated"])
+        self.assertLessEqual(sum(len(line) + 1 for line in excerpt["lines"]),
+                             ci.DIAGNOSTIC_MAX_CHARS)
+        self.assertGreaterEqual(len(excerpt["lines"]), 1)
+
+    def test_single_overlong_line_is_hard_truncated(self):
+        excerpt = ci.sanitize_compiler_excerpt("error: %s\n" % ("y" * 9000))
+        self.assertEqual(len(excerpt["lines"]), 1)
+        self.assertEqual(len(excerpt["lines"][0]), ci.DIAGNOSTIC_MAX_CHARS)
+        self.assertTrue(excerpt["truncated"])
+
+    def test_non_diagnostic_log_yields_none(self):
+        self.assertIsNone(ci.sanitize_compiler_excerpt(""))
+        self.assertIsNone(ci.sanitize_compiler_excerpt(
+            "   Compiling codex-core v0.1.0\nFinished `test` profile in 1.2s\n"))
+
+    def test_stage_diagnostic_is_none_for_missing_or_absent_log(self):
+        self.assertIsNone(ci._stage_diagnostic(None))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(ci._stage_diagnostic(Path(tmp) / "does-not-exist.log"))
+
+    def test_stage_diagnostic_reads_only_a_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prep.log"
+            filler = "note: boilerplate line\n" * \
+                (ci.DIAGNOSTIC_TAIL_BYTES // 22 + 64)
+            path.write_text("error: first-line-outside-the-tail\n" + filler +
+                            "error: last prior error\n")
+            excerpt = ci._stage_diagnostic(path)
+            self.assertIsNotNone(excerpt)
+            self.assertEqual(excerpt["lines"], ["error: last prior error"])
+            self.assertNotIn("first-line-outside-the-tail", json.dumps(excerpt))
+
+
 class ArtifactAllowlistTests(unittest.TestCase):
     def _artifact_dir(self, tmp):
         patch_dir = Path(tmp) / "patches"
@@ -600,13 +698,17 @@ class OrchestrationFixtureTests(unittest.TestCase):
     def test_qualified_run_uses_one_deadline_and_records_results(self):
         with tempfile.TemporaryDirectory() as tmp:
             patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
-            host = FakeHost(tmp, patch_dir=patch_dir)
+            # Non-empty build/prepare logs must never surface on a qualified run.
+            host = FakeHost(tmp, patch_dir=patch_dir,
+                            build_log_text=COMPILER_LOG_SAMPLE,
+                            prep_log_text=COMPILER_LOG_SAMPLE)
             # Production target already present; test patches rewrite targets.
             host._build = build
             host._test_output = passing_output(ci.EXPECTED_TESTS)
             qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
                                                    lock_digest)
             self.assertTrue(qualified, reason)
+            self.assertIsNone(receipt["failure"])
             # One single deadline across every supervised stage.  The build stage is
             # the accepted compile scope ("supervise"); the test stages keep their own
             # truthful wrapper stage names.
@@ -718,6 +820,66 @@ class OrchestrationFixtureTests(unittest.TestCase):
             self.assertIsNone(failure["compiler_child_status"])
             self.assertIsNone(failure["stop_reason"])
             self.assertEqual(host._attempts[-1][2]["stage"], "prepare-tests")
+
+    def test_prepare_tests_failure_carries_bounded_sanitized_diagnostic(self):
+        # The failing stage is otherwise unrecoverable (the artifact is
+        # receipt-only), so the receipt carries one bounded, redacted excerpt.
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
+            host = FakeHost(tmp, prep_code=1, patch_dir=patch_dir,
+                            prep_log_text=COMPILER_LOG_SAMPLE)
+            host._build = build
+            qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
+                                                   lock_digest)
+            self.assertFalse(qualified)
+            failure = receipt["failure"]
+            self.assertEqual(failure["stage"], "prepare-tests")
+            # No fabricated supervisor fields, and the diagnostic is a bounded,
+            # redacted, diagnostic-only object.
+            self.assertIsNone(failure["compiler_cleanup"])
+            self.assertIsNone(failure["compiler_child_status"])
+            self.assertEqual(set(failure["diagnostic"]), {"lines", "truncated"})
+            self.assertIn("error[E0308]: mismatched types", failure["diagnostic"]["lines"])
+            self.assertLessEqual(len(failure["diagnostic"]["lines"]), ci.DIAGNOSTIC_MAX_LINES)
+            blob = json.dumps(receipt)
+            self.assertNotIn("/home/runner", blob)
+            self.assertNotIn("repo/build", blob)
+            self.assertFalse(receipt["native_admission"])
+            self.assertTrue(receipt["guard_unchanged"])
+
+    def test_build_failure_carries_bounded_sanitized_diagnostic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
+            host = FakeHost(tmp, build_code=1, patch_dir=patch_dir,
+                            build_log_text=COMPILER_LOG_SAMPLE)
+            host._build = build
+            qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
+                                                   lock_digest)
+            self.assertFalse(qualified)
+            failure = receipt["failure"]
+            self.assertEqual(failure["stage"], "build")
+            self.assertIn("error[E0308]: mismatched types", failure["diagnostic"]["lines"])
+            self.assertNotIn("/home/runner", json.dumps(receipt))
+
+    def test_test_patch_failure_never_inherits_the_build_log_diagnostic(self):
+        # The build succeeded and its log holds decoy diagnostics; a later
+        # test-patches failure has no log of its own, so its receipt must not
+        # present the build's excerpt as its own evidence.
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
+            host = FakeHost(tmp, build_code=0, fail_apply=True, patch_dir=patch_dir,
+                            build_log_text=COMPILER_LOG_SAMPLE)
+            host._build = build
+            qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
+                                                   lock_digest)
+            self.assertFalse(qualified)
+            failure = receipt["failure"]
+            self.assertEqual(failure["stage"], "test-patches")
+            self.assertIsNone(failure["diagnostic"])
+            blob = json.dumps(receipt)
+            self.assertNotIn("error[E0308]", blob)
+            self.assertNotIn("warning: unused", blob)
+            self.assertNotIn("could not compile", blob)
 
     def test_test_patch_failure_is_stage_scoped_without_stale_compiler_state(self):
         with tempfile.TemporaryDirectory() as tmp:

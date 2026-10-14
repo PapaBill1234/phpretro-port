@@ -90,6 +90,26 @@ is unchanged.
     cause. Each stage boundary clears the outcome so a completed build's state
     can never leak into a later stage. An `OSError` yields a truthfully staged
     receipt with no exception text.
+    The failing supervised stage also contributes at most one bounded
+    **diagnostic** excerpt (`failure.diagnostic`), because the failure artifact is
+    otherwise receipt-only and a hosted `cargo` failure (observed as a bare
+    `exit 101` in `prepare-tests`) leaves no compiler text anywhere else:
+    - the excerpt is **stage-scoped**: every stage boundary assigns the log
+      reference it owns (`build`, `prepare-tests`, `offline-tests`) or `null`
+      (`preflight`, `source`, `toolchain`, `prepare`, `test-patches`), so a
+      `test-patches` failure can never present the completed build's log as its
+      own evidence, and a stage with no log of its own always yields `null`;
+    - only diagnostic-shaped log lines are kept — `error`, `error[E…]`, `-->`
+      and `warning: unused` — so cargo boilerplate, source snippets and progress
+      lines are dropped;
+    - absolute paths, URLs, the literal `$HOME` and `KEY=value` environment
+      values are redacted (`<path>`, `<url>`, `<home>`, `<redacted>`); relative
+      paths such as `core/src/tools/registry.rs` are kept;
+    - at most the **last 256 KiB** of the stage log is read, and the excerpt is
+      hard-capped to **40 lines / 4000 characters** with a `truncated` flag;
+    - a missing, unreadable or diagnostic-free log yields `null` — nothing is
+      fabricated. No full log, environment dump or secret is published, and the
+      artifact on failure remains the receipt alone.
 12. **Fresh atomic artifact.** The upload directory is published by an atomic
     replace of a dedicated staging directory that contains only the receipt (on
     failure) or the binary, receipt, `LICENSE` and `NOTICE` (on success). A
@@ -158,7 +178,9 @@ can never be downloaded. The receipt records the exact build inputs (source pin,
 patch, lock, toolchain, profile, binary digest), the test-patch digests and
 observed result names, the GitHub run/ref/SHA identity, timing and resources,
 the curated failure stage/scope/stop reason (no fabricated cleanup or resource
-cause), and always `native_admission: false` with the guard unchanged.
+cause), the bounded redacted `diagnostic` excerpt of the failing stage (≤ 40
+lines / ≤ 4000 chars; `null` when there is none), and always
+`native_admission: false` with the guard unchanged.
 
 ## Remaining gaps
 

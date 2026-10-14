@@ -49,7 +49,13 @@ Contract enforced here
   wrapper stage name, so the accepted helper records the compiler scope as
   ``not_applicable`` outside the build stage.  No child-cleanup result and no
   resource cause is ever fabricated, and an ``OSError`` yields a receipt with no
-  exception text.
+  exception text.  The failing stage's receipt also carries one bounded,
+  sanitized ``diagnostic`` excerpt of *its own* stage log (every stage boundary
+  assigns the log reference, so no stage inherits another's): only
+  diagnostic-shaped log lines, with
+  absolute paths/``$HOME``/environment values redacted and hard caps on lines
+  and characters; the artifact itself stays receipt-only and no full log,
+  environment or secret is ever published.
 * The artifact is published into a fresh, dedicated directory by an atomic
   replace: compiled binary + sanitized receipt + LICENSE/NOTICE only on full
   success (all four mandatory), and a truthful receipt only on failure with no
@@ -437,7 +443,91 @@ def evaluate_qualification(parsed, expected=EXPECTED_TESTS):
     return {"ok": not errors, "errors": errors, "observed_passed": observed}
 
 
-def _sanitized_failure(wrapper_stage, outcome, reason):
+# --- bounded, sanitized failure diagnostics ---------------------------------
+# On failure the artifact stays receipt-only, so the failing stage's compiler
+# text is otherwise unrecoverable from CI (the hosted runs returned only
+# ``exit 101``).  A strictly bounded, redacted excerpt of *diagnostic-shaped*
+# lines is therefore carried in the failure receipt: only lines that look like
+# rustc/cargo diagnostics are kept, absolute paths / ``$HOME`` / environment
+# values are redacted, and the line and character counts are hard-capped.
+DIAGNOSTIC_MAX_LINES = 40
+DIAGNOSTIC_MAX_CHARS = 4000
+DIAGNOSTIC_TAIL_BYTES = 256 * 1024  # read at most this much of the stage log
+DIAGNOSTIC_LINE_RE = re.compile(
+    r"^(?:error\b|error\[[0-9A-Za-z]+\]|warning: unused|-->)")
+# Only an *absolute* path is redacted: the leading ``/`` must not follow a
+# path-ish character, so a relative ``core/src/...`` path is preserved verbatim
+# while ``/home/runner/...`` (after the line start or any separator) is not.
+DIAGNOSTIC_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.\-])/[^\s:`'\"()\[\],]*")
+DIAGNOSTIC_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://\S*")
+DIAGNOSTIC_ENV_VALUE_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})=\S+")
+
+
+def _redact_diagnostic_line(line):
+    """Redact absolute paths, URLs, ``$HOME`` and ``KEY=value`` environment values."""
+    line = DIAGNOSTIC_URL_RE.sub("<url>", line)
+    line = line.replace("$HOME", "<home>")
+    line = DIAGNOSTIC_ABS_PATH_RE.sub("<path>", line)
+    return DIAGNOSTIC_ENV_VALUE_RE.sub(r"\1=<redacted>", line)
+
+
+def sanitize_compiler_excerpt(text, max_lines=DIAGNOSTIC_MAX_LINES,
+                              max_chars=DIAGNOSTIC_MAX_CHARS):
+    """A bounded, redacted excerpt of compiler diagnostics, else ``None``.
+
+    Only diagnostic-shaped lines are kept (``error``, ``error[E...]``, ``-->``,
+    ``warning: unused``); the kept lines are redacted and then hard-capped to
+    ``max_lines`` lines and ``max_chars`` characters.  ``truncated`` records that
+    a cap dropped further lines.  Nothing is invented: a log with no
+    diagnostic-shaped line yields ``None``.
+    """
+    kept = []
+    truncated = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not DIAGNOSTIC_LINE_RE.match(line):
+            continue
+        if len(kept) >= max_lines:
+            truncated = True
+            break
+        kept.append(_redact_diagnostic_line(line))
+    if not kept:
+        return None
+    lines = []
+    used = 0
+    for line in kept:
+        if used + len(line) + 1 > max_chars:
+            truncated = True
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if not lines:  # one line already over the character cap: hard-truncate it
+        lines = [kept[0][:max_chars]]
+        truncated = True
+    return {"lines": lines, "truncated": truncated}
+
+
+def _stage_diagnostic(log_path):
+    """Bounded sanitized diagnostics from a failing stage log, else ``None``.
+
+    At most ``DIAGNOSTIC_TAIL_BYTES`` are read from the end of the log; a
+    missing, unreadable or diagnostic-free log yields ``None`` rather than any
+    fabricated text.
+    """
+    if log_path is None:
+        return None
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - DIAGNOSTIC_TAIL_BYTES))
+            tail = handle.read(DIAGNOSTIC_TAIL_BYTES)
+    except OSError:
+        return None
+    return sanitize_compiler_excerpt(tail.decode("utf-8", errors="replace"))
+
+
+def _sanitized_failure(wrapper_stage, outcome, reason, diagnostic=None):
     """Curated failure evidence from the real supervisor outcome; no exception text."""
     return {
         "stage": wrapper_stage,
@@ -448,6 +538,7 @@ def _sanitized_failure(wrapper_stage, outcome, reason):
         "ram_floor_bytes": outcome.get("ram_floor_bytes"),
         "compiler_child_status": outcome.get("compiler_child_status"),
         "compiler_cleanup": outcome.get("compiler_cleanup"),
+        "diagnostic": diagnostic,
     }
 
 
@@ -613,16 +704,19 @@ def _load_host(path=HOST_PATH):
     return module
 
 
-def _enter_stage(outcome, stage):
+def _enter_stage(outcome, stage, log_path=None):
     """Reset the caller-owned supervisor outcome to the truthful current stage.
 
     Every stage boundary clears the dict so a failure never reuses the previous
     stage's curated fields (a stale ``compiler_cleanup`` from a completed build
-    must never be attributed to a later stage).
+    must never be attributed to a later stage).  It also returns the log path
+    this stage may write — ``None`` for a stage that has no log of its own — and
+    every boundary assigns that return value, so a failure can never present an
+    earlier stage's log as its own diagnostic evidence.
     """
     outcome.clear()
     outcome["stage"] = stage
-    return outcome
+    return log_path
 
 
 def _supervised(host, argv, cwd, env, log_path, deadline, outcome):
@@ -688,6 +782,9 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
     deadline = None
     wrapper_stage = "gate"
     outcome = {"stage": wrapper_stage}
+    # The supervised stage currently running; its log is the only source for the
+    # bounded diagnostic excerpt in the failure receipt.
+    stage_log = None
 
     missing = check_prerequisite(host)
     if missing:
@@ -715,20 +812,20 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
         with child_environment(environ, home):
             with scoped_gate_cutoff(host, deadline):
                 wrapper_stage = "preflight"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage)
                 # A fresh checkout has no private build root yet, and the disk/
                 # RAM preflight must not fail on the absent directory itself.
                 # Creating the root is idempotent and precedes any heavy work.
                 private_root.mkdir(parents=True, exist_ok=True)
                 resources = host.preflight_resources(private_root)
                 wrapper_stage = "source"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage)
                 host.ensure_source(host.ROOT, deadline=deadline)
                 wrapper_stage = "toolchain"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage)
                 cargo = host.ensure_toolchain(host.ROOT, deadline=deadline)
                 wrapper_stage = "prepare"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage)
                 build, patch, digest = host.prepare_build(host.ROOT, deadline=deadline)
                 verify_patch_digest(PATCH_DIR / PRODUCTION_PATCH["file"],
                                     PRODUCTION_PATCH["sha256"], "text-only.patch")
@@ -737,7 +834,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
                 # The native command/build stage: the accepted compile scope is the
                 # only stage whose receipt carries the compiler child status/cleanup.
                 wrapper_stage = "build"
-                _enter_stage(outcome, COMPILER_SCOPE)
+                stage_log = _enter_stage(outcome, COMPILER_SCOPE, build_log)
                 code = _supervised(host, host.build_argv(cargo), build / "codex-rs",
                                    build_env, build_log, deadline, outcome)
                 if code != 0:
@@ -750,7 +847,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
                     raise Refusal("production build produced no %s binary" % host.BIN)
 
                 wrapper_stage = "test-patches"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage)
                 applied = []
                 for entry in TEST_PATCH_MANIFEST:
                     patch_path = PATCH_DIR / entry["file"]
@@ -781,13 +878,13 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
                              "-p", "codex-core", "--lib", TEST_FILTER,
                              "--", "--test-threads=1"]
                 wrapper_stage = "prepare-tests"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage, prep_log)
                 code = _supervised(host, prep_argv, build / "codex-rs", build_env,
                                    prep_log, deadline, outcome)
                 if code != 0:
                     raise Refusal("locked online test preparation failed (exit %d)" % code)
                 wrapper_stage = "offline-tests"
-                _enter_stage(outcome, wrapper_stage)
+                stage_log = _enter_stage(outcome, wrapper_stage, test_log)
                 code = _supervised(host, test_argv, build / "codex-rs", build_env,
                                    test_log, deadline, outcome)
                 parsed = parse_cargo_test_output(test_log.read_text(errors="replace"))
@@ -830,7 +927,8 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
                                       outcome.get("code") or code)
         except Exception:
             pass
-        failure = _sanitized_failure(wrapper_stage, outcome, reason)
+        failure = _sanitized_failure(wrapper_stage, outcome, reason,
+                                     _stage_diagnostic(stage_log))
         receipt = build_receipt(identity, deadline, {"seconds": elapsed}, None,
                                 {"source_pin": getattr(host, "CODEX_PIN", None)}, None,
                                 False, failure)
