@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "eliza_upstream", Path(__file__).resolve().parents[2] / "scripts/eliza-upstream.py")
@@ -305,7 +306,7 @@ class CliFixture(unittest.TestCase):
             os.environ["OPENAI_API_KEY"] = "leak"
             try:
                 upstream.UPSTREAM_PIN = head
-                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": None}
+                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()}
                 code = upstream.main(["cli", "--", "--help"], root=root)
                 self.assertEqual(code, 0)
                 argv = argv_out.read_text().splitlines()
@@ -326,7 +327,7 @@ class CliFixture(unittest.TestCase):
             write_exe(upstream.bun_bin(root), "#!/bin/sh\nexit 0\n")
             original_gate = upstream.gate_decision
             try:
-                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": None}
+                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()}
                 self.assertEqual(upstream.main(["cli", "--", "--help"], root=root), 1)
             finally:
                 upstream.gate_decision = original_gate
@@ -382,7 +383,7 @@ class TamperReexecution(unittest.TestCase):
             original_gate = upstream.gate_decision
             try:
                 upstream.UPSTREAM_PIN = head
-                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": None}
+                upstream.gate_decision = lambda now=None: {"allowed": True, "stop_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()}
                 self.assertEqual(upstream.main(["cli", "--", "--help"], root=root), 1)
             finally:
                 upstream.UPSTREAM_PIN = original_pin
@@ -461,6 +462,34 @@ class ManifestTrust(unittest.TestCase):
 
 
 class DeadlineBudget(unittest.TestCase):
+    def test_late_eof_cannot_publish_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "archive"
+            response = io.BytesIO(b"")
+            deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()
+            with patch.object(upstream.urllib.request, "urlopen", return_value=response), \
+                    patch.object(upstream, "past_deadline", side_effect=[False, True]):
+                with self.assertRaises(upstream.SetupError):
+                    upstream.fetch(upstream.NODE_URL, target, deadline=deadline)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_suffix(".part").exists())
+
+    def test_blocking_read_is_interrupted_at_absolute_deadline(self):
+        class BlockedResponse(io.BytesIO):
+            def read(self, size):
+                time.sleep(30)
+                return b""
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "archive"
+            deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=2)).isoformat()
+            started = time.monotonic()
+            with patch.object(upstream.urllib.request, "urlopen", return_value=BlockedResponse()):
+                with self.assertRaises(upstream.SetupError):
+                    upstream.fetch(upstream.NODE_URL, target, deadline=deadline)
+            self.assertLess(time.monotonic() - started, 4)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_suffix(".part").exists())
+
     def test_clone_consumes_remaining_and_blocks_next(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -469,7 +498,7 @@ class DeadlineBudget(unittest.TestCase):
             original_state = upstream.source_state
             upstream._git = lambda args, cwd=None, timeout=600: (
                 calls.append(timeout) or subprocess.CompletedProcess(args, 0, "", ""))
-            upstream.source_state = lambda r: {"ok": True, "reason": "pinned_clean"}
+            upstream.source_state = lambda r, deadline=None: {"ok": True, "reason": "pinned_clean"}
             try:
                 deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3)).isoformat()
                 upstream.ensure_source(root, deadline=deadline)
@@ -479,6 +508,31 @@ class DeadlineBudget(unittest.TestCase):
             finally:
                 upstream._git = original_git
                 upstream.source_state = original_state
+
+    def test_existing_checkout_validation_keeps_original_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (upstream.source_dir(root) / ".git").mkdir(parents=True)
+            calls = []
+            original_git = upstream._git
+            def metadata(args, cwd=None, timeout=600):
+                calls.append((args, timeout))
+                return subprocess.CompletedProcess(args, 0,
+                    upstream.UPSTREAM_PIN if args[0] == "rev-parse" else "", "")
+            upstream._git = metadata
+            try:
+                deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3)).isoformat()
+                upstream.ensure_source(root, deadline=deadline)
+                self.assertEqual([args[0] for args, _ in calls], ["rev-parse", "status"])
+                self.assertLessEqual(calls[0][1], 3)
+                self.assertLessEqual(calls[1][1], calls[0][1])
+                calls.clear()
+                expired = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat()
+                with self.assertRaises(upstream.SetupError):
+                    upstream.source_state(root, deadline=expired)
+                self.assertEqual(calls, [])
+            finally:
+                upstream._git = original_git
 
     def test_expired_deadline_blocks_clone_and_provisioning(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -409,6 +409,32 @@ def _truncate_log(path):
 
 
 # --- network (allowlisted, verified before use) -----------------------------
+@contextmanager
+def absolute_download_deadline(deadline):
+    """Interrupt a blocking connect/read at the original Linux CLI cutoff."""
+    if not deadline:
+        yield
+        return
+    remaining = time_budget(deadline, 300)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    def expired(signum, frame):
+        raise SetupError("off-peak download deadline reached", code=75)
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL,
+                     min(remaining, previous_timer[0]) if previous_timer[0] else remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                            max(0.000001, previous_timer[0] - (time.monotonic() - started)),
+                            previous_timer[1])
+
+
 def fetch(url, dest, deadline=None, cap=300):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
@@ -418,12 +444,15 @@ def fetch(url, dest, deadline=None, cap=300):
     tmp = dest.with_suffix(dest.suffix + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "phpretro-eliza-upstream"})
     try:
-        with urllib.request.urlopen(request, timeout=time_budget(deadline, cap)) as response, \
+        with absolute_download_deadline(deadline), \
+                urllib.request.urlopen(request, timeout=time_budget(deadline, cap)) as response, \
                 open(tmp, "wb") as out:
             while True:
                 if past_deadline(deadline):
                     raise SetupError("off-peak deadline reached during download: %s" % url, code=75)
                 chunk = response.read(1024 * 1024)
+                if past_deadline(deadline):
+                    raise SetupError("off-peak deadline reached during download", code=75)
                 if not chunk:
                     break
                 out.write(chunk)
@@ -433,6 +462,9 @@ def fetch(url, dest, deadline=None, cap=300):
     except (OSError, urllib.error.URLError) as error:
         tmp.unlink(missing_ok=True)
         raise SetupError("download failed: %s (%s)" % (url, error), code=1)
+    if past_deadline(deadline):
+        tmp.unlink(missing_ok=True)
+        raise SetupError("off-peak deadline reached before download publication", code=75)
     os.replace(tmp, dest)
     return dest
 
@@ -566,7 +598,7 @@ def _git(args, cwd=None, timeout=600):
         raise SetupError("git %s timed out" % (args[0] if args else "command"), code=75)
 
 
-def source_state(root):
+def source_state(root, deadline=None):
     src = source_dir(root)
     if not src.exists():
         return {"present": False, "ok": False, "reason": "missing"}
@@ -574,11 +606,11 @@ def source_state(root):
         return {"present": True, "ok": False, "reason": "unsafe_path"}
     if not (src / ".git").exists():
         return {"present": True, "ok": False, "reason": "not_a_checkout"}
-    head = _git(["rev-parse", "HEAD"], cwd=str(src))
+    head = _git(["rev-parse", "HEAD"], cwd=str(src), timeout=time_budget(deadline, 30))
     if head.returncode != 0:
         return {"present": True, "ok": False, "reason": "git_error"}
     revision = head.stdout.strip()
-    status = _git(["status", "--porcelain"], cwd=str(src))
+    status = _git(["status", "--porcelain"], cwd=str(src), timeout=time_budget(deadline, 30))
     dirty = status.stdout.strip()
     if revision != UPSTREAM_PIN:
         return {"present": True, "ok": False, "reason": "wrong_pin", "revision": revision}
@@ -600,7 +632,7 @@ def ensure_source(root, deadline=None):
                         timeout=time_budget(deadline, 600))
         if checkout.returncode != 0:
             raise SetupError("pin checkout failed: %s" % checkout.stderr.strip(), code=1)
-    state = source_state(root)
+    state = source_state(root, deadline=deadline)
     if not state["ok"]:
         raise SetupError("source not pinned/clean: %s" % state["reason"], code=1)
     return src
@@ -782,7 +814,10 @@ def command_setup(root, node_path=None, bun_path=None):
 def command_cli(root, argv):
     require_platform()
     decision = enforce_gate()
-    source = source_state(root)
+    deadline = decision.get("stop_at")
+    if not deadline:
+        raise SetupError("off-peak gate has no verified cutoff; refusing CLI", code=75)
+    source = source_state(root, deadline=deadline)
     if not source["ok"]:
         raise SetupError("source not pinned/clean: %s" % source["reason"], code=1)
     bun = verified_runtime(root, "bun")
@@ -792,7 +827,7 @@ def command_cli(root, argv):
     state.mkdir(parents=True, exist_ok=True)
     return run_supervised(cli_argv(bun, argv), cwd=source_dir(root),
                           env=client_env(root), log_path=logs_dir(root) / "cli.log",
-                          stop_at=decision.get("stop_at"))
+                          stop_at=deadline)
 
 
 def main(argv=None, root=None):
