@@ -40,6 +40,12 @@ This is the work queue. Every entry has one owner/claim in the durable task stor
 
 Eliza-first work currently pauses further CMS/theme/game-port implementation. The root companion uses actual published Eliza runtime/SQL/orchestrator packages with controlled ACP and bridge fixtures. The full upstream CLI/API/UI is pinned separately as a submodule at `28fef47c9d9d3acc7792be0fdaa3070020293cc5`; source installation, first-run browser rendering and later owner-login/DeepSeek chat checks passed in a separate reference checkout. This is not proof of a reproducible full-app launch from the root integration or a configured Sol main-chat handler. Project plugin/dashboard fixes and live worker/queue acceptance remain pending. See [integration evidence and launch boundary](eliza-integration.md). No full-port percentage or 100% completion is claimed.
 
+## G05 native qualification correction — 2026-10-14
+
+The installed raw ELF `codex-cli 0.162.0` matches the official release from source commit `c1382380de69521303b416720a52f42d51af6248`. The experimental schema defines the isolation fields that the earlier stable-only check missed. This confirms metadata support; generation remains blocked because the effective toolset is unqualified. Source inspection found an empty `ToolPolicy` ceiling, but no supported stock startup input for it. The host path, build provenance, runtime registry proof and hard-parent cleanup remain open. All 31 generator tests and 19 controlled JS fixtures pass; six GitHub jobs passed for both push and PR on `e540a9c`. Root upstream installation and CLI help passed. Configured full-host startup, browser mounting, live queue and main-Sol acceptance remain open. **G05 and G06 stay Partial.** See [qualification evidence and acceptance plan](eliza-native-qualification.md).
+
+The G06 `proc <X> dead` terminate-group assertion repair (`2ac672d`) is **test-only** and does not close G06.
+
 ## Entry update format
 
 For each completed slice append: task/issue ID; exact changed behavior; source/reference revision; checks run and results; commit/PR; remaining limitation; status (`missing`, `partial`, `verified`, `blocked-external`). A passing mock or a code-text assertion cannot close an integration gap. Store verbose test artifacts privately or in a sanitized evidence index rather than pasting transcripts here.
