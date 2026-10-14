@@ -2,6 +2,22 @@
 
 The cleanup regression check uses the real leader/grandchild launch and unchanged production `terminate_group`. Test-local `/proc/<pid>/stat` observation maps only `FileNotFoundError`/`ProcessLookupError` to `gone`; other I/O/permission errors and malformed contents propagate, and non-zombie live states remain rejected. Accepted `Z`/`gone` means not running; it does not prove the grandchild was reaped. Focused, complete ops-suite and predetermined repeated real-cleanup test results are recorded in the worker handoff after execution. This does not enable the game or resolve full-port/budget limits.
 
+## G05 resource-fit contract — 2026-10-14
+
+Independent architecture and final native Sol source reviews accepted worker
+`2f6f192dcdff17462baa1380d7c79feec2769943`; feature integration is `8fdc2be`.
+Root independently ran 87 native-host setup tests (23.746 seconds), 30 upstream
+launcher tests (5.029 seconds), and public-file/document/configuration checks;
+all passed. Diff checks passed. Worker CI run `38612139952` succeeded.
+Evidence is retained privately under `.builder/current-workers/native-resource-fit`.
+Profile mutation/removal rejects stale provenance; a real Python Cargo fixture
+observes actual flags/environment, while actual leaders and TERM-resistant
+descendants exercise low/unknown-RAM cleanup and absence of successful provenance.
+These fixtures do not establish Rust compilation. The cleanup fixture has a
+timing-dependent startup interval; source review retained that nonblocking
+limitation. Actual native build, compiled tests and registry/contributor/MCP
+qualification remain open; generation remains disabled.
+
 # Checkpoint validation — 2026-10-11
 
 This is a runnable development foundation, not the completed CMS/game port.

@@ -125,3 +125,16 @@ resolution of the missing dependency and overlay UI passed; 24 adapter boundary
 checks pass. The original acceptance cutoff expired and was not extended.
 A fresh bounded configured-host/browser run is still required. Source bindings
 are verified; **G06 remains Partial**, with no runtime or native admission claim.
+
+## G05 resource-fit build contract — 2026-10-14
+
+Task G05-native-resource-fit; reviewed worker `2f6f192`, integrated on the feature
+branch as `8fdc2be`. A fixed release profile now disables optimization/LTO and
+incremental compilation, uses 256 codegen units and no debuginfo, and binds all
+profile values to build provenance/freshness. The build supervisor checks available
+RAM before launch and throughout compilation; low or unknown RAM stops its owned
+group and prevents successful provenance publication. Root verified 87 focused
+tests and 30 upstream tests; worker CI `38612139952` passed. These tests include
+real process cleanup and a subprocess argument/environment fixture, not a Rust
+compile. Actual resource fit, compiled qualification and native admission remain
+open. The generation guard remains false. See [validation](validation.md).
