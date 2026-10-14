@@ -658,35 +658,35 @@ def write_config(root, deadline=None):
 
 # --- commands ---------------------------------------------------------------
 def cmd_check(root, _argv=None):
-    import io
+    """Read prerequisites without creating state, locks or a captured cutoff."""
     root = Path(root)
-    prereq = {"ready": False, "problems": []}
-    buf = io.StringIO()
-    stdout = sys.stdout
+    problems = []
+    overlay_ready = False
     try:
-        sys.stdout = buf
-        dash.cmd_check(root, acceptance_profile(root).source, acceptance_profile(root))
-    finally:
-        sys.stdout = stdout
-    try:
-        prereq = json.loads(buf.getvalue())
-    except ValueError:
-        prereq = {"ok": False, "problems": ["prerequisite check produced no report"]}
-    overlay_ready = _overlay_ok(root)
+        validate_overlay_source(root)
+        overlay_ready = True
+        dash.require_window(root)
+        for port in (API_PORT, UI_PORT):
+            dash.port_free(port, API_HOST)
+        lock = assert_private_path(root, acceptance_root(root) / "dashboard.lock")
+        if lock.exists() or lock.is_symlink():
+            dash.read_private_text(lock)
+    except (DashboardError, upstream.SetupError, OSError) as exc:
+        problems.append(str(exc))
     try:
         dropins_ready = _dropin_ready(root)
-    except Exception:
+    except (DashboardError, OSError):
         dropins_ready = False
     report = {
         "command": "check",
-        "prerequisites": {"ok": bool(prereq.get("ok")), "problems": prereq.get("problems", [])},
+        "prerequisites": {"ok": not problems, "problems": problems},
         "overlay_ready": overlay_ready,
         "dropins_ready": dropins_ready,
-        "host": "pending",       # real configured host not launched here
-        "browser": "pending",    # browser/owner transport proof pending root
+        "host": "pending",
+        "browser": "pending",
     }
     print(json.dumps(report, indent=2))
-    return 0 if (report["prerequisites"]["ok"] and overlay_ready and dropins_ready) else 1
+    return 0 if not problems and overlay_ready and dropins_ready else 1
 
 
 def operation_budget(args, cap):

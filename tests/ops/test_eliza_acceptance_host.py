@@ -30,6 +30,19 @@ def _git(cwd, *args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+class ReadOnlyCheckTest(unittest.TestCase):
+    def test_check_never_creates_private_state_lock_or_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(host, "validate_overlay_source", return_value={"readiness": True}), \
+                    mock.patch.object(host.dash, "require_window", return_value={"allowed": True}), \
+                    mock.patch.object(host.dash, "port_free"), \
+                    mock.patch.object(host, "_dropin_ready", return_value=True), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(host.cmd_check(root), 0)
+            self.assertEqual(list(root.iterdir()), [])
+
+
 class ProfileTest(unittest.TestCase):
     def test_profile_ports_origins_and_immutability(self):
         profile = host.acceptance_profile(Path("/tmp/root"))

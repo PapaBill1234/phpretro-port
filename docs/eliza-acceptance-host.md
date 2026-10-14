@@ -28,8 +28,7 @@ python3 scripts/eliza-acceptance-host.py stop
 python3 scripts/eliza-acceptance-host.py status
 ```
 
-`check` reports, separately: `prerequisites` (pin/runtimes/ports/lock via the
-dashboard), `overlay_ready`, `dropins_ready`, and `host:"pending"` /
+`check` reports, separately: `prerequisites` (pin/runtimes/ports and existing-lock safety), `overlay_ready`, `dropins_ready`, and `host:"pending"` /
 `browser:"pending"`.
 
 ## Private copy and provenance
@@ -91,7 +90,7 @@ and clean state are verified before copy/launch. All acceptance-path ancestors
 and write targets are checked for symlinks before mutation. Launch verification
 requires both overlay and drop-in provenance.
 
-Twenty-one adapter checks pass; 59 dashboard checks pass with one existing skip.
+Twenty-two adapter checks pass; 59 dashboard checks pass with one existing skip.
 Tests include parent-path symlinks, closed-gate setup with no writes, wrapper
 modification and missing provenance. Private real-source/loader/schema proof is
 under `.builder/current-workers/root-acceptance-takeover/` and the neighboring
@@ -112,3 +111,8 @@ covered by captured child-launch regressions.
 Independent final Sol review accepted the source fixes. The actual configured
 host and browser remain unqualified; source acceptance does not admit the native
 provider or close G05/G06.
+
+The adapter `check` reads existing prerequisites without creating directories,
+lock files or a captured cutoff. Acquiring the lifecycle lock belongs to `start`.
+Independent Sol review accepted this no-write adjustment; a successful-check
+regression leaves a fresh private root empty.
