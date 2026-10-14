@@ -26,6 +26,15 @@ provisions a worktree itself, and the companion keeps its global four-worker
 cap. The autopilot additionally refuses to dispatch while the reported
 `activeWorkers` already reaches four.
 
+Before reusing any existing task, the autopilot treats the `/tasks` rows as
+candidate ids only and reads the authoritative metadata through `task-status`.
+It reuses a task only when the trusted identity matches exactly -- the same
+`boardId`, `goal`, `scope` and `acceptanceCommand` as the reviewed manifest
+entry. A `boardId` that already belongs to a differently-scoped task (for
+example a CMS/private task) fails closed: the autopilot records an
+identity-conflict review and never creates, dispatches, rewrites or mutates the
+foreign task.
+
 ## Controls
 
 ```sh
@@ -96,10 +105,16 @@ an account.
 Every mutating control request is preceded by a durable attempt marker. If a
 dispatch POST completes but no response is observed (an ambiguous outcome), the
 marker is retained as ambiguous and the run enters **recovery-required**: it
-pauses and never blindly re-POSTs the same mutation. Reconciliation compares a
-completed worker turn against the protocol-ready session and treats an
-interrupted process as infrastructure, not a code failure; acceptance is only
-taken for an actual completed worker turn.
+pauses and never blindly re-POSTs the same mutation.
+
+Every open-window cycle, the running daemon reconciles its tracked workers
+before deciding anything new. Reconciliation compares a completed worker turn
+against the protocol-ready session, verifies the worker's actual changed paths
+against the declared scope, and treats an interrupted process as infrastructure,
+not a code failure; acceptance is only taken for an actual completed worker turn.
+It is idempotent across restarts: an attempt already resolved by a prior cycle
+is closed from the durable receipts rather than re-checked, and no acceptance is
+ever taken during a blocked window or while an ambiguity needs recovery.
 
 ## Failures, review and integration
 

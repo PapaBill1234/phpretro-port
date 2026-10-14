@@ -42,6 +42,7 @@ BUILDER_STATE = Path(os.environ.get("ELIZA_AUTOPILOT_HOME") or (ROOT / ".builder
 DEFAULT_STATE = BUILDER_STATE / "eliza-autopilot"
 DEFAULT_COMPANION = BUILDER_STATE / "eliza"
 CAPACITY = 4
+MAX_TASK_SCAN = 200
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 18791
 MAX_RESPONSE_BYTES = 1 << 20
@@ -97,6 +98,10 @@ class AmbiguousDispatch(ApiError):
 
 class SingletonBusy(AutopilotError):
     pass
+
+
+class IdentityConflict(AutopilotError):
+    """A boardId already belongs to a task whose trusted identity differs."""
 
 
 def _load_coding_window():
@@ -605,14 +610,47 @@ class Autopilot:
         self.attempts.finish(key, "done", {"id": result.get("id")})
         return result.get("id")
 
-    def _find_task_id(self, board_id):
+    def _task_ids(self):
+        # GET /tasks is treated as candidate ids only. The companion itself
+        # resolves a row's authoritative metadata through task-status, so the
+        # client mirrors that instead of trusting the list envelope.
+        ids = []
         for row in self.api.tasks():
-            if (row.get("metadata") or {}).get("boardId") == board_id:
-                return row.get("id")
+            tid = row.get("id") if isinstance(row, dict) else None
+            if tid:
+                ids.append(tid)
+        return ids[:MAX_TASK_SCAN]
+
+    def _identity_matches(self, detail, task):
+        meta = detail.get("metadata") or {}
+        return (meta.get("boardId") == task["boardId"]
+                and meta.get("scope") == list(task["scope"])
+                and detail.get("goal") == task["goal"]
+                and meta.get("acceptanceCommand") == list(task["acceptanceCommand"]))
+
+    def _find_existing_task(self, task):
+        for tid in self._task_ids():
+            try:
+                detail = self.api.control("task-status", id=tid)
+            except ApiError:
+                continue
+            if (detail.get("metadata") or {}).get("boardId") != task["boardId"]:
+                continue
+            if not self._identity_matches(detail, task):
+                raise IdentityConflict(
+                    f"boardId {task['boardId']} already belongs to an existing task "
+                    "whose scope/goal/acceptance do not match the trusted manifest")
+            return tid
         return None
 
     def dispatch(self, task):
-        task_id = self._find_task_id(task["boardId"])
+        try:
+            task_id = self._find_existing_task(task)
+        except IdentityConflict as error:
+            # Fail closed: never mutate, rewrite or dispatch the foreign task.
+            self._mark_review(None, task["boardId"], "identity_conflict", handoff=redact(error))
+            return {"action": "review_required", "reason": "identity_conflict",
+                    "task": task["boardId"]}
         if task_id is None:
             task_id = self._create_task(task)
         key = f"dispatch:{task['boardId']}"
@@ -647,41 +685,63 @@ class Autopilot:
         return cancelled
 
     # -- reconciliation --------------------------------------------------------
+    def _drop_tracked(self, task_id):
+        if self.tracked.pop(task_id, None) is not None:
+            self._save_tracked()
+
     def reconcile(self, now):
+        """Complete/verify tracked workers; safe and idempotent across restarts."""
         for task_id, entry in list(self.tracked.items()):
             try:
                 state = self.api.control("task-status", id=task_id)
             except ApiError:
                 continue
+            if not isinstance(state, dict):
+                continue
             meta = state.get("metadata") or {}
+            board_id = meta.get("boardId") or entry.get("boardId")
             worker = next((s for s in state.get("sessions", [])
                            if s.get("sessionId") == entry.get("sessionId")), None)
             status = worker.get("status") if worker else None
             if status in ("errored", "cancelled", "stopped"):
-                self.tracked.pop(task_id, None)
-                self._save_tracked()
+                # An interrupted process is infrastructure, not a code failure.
+                self._drop_tracked(task_id)
                 continue
             if status != "completed":
                 continue
-            changed = changed_paths(meta.get("workdir")) if meta.get("workdir") else None
+            workdir = meta.get("workdir")
+            changed = changed_paths(workdir) if workdir else None
             if changed is None or not paths_within_scope(changed, meta.get("scope") or []):
-                self.tracked.pop(task_id, None)
-                self._save_tracked()
-                self._mark_review(task_id, meta.get("boardId"), "scope_violation")
+                self._drop_tracked(task_id)
+                self._mark_review(task_id, board_id, "scope_violation")
                 continue
             try:
                 result = self.api.control("task-check", id=task_id)
             except ControlRejected as error:
-                if "worker attempt" in str(error) or "not completed" in str(error):
+                message = str(error)
+                if "worker attempt" in message or "not completed" in message or "No unchecked" in message:
+                    # A prior cycle or crash already resolved this attempt; derive
+                    # the outcome idempotently instead of re-checking forever.
+                    self._drop_tracked(task_id)
+                    kind = self._report_kind(task_id)
+                    if kind:
+                        self._record_result(task_id, board_id, {"kind": kind})
                     continue
-                self.tracked.pop(task_id, None)
-                self._save_tracked()
+                self._drop_tracked(task_id)
                 continue
             except ApiError:
                 continue
-            self.tracked.pop(task_id, None)
-            self._save_tracked()
-            self._record_result(task_id, meta.get("boardId"), result)
+            self._drop_tracked(task_id)
+            self._record_result(task_id, board_id, result)
+
+    def _report_kind(self, task_id):
+        try:
+            report = self.api.control("report", id=task_id)
+        except ApiError:
+            return None
+        terminal = [r.get("kind") for r in report.get("receipts", [])
+                    if r.get("kind") in ("acceptance_passed", "acceptance_failed", "attempt_interrupted")]
+        return terminal[-1] if terminal else None
 
     def _record_result(self, task_id, board_id, result):
         kind = result.get("kind")
@@ -691,10 +751,15 @@ class Autopilot:
             self.qstate.data["completed"] = sorted(completed)
             self.qstate.save()
         elif kind == "acceptance_failed":
-            if self._count_failures(task_id) >= 3:
+            # Never auto-retry a real code failure; retain review-needed. The
+            # existing Builder already asks Sol for help at the third failure.
+            failures = self._count_failures(task_id)
+            if failures >= 3:
                 self._mark_review(task_id, board_id, "third_failure",
                                   handoff="existing Builder already auto-helps Sol; "
                                           "stop further dispatch, retain review-needed")
+            else:
+                self._mark_review(task_id, board_id, "acceptance_failed")
 
     def _count_failures(self, task_id):
         try:
@@ -705,7 +770,7 @@ class Autopilot:
 
     def _mark_review(self, task_id, board_id, reason, handoff=None):
         rows = self.qstate.data.setdefault("reviewNeeded", [])
-        if any(r.get("taskId") == task_id for r in rows):
+        if any(r.get("boardId") == board_id or (task_id and r.get("taskId") == task_id) for r in rows):
             return
         rows.append({"taskId": task_id, "boardId": board_id, "reason": reason,
                      "handoff": handoff})
@@ -713,6 +778,11 @@ class Autopilot:
 
     # -- control flow ----------------------------------------------------------
     def step(self, now):
+        # Reconcile during an open window so completed workers are accepted
+        # (with scope verification and third-failure handoff). Never during a
+        # blocked window, and never while an ambiguity needs recovery.
+        if coding_window.decision(now)["allowed"] and not self.attempts.unresolved():
+            self.reconcile(now)
         decision = self.decide(now, for_run=True)
         action = decision["action"]
         if action == "dispatch":

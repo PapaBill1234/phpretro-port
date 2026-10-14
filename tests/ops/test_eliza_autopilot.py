@@ -307,8 +307,15 @@ class ControlFlowTests(Base):
 class DispatchTests(Base):
     def _ready_fixture(self):
         fixture = self.start_fixture()
-        fixture.tasks = [{"id": "t-1", "metadata": {"boardId": "AUTO-1", "scope": ["scripts/eliza-"],
-                                                    "workdir": str(self.build / "worktrees" / "AUTO-1")}}]
+        # /tasks rows are candidate ids only; the authoritative identity is read
+        # through task-status, mirroring the companion's own resolution.
+        fixture.tasks = [{"id": "t-1"}]
+        fixture.control["task-status"] = {
+            "id": "t-1", "goal": "bounded local change",
+            "metadata": {"boardId": "AUTO-1", "scope": ["scripts/eliza-"],
+                         "acceptanceCommand": ["python3", "-c", "pass"],
+                         "workdir": str(self.build / "worktrees" / "AUTO-1")},
+            "sessions": []}
         fixture.control["task-dispatch"] = {"attemptId": "a1", "sessionId": "s1", "task": {}}
         return fixture
 
@@ -335,6 +342,24 @@ class DispatchTests(Base):
         second = pilot.step(dt.datetime.fromisoformat(OPEN))
         self.assertEqual(second["action"], "recovery_required")
         self.assertEqual(len(fixture.posts("task-dispatch")), 1)
+
+    def test_conflicting_boardid_with_foreign_scope_fails_closed(self):
+        self.write_manifest([self.task()])  # trusted AUTO-1: scripts/eliza-
+        fixture = self.start_fixture()
+        fixture.tasks = [{"id": "t-9"}]
+        fixture.control["task-status"] = {
+            "id": "t-9", "goal": "cms/private work",
+            "metadata": {"boardId": "AUTO-1", "scope": ["apps/web"],
+                         "acceptanceCommand": ["echo", "x"]},
+            "sessions": []}
+        pilot = self.pilot(OPEN)
+        decision = pilot.step(dt.datetime.fromisoformat(OPEN))
+        self.assertEqual(decision["action"], "review_required")
+        self.assertEqual(decision["reason"], "identity_conflict")
+        # Fail closed: never create, dispatch, or rewrite the foreign task.
+        self.assertEqual(fixture.posts("task-create"), [])
+        self.assertEqual(fixture.posts("task-dispatch"), [])
+        self.assertEqual(pilot.qstate.data["reviewNeeded"][0]["reason"], "identity_conflict")
 
 
 class ReconcileTests(Base):
@@ -395,6 +420,31 @@ class ReconcileTests(Base):
         self.assertEqual(reviews[0]["reason"], "third_failure")
         self.assertIn("stop further dispatch", reviews[0]["handoff"])
         self.assertEqual(pilot.decide(dt.datetime.fromisoformat(OPEN), for_run=True)["action"], "idle_empty")
+
+    def test_step_reconciles_and_finishes_a_tracked_task(self):
+        # The production step/run path must itself reconcile and complete a
+        # worker, not only a manual reconcile() call.
+        self.write_manifest([self.task()])
+        wd = self._worktree("scripts/eliza-newhelper.py")
+        fixture = self._fixture_with_task(wd)
+        fixture.control["task-check"] = {"kind": "acceptance_passed", "receipt": {"id": "r1"},
+                                         "independentReviewRequired": True}
+        pilot = self.pilot(OPEN)
+        pilot.tracked = {"t-1": {"attemptId": "a1", "sessionId": "s1", "boardId": "AUTO-1"}}
+        decision = pilot.step(dt.datetime.fromisoformat(OPEN))
+        self.assertIn("AUTO-1", pilot.qstate.data["completed"])
+        self.assertEqual(len(fixture.posts("task-check")), 1)
+        self.assertEqual(decision["action"], "idle_empty")
+
+    def test_step_does_not_reconcile_during_peak(self):
+        self.write_manifest([self.task()])
+        wd = self._worktree("scripts/eliza-newhelper.py")
+        fixture = self._fixture_with_task(wd)
+        pilot = self.pilot(PEAK)
+        pilot.tracked = {"t-1": {"attemptId": "a1", "sessionId": "s1", "boardId": "AUTO-1"}}
+        decision = pilot.step(dt.datetime.fromisoformat(PEAK))
+        self.assertEqual(decision["action"], "stay_idle")
+        self.assertEqual(fixture.posts("task-check"), [])
 
 
 class HttpBoundaryTests(Base):
