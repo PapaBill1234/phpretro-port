@@ -1,6 +1,6 @@
 # Known gaps against the requested PHPRetro port
 
-Last reviewed/updated: 2026-10-13. Target: pinned PHPRetro feature behavior, Polaris/Octane compatibility, and the current Habbo public-site layout recreated with original assets. This structure is inspired by [PhotoCraft's gaps ledger](https://github.com/storytold/photocraft/blob/52e130d481c9017b6ec8321784776b33b04ad2c4/docs/gaps.md); project facts and estimates are specific to this port.
+Last reviewed/updated: 2026-10-14. Target: pinned PHPRetro feature behavior, Polaris/Octane compatibility, and the current Habbo public-site layout recreated with original assets. This structure is inspired by [PhotoCraft's gaps ledger](https://github.com/storytold/photocraft/blob/52e130d481c9017b6ec8321784776b33b04ad2c4/docs/gaps.md); project facts and estimates are specific to this port.
 
 This is the work queue. Every entry has one owner/claim in the durable task store, evidence and an exit condition. Implementation coverage is **not yet measured**. A planning document is not a closed application feature. Priority is release risk and user impact, then dependency order. Estimates remain uncalibrated until a real vertical slice is complete.
 
@@ -197,3 +197,17 @@ stop evidence/final preservation checks and stale artifact contents. A repair
 draft remains unreviewed. No heavy CI build, binary import or compiled
 qualification has run. Fresh quota reached the required 10% reserve; private
 handoff records the unfinished drafts. **G05/G06 remain Partial.**
+
+Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
+`scripts/eliza-dashboard.py` `build_env` now exports
+`PHP_RETRO_COMPANION_TRUSTED_ORIGINS` into the API child environment only, from
+the immutable `profile.allowed_origins`, on both return paths; ambient values
+cannot override it and the UI child never receives it. Worker commit `8e9e4b7`
+plus a doc-qualifier `5e0e863`, integrated as `29dc04b`/`1586212`. DeepSeek
+independent source review found no defects; standard Verify CI passed for both
+worker-branch SHAs (`38638478078`, `38638840061`); root `tests.ops.test_eliza_dashboard`
+Ran 66 tests OK and `scripts/repo-check.py` passed. This is a source-only change:
+live same-UI-Origin acceptance, browser mounting and USER/gateway boundaries
+remain unqualified and no native/generation admission follows. The native
+CI-wrapper repair (`codex/eliza-native-ci-build-v41`) and any hosted compiled
+run remain open, unreviewed and unintegrated.

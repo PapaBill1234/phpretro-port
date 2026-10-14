@@ -196,3 +196,27 @@ in 0.522 seconds. A fresh bounded runtime/browser acceptance remains open.
 Private evidence: `package-resolution.result.json`, `dependency-review.json`,
 `live-start.json.log` and owned supervisor logs under the existing private
 acceptance state. The failed startup is not a passing full-host qualification.
+
+## G06-acceptance-origin — companion trusted-origin wiring — 2026-10-14 (direct DeepSeek)
+
+`scripts/eliza-dashboard.py` `build_env` now exports
+`PHP_RETRO_COMPANION_TRUSTED_ORIGINS` to the API child only, from the immutable
+`profile.allowed_origins`, on both the non-compat acceptance/local-auth path and
+the compat path. The pinned consumer name matches exactly
+(`builder/eliza/upstream-plugin/src/owner-authority.js:20`,
+`TRUSTED_ORIGINS_ENV`; comma-split parse at `:48`). The UI child never receives
+the key, and ambient `os.environ` values cannot override or widen it. Tests: two
+added regressions (API-only on both paths; hostile-ambient override ignored with
+`os.environ` left untouched), plus preserved `ELIZA_ALLOWED_ORIGINS`/UI asserts.
+
+Worker `codex/eliza-acceptance-origin-v41`: `8e9e4b7` (source + tests + doc) and
+`5e0e863` (doc qualifier after review), integrated onto
+`build/eliza-deepseek-themes` as `29dc04b` and `1586212`. Checks: root
+`python3 -m unittest tests.ops.test_eliza_dashboard` Ran 66 tests, OK;
+`python3 scripts/repo-check.py` passed; standard Verify CI succeeded for both
+worker-branch SHAs (runs `38638478078`, `38638840061`). A **DeepSeek** read-only
+source review found no confirmed defects (two low-severity wording/coverage
+questions, one of which was fixed in `5e0e863`); this is not a Sol checkpoint.
+Source-only: live same-UI-Origin acceptance, browser mounting, USER/gateway
+boundaries and the native provider guard remain unqualified; **G06 stays
+Partial**.
