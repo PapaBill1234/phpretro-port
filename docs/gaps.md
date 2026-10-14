@@ -267,12 +267,22 @@ predicate gaps — a bare `"source"` condition (never passed by the children) an
 array/string-form `exports` are not covered — so the docstring overstates the
 case. A live re-probe in the next namespace (`acceptance-20261014-v41c`) then
 **confirmed the first of those predictions**: the original
-`plugin-native-settings` resolution error is gone, but the identical failure now
-appears for `@elizaos/plugin-trajectory-logger/register` (`ui.log`), and the UI
-still serves no document (`mounted:false`, `TimeoutError`); the API matrix stayed
-correct (unauth 401, foreign origin 403, owner 200, owner+same-UI-origin 200).
-Still unqualified: browser/UI mounting (blocked at that next member), the USER
-(non-owner) boundary, chat/two-room history and reload (generation is not
-admitted), and any native/compiled claim; no native/generation admission
-follows. The native CI-wrapper repair is integrated separately (see the
-paragraph above).
+`plugin-native-settings` resolution error was gone, but the identical failure
+appeared for `@elizaos/plugin-trajectory-logger/register` (`ui.log`). A second,
+final revision resolves `exports` the way the pinned children do (only
+`eliza-source` is a source condition; string, array and nested-map shapes are
+followed) and keeps every reviewed overlay-patched member on the overlay copy; an
+independent DeepSeek review passed it while noting the condition-order mirror and
+some export shapes remain unexercised, and lives the resolution class is now
+clean: in `acceptance-20261014-v41d` the pre-transform errors are **zero** and
+Vite reports `ready in 12979 ms`. That exposed a **separate, still-open blocker**:
+the document request hangs rather than failing — in `acceptance-20261014-v41e`
+`curl --max-time 150 http://127.0.0.1:18832/` received **0 bytes after 150 s**
+(`mounted:false`, `requestFailures:1`) while the API matrix stayed correct
+(unauth 401, empty bearer 401, foreign origin 403, owner 200,
+owner+same-UI-origin 200). Each probe stopped its host cleanly
+(`terminated ["api","ui","supervisor"]`). Still unqualified: browser/UI mounting
+(blocked on that hang), the USER (non-owner) boundary, chat/two-room history and
+reload (generation is not admitted), and any native/compiled claim; no
+native/generation admission follows. The native CI-wrapper repair is integrated
+separately (see the paragraph above).
