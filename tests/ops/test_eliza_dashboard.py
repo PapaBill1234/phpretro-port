@@ -1102,6 +1102,60 @@ class DashboardTests(unittest.TestCase):
                 proc.kill()
             proc.wait()
 
+    # -- local-auth credentials (create once, load read-only) ---------------
+    def _noncompat_profile(self, local_auth):
+        return dash.LaunchProfile(
+            name="noncompat", compat=False, local_auth=local_auth,
+            api_host="127.0.0.1", api_port=1, ui_port=2,
+            allowed_origins="o", allowed_hosts="h",
+            home=None, state_relative=Path(".x"))
+
+    def test_noncompat_local_auth_injects_vault_env_only_when_enabled(self):
+        secrets = {"profile": Path("/tmp/runtime"),
+                   "api_token": "A" * 43, "vault_passphrase": "B" * 43}
+        api_env, ui_env = dash.build_env(self.source, secrets, self._noncompat_profile(True))
+        self.assertEqual(api_env["ELIZA_API_TOKEN"], "A" * 43)
+        self.assertEqual(api_env["ELIZA_VAULT_PASSPHRASE"], "B" * 43)
+        self.assertEqual(api_env["ELIZA_VAULT_DISABLE_KEYCHAIN"], "1")
+        for name in ("ELIZA_API_TOKEN", "ELIZA_VAULT_PASSPHRASE",
+                     "ELIZA_VAULT_DISABLE_KEYCHAIN"):
+            self.assertNotIn(name, ui_env)  # UI never receives a secret
+
+    def test_noncompat_without_local_auth_injects_no_vault_env(self):
+        secrets = {"profile": Path("/tmp/runtime")}
+        api_env, ui_env = dash.build_env(self.source, secrets, self._noncompat_profile(False))
+        for name in ("ELIZA_API_TOKEN", "ELIZA_VAULT_PASSPHRASE",
+                     "ELIZA_VAULT_DISABLE_KEYCHAIN"):
+            self.assertNotIn(name, api_env)
+            self.assertNotIn(name, ui_env)
+
+    def test_create_and_load_credentials_are_canonical_and_strict(self):
+        dash.create_credentials(self.state)
+        creds = dash.load_local_credentials(self.state)
+        for name in dash.SECRET_FILES:
+            self.assertEqual(stat.S_IMODE((self.state / name).lstat().st_mode), 0o600)
+            self.assertEqual(len(creds[name.replace(".", "_")]), 43)
+        before = {n: (self.state / n).read_bytes() for n in dash.SECRET_FILES}
+        dash.create_credentials(self.state)  # reuse unchanged, never rotate
+        self.assertEqual(before, {n: (self.state / n).read_bytes() for n in dash.SECRET_FILES})
+        (self.state / "api.token").write_bytes(b"x" * 43 + b"\n")  # trailing newline
+        os.chmod(self.state / "api.token", 0o600)
+        with self.assertRaises(dash.DashboardError) as caught:
+            dash.load_local_credentials(self.state)
+        self.assertNotIn("x" * 43, str(caught.exception))  # value-free error
+
+    def test_create_credentials_never_repairs_an_unsafe_dir_or_file(self):
+        os.chmod(self.state, 0o755)
+        with self.assertRaises(dash.DashboardError):
+            dash.create_credentials(self.state)
+        self.assertEqual(stat.S_IMODE(self.state.lstat().st_mode), 0o755)
+        os.chmod(self.state, 0o700)
+        dash.create_credentials(self.state)
+        (self.state / "vault.passphrase").chmod(0o644)
+        with self.assertRaises(dash.DashboardError):
+            dash.create_credentials(self.state)
+        self.assertEqual(stat.S_IMODE((self.state / "vault.passphrase").lstat().st_mode), 0o644)
+
 
 if __name__ == "__main__":
     unittest.main()
