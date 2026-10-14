@@ -340,25 +340,31 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("unknown_active:shell_tool_v2", unknown["reasons"])
 
     def test_probe_applies_overrides_and_parses_stdout_only(self):
-        # A fake CLI that records argv and separates stdout/stderr.
-        fake = self.root / "fake-codex"
-        record = self.root / "feat-args.txt"
-        fake.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$@\" > " + str(record) + "\n"
-            "echo 'shell_tool  stable  true' >&2\n"
-            "printf 'not_shell_tool  stable  false\\nviews  stable  true\\n'\n"
-        )
-        fake.chmod(0o755)
-        parsed = generate.probe_feature_list(str(fake), overrides=[("features.unified_exec", "false")])
+        response = generate.subprocess.CompletedProcess([], 0,
+            b"not_shell_tool  stable  false\nviews  stable  true\n",
+            b"shell_tool stable true\n")
+        with patch.object(generate.subprocess, "run", return_value=response) as run:
+            parsed = generate.probe_feature_list(sys.executable,
+                overrides=[("features.unified_exec", "false")])
+        argv = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertNotEqual(environment["CODEX_HOME"], os.environ.get("CODEX_HOME"))
         self.assertEqual(
             parsed,
             {"not_shell_tool": {"stage": "stable", "state": False}, "views": {"stage": "stable", "state": True}},
         )
-        argv = record.read_text().split()
         self.assertIn("-c", argv)
         self.assertIn("features.unified_exec=false", argv)
         self.assertIn("features", argv)  # subcommand preserved after the overrides
+
+    def test_profile_rewriting_wrapper_is_refused_before_execution(self):
+        wrapper = self.root / "wrapper"
+        wrapper.write_text("#!/bin/sh\nexit 0\n")
+        with patch.object(generate.subprocess, "run") as run:
+            with self.assertRaises(generate.bridge.BridgeError) as error:
+                generate.probe_feature_list(str(wrapper))
+            self.assertEqual(error.exception.code, "unsupported_executable")
+            run.assert_not_called()
 
     def test_execute_blocks_before_starting_rpc_on_unqualified_contract(self):
         result, events = self.run_generate(qualify=lambda: {"qualified": False, "reasons": ("active:unified_exec",)})

@@ -207,6 +207,16 @@ def probe_feature_list(binary: str, overrides=()):
     so the returned states are the ACTUAL effective states, not assumed ones.
     The temp dir is always cleaned up.
     """
+    try:
+        with open(binary, "rb") as executable:
+            is_elf = executable.read(4) == b"\x7fELF"
+    except OSError:
+        is_elf = False
+    if not is_elf:
+        raise bridge.BridgeError(
+            "unsupported_executable",
+            "Offline qualification requires the native ELF; profile-changing wrappers are refused.",
+        )
     home = tempfile.mkdtemp(prefix="codex-empty-home-")
     try:
         codex_home = os.path.join(home, ".codex")
