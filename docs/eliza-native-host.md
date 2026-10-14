@@ -1,0 +1,157 @@
+# Private native text-host bootstrap and build
+
+`scripts/native-host.py` is the reproducible, fail-closed bootstrap/build control
+surface for the pinned OpenAI Codex text host. It owns only these files:
+`scripts/native-host.py`, `tests/ops/test_native_host_setup.py` and this
+document. The public patch/provenance tree `builder/eliza/native-host` is owned
+by another worker and is read-only here; this helper never edits it, the
+CMS/theme/port trees, the tool guard or any account/OAuth material.
+
+This is a **BOOTSTRAP/BUILD helper, not runtime admission**. A successful build
+records build provenance only: it does **not** qualify the model or toolset, and
+the helper never runs the host, a model, a turn or a service. Qualification
+stays open per the [native qualification evidence](eliza-native-qualification.md)
+and [known gaps](gaps.md).
+
+## Pinned identity (non-overridable)
+
+| Item | Value |
+| --- | --- |
+| Source repo | `https://github.com/openai/codex.git` |
+| Exact pin | `c1382380de69521303b416720a52f42d51af6248` |
+| Rust | `1.95.0` `x86_64-unknown-linux-gnu` from the source `rust-toolchain.toml` |
+| Rust manifest | `https://static.rust-lang.org/dist/channel-rust-1.95.0.toml` |
+| Build target | `codex-cli --bin codex` |
+
+Toolchain archives and their SHA-256 manifest are only fetched from
+`static.rust-lang.org`; any other host is refused. There is no flag, environment
+variable or argument that can change the URLs, the pin or the Rust version.
+
+## Private layout
+
+Everything lives under `ROOT/.builder/native-host` and never touches global
+runtimes, `~/.cargo`, `~/.rustup`, `~/.codex` or ancestor directories:
+
+```
+.builder/native-host/source/      # verified pinned clean clone (reused, never reset)
+.builder/native-host/build/       # private checkout of source + reviewed patch
+.builder/native-host/toolchain/   # private Rust prefix (bin/cargo, bin/rustc)
+.builder/native-host/cargo/       # private CARGO_HOME (registry/git cache)
+.builder/native-host/target/      # private CARGO_TARGET_DIR
+.builder/native-host/home/        # private HOME (no operator credentials)
+.builder/native-host/cache/       # verified toolchain manifest + archive
+.builder/native-host/logs/         # bounded, truncating install/build logs
+.builder/native-host/native-host.lock
+.builder/native-host/provenance.json
+```
+
+## Commands
+
+```sh
+python3 scripts/native-host.py status
+python3 scripts/native-host.py source
+python3 scripts/native-host.py toolchain
+python3 scripts/native-host.py build
+```
+
+- **status** is read-only and truthful. It reports the source pin versus the
+  expected SHA, tracked modifications, the verified toolchain and the recorded
+  build binary (bytes re-hashed). `ready` requires all three. `qualified` is
+  always `false`: readiness is build provenance, not model/toolset admission.
+- **source** verifies the pinned clean clone and the reviewed patch. An existing
+  checkout is inspected and reused, **never reset**: a wrong revision or any
+  tracked modification is refused rather than repaired. The source
+  `rust-toolchain.toml` must pin exactly `1.95.0`.
+- **toolchain** downloads `channel-rust-1.95.0.toml`, reads the exact
+  `x86_64-unknown-linux-gnu` archive URL and SHA-256 from it, downloads and
+  verifies that archive, extracts it with bounded member/path/symlink checks and
+  runs the official `install.sh` with `--prefix <private> --disable-ldconfig
+  --without=rust-docs`. It never touches a global path, `~/.rustup` or the system
+  ld cache, and records the `cargo`/`rustc` digests.
+- **build** applies the reviewed patch to a private checkout of the trusted
+  source (`git clone --shared`, so the clean clone is untouched), preflights
+  free disk and available RAM to protect XRDP, then runs exactly one
+  low-priority release job:
+  `nice -n 19 cargo build --release --locked -p codex-cli --bin codex --jobs 1`.
+  Debuginfo is disabled, the Cargo cache/target are private and the environment
+  is built from scratch (no inherited provider or cloud credential, no account
+  or OAuth copy).
+
+## Reviewed public patch (read-only dependency)
+
+The reviewed patch and its digest are read from the accepted public schema in
+`builder/eliza/native-host/provenance.json`: `upstream.commit` and
+`patch.applies_to_commit` must both equal the pinned source revision, `patch.file`
+must name a patch whose bytes match `patch.sha256`, and `patch.target_file`
+declares `{path, base_sha256, patched_sha256}`. A missing manifest, an unknown
+digest, an escaping or symlinked patch path, a digest mismatch or an unbound
+commit all refuse before anything is applied. In the real build the declared
+target bytes are verified against the private checkout `base_sha256` **before**
+the patch is applied and `patched_sha256` **after**, so a wrong target is
+rejected. The patch is applied only to the private build checkout, so the trusted
+clone is never dirtied and `status` stays truthful; a recorded build whose
+source, production patch or actual toolchain binary digests no longer match is
+reported stale, never ready.
+
+The official toolchain manifest is trusted only through its HTTPS `.sha256`
+sidecar: the sidecar is read from the same host, the manifest bytes are
+re-hashed against it **before** parsing or selecting an archive URL, and a
+tampered or unverified cache is discarded and refetched (never accepted).
+Downloads follow no redirect and use no ambient proxy, the final URL/scheme is
+re-checked, manifest/sidecar and archive downloads are byte-bounded while
+reading, and both manifest and archive bytes/hashes are recorded.
+
+## Bounds, gate and cleanup
+
+All expensive stages (`source`, `toolchain`, `build`) require the canonical
+off-peak gate and share one captured cutoff; work is refused while peak or
+without a verified cutoff. Every costly path parses the cutoff strictly and
+refuses a **missing, naive, malformed, non-finite or expired** value *before*
+any subprocess or network read, so no workload can run unbounded or past the
+window. The cutoff is immutable: each stage recomputes its own remaining budget
+from the same value and never extends it. Read-only `status` needs no cutoff and
+still reports truthfully without dispatch (its git probes use a fixed bounded
+probe timeout, never a naive `None` cap on a costly step).
+
+Subprocesses run in their own supervised session. The cancellation handlers are
+installed **before** the child is launched, so a startup signal cannot orphan it;
+the leader is kept unreaped until its **whole group** is cleaned (its id cannot
+be recycled under a `killpg`), and the group is TERM/KILL-cleaned even when the
+leader has already exited — a surviving TERM-resistant grandchild cannot outlive
+the step. Every wait, reap and log-drain is bounded by the original cutoff, the
+log is capped *while* the child runs (a single finite overflow flag, never
+per-chunk growth), and an unprovable group state is a failure, never success; a
+helper that dies by signal is reported as `128+signum`. The runner's own process
+group is never signalled.
+
+Archive scanning and extraction share one absolute `SIGALRM` boundary around
+the complete operation, including blocking `getmembers`, decompression and
+member writes. Between-member checks alone are insufficient. The boundary uses
+the original captured cutoff and restores an enclosing alarm's handler and
+remaining time without extending it. An interrupted extraction cleans private
+temporary files before any installer runs or toolchain provenance is recorded.
+
+The gate comes from `scripts/coding-window.py`, which this worker does not commit
+or edit (it is owned by the integration branch and fails closed if absent). Every
+delete or install asserts its target stays inside `.builder/native-host` and
+crosses no symlinked ancestor. One `fcntl` advisory lock guards each step. If the
+budget stops mid-run, the worktree checkpoints at the precise stage (`source`,
+`toolchain` or `build`).
+
+## Acceptance status
+
+The helper is verified by its own isolated tests (64 focused tests: source/patch/
+digest/tar/path/deadline/resource refusal, containment dotdot/symlink refusal
+before any write, bounded downloads and archive members, tampered-cache
+refetch, stale-build binding, no-signal-after-reap ordering, cutoff-clamped
+probes and extraction, blocked archive scanning/member extraction with no
+installation or provenance publication, nested alarm restoration, unknown-RAM
+refusal, and the real public manifest schema
+probed offline) against controlled fixtures; there are no public-network,
+install or build calls, and the tests do not assert that a real build succeeded.
+The upstream regression suite (30 tests) and the repository public-file/
+document-link check still pass. A **real Root toolchain install and codex-cli
+build is still pending** and is executed by Root after independent review; the
+`source`, `toolchain` and `build` mutating commands are unaccepted until then.
+No runtime qualification, main-Sol acceptance, live queue or configured host
+startup is claimed here.
