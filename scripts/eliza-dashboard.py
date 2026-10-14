@@ -342,10 +342,13 @@ def load_credential(path, name: str) -> str:
 
     Rejects a symlink (``O_NOFOLLOW``), a non-regular file, a foreign owner and
     any mode other than exactly 0600; validates canonical bytes without
-    stripping.  Raises ``FileNotFoundError`` only when the file is absent.
+    stripping.  ``O_NONBLOCK`` is essential: opening an unwritten FIFO
+    ``O_RDONLY`` blocks until a writer arrives, so the type check would never
+    run; a non-blocking open returns promptly and ``fstat`` refuses it.  Raises
+    ``FileNotFoundError`` only when the file is absent.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise
     except OSError:
