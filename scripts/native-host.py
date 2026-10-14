@@ -1286,7 +1286,7 @@ def command_build(root):
         build, patch, digest = prepare_build(root, deadline=deadline)
         resources = preflight_resources(private_root(root))
         argv = build_argv(cargo)
-        code = run_supervised(argv, cwd=build, env=build_env(root),
+        code = run_supervised(argv, cwd=build / "codex-rs", env=build_env(root),
                               log_path=logs_dir(root) / "build.log", stop_at=deadline)
         if code != 0:
             raise SetupError("codex-cli build did not complete (exit %s); checkpoint at build" % code, code=1)

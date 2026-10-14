@@ -636,6 +636,35 @@ class ResourcePreflight(unittest.TestCase):
 
 
 class BuildContract(unittest.TestCase):
+    def test_build_uses_nested_cargo_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = host.build_dir(root)
+            workspace = build / "codex-rs"
+            workspace.mkdir(parents=True)
+            (workspace / "Cargo.toml").write_text('[workspace]\n')
+            compiler = root / "cargo-fixture"
+            compiler.write_text(
+                '#!' + sys.executable + '\n'
+                'import os\nfrom pathlib import Path\n'
+                'assert Path("Cargo.toml").is_file(), "missing nested workspace"\n'
+                'target=Path(os.environ["CARGO_TARGET_DIR"])/"release"/"codex"\n'
+                'target.parent.mkdir(parents=True,exist_ok=True)\n'
+                'target.write_bytes(b"controlled-build-result")\n'
+            )
+            compiler.chmod(0o700)
+            patch_path = root / "reviewed.patch"
+            patch_path.write_text("controlled patch")
+            deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}):
+                self.assertEqual(host.command_build(root), 0)
+            self.assertEqual((host.target_dir(root) / "release" / "codex").read_bytes(),
+                             b"controlled-build-result")
+            self.assertFalse(host.load_provenance(root)["checks"]["qualified"])
+
     def test_build_argv_is_one_low_priority_job(self):
         argv = host.build_argv("/tc/bin/cargo")
         self.assertEqual(argv[:2], ["nice", "-n"])
