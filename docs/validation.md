@@ -52,6 +52,19 @@ The trusted source/toolchain/cache remain; compiled qualification is open.
   `0961dfe`: independent source acceptance; root standalone ordered apply
   changed actual target bytes and verified patch `3caae90b…a23c749`, target
   `f4f70ca1…619208f`; CI `38622273763` passed. Four new tests remain uncompiled.
+- Superseded 2026-10-14 by the hosted `prepare-tests` repair: the pinned
+  `TurnContext` has no `Clone`, so `Arc::make_mut` in the qualification tests
+  failed to compile (`error[E0277] … CloneToUninit`, hosted run `38651470954`)
+  and those sites now use `Arc::get_mut`. The patch bytes and patched-target
+  digests therefore moved: `qualification-registry.patch` `21a127fa…` →
+  `87cb1a63c68a1103b4028f88fd159ae825301822413732e743a5aabefab754ad`,
+  `qualification-adversarial.patch` `952355fb…` →
+  `3c6680469db60cd9cf4b2cbe555d10f9c97e1ee02b843b4157f40b0403d27648`, and the
+  `spec_plan_tests.rs` targets → `d45fc796…f75579` (registry),
+  `688cec9b…c9481` (adversarial), `73a843f296b982f7f5030beea185248f4c0e0e866a209732809d8eb225b225a4`
+  (contributors). The contributors patch bytes (`3caae90b…`) are unchanged.
+  These digests are assertions, not measurements: the Rust compile is still
+  unverified on this host and needs one hosted run.
 - Local-credential worker `7a2615a93a4cd1788a757c40ba20595a7a2e3e30`, feature
   `305b94c`: independent source acceptance; root 121 candidate tests in 19.162
   seconds with two source-availability skips; CI `38622569264` passed. Root
