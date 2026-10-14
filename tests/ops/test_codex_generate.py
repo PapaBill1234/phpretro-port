@@ -470,6 +470,56 @@ class GenerateTests(unittest.TestCase):
         keys = [key for key, _ in generate.GENERATION_CONFIG_OVERRIDES]
         self.assertEqual(len(keys), len(set(keys)))
 
+    def test_guardian_command_is_host_fixed_and_preserves_native_argv(self):
+        native = ["host-codex", "app-server", "--listen", "stdio://"]
+        deadline = 123456.5
+        command = generate.guardian_command(native, deadline)
+        self.assertEqual(command[:5], [sys.executable, generate.GUARDIAN,
+                                       "--parent-pid", str(os.getpid()), "--deadline"])
+        self.assertEqual(command[5], repr(float(deadline)))
+        self.assertEqual(command[6], "--")
+        self.assertEqual(command[7:], native)  # native argv verbatim after --
+        self.assertTrue(Path(generate.GUARDIAN).is_file())
+        # A caller cannot choose the wrapper: only the host passes pid/deadline.
+        self.assertEqual(generate.guardian_command(native, deadline, parent_pid=7)[3], "7")
+
+    def test_launched_native_command_is_wrapped_in_the_group_guardian(self):
+        captured = {}
+
+        class _Recorder:
+            def __init__(self, command, timeout):
+                captured["command"] = list(command)
+                self.deadline = timeout
+                self.active = None
+                self.pending = []
+                self.process = None
+
+            def request(self, method, params):
+                raise generate.bridge.BridgeError("rpc_error", "recorder stops here")
+
+            def close(self, interrupt=False):
+                captured["interrupt"] = interrupt
+
+        native = ["host-codex", "app-server", "--listen", "stdio://"]
+        fixed_deadline = time.monotonic() + 20.0
+        args = generate.parser().parse_args(["--state-dir", str(self.state), "--timeout", "30"])
+        with patch.object(generate, "capture_work_deadline", return_value=fixed_deadline), \
+                patch.object(generate, "generation_codex_command", return_value=list(native)), \
+                patch.object(generate.bridge, "resolve_codex_binary", return_value="host-codex"), \
+                patch.object(generate.bridge, "RpcClient", _Recorder), \
+                patch.object(generate.window_policy, "require_allowed", lambda: _window()), \
+                patch.object(sys, "stdin", _Stdin(json.dumps(self.request()).encode())):
+            result = generate.execute(args, command=None, emit=lambda _e: None,
+                                      qualify=lambda: {"qualified": True, "schema_supported": False})
+        self.assertFalse(result["ok"])
+        command = captured["command"]
+        self.assertEqual(command[1], generate.GUARDIAN)
+        self.assertEqual(command[2:4], ["--parent-pid", str(os.getpid())])
+        # The guardian receives the ORIGINAL captured monotonic work deadline...
+        self.assertEqual(command[5], repr(float(fixed_deadline)))
+        # ...and the host-fixed native argv verbatim.
+        self.assertEqual(command[7:], native)
+
     def test_qualify_passes_only_when_candidate_overrides_disable_every_relevant_feature(self):
         result = generate.qualify_native_contract(
             "x",

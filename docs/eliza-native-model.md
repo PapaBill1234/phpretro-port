@@ -19,11 +19,12 @@ A first, deliberately small vertical slice that makes the native ChatGPT
 subscription model (`gpt-6.1-sol`) the **main text provider** of the Eliza
 runtime, without ever running native filesystem/shell/web/MCP/agent tools.
 
-Two owned artifacts plus tests and this note:
+Three owned artifacts plus tests and this note:
 
 | Path | Role |
 |---|---|
 | `scripts/codex-generate.py` | Generic generation transport (stdin JSON → stdout JSONL). |
+| `scripts/native-group-guardian.py` | Linux process-group guardian wrapping the fixed native argv. |
 | `builder/eliza/native-model/index.mjs` | Physical ESM plugin registering the real model handlers + live stream. |
 | `builder/eliza/native-model/transport.mjs` | Child-process transport (env allowlist, JSONL reader). |
 | `builder/eliza/native-model/package.json` | ESM package manifest / loader entry (`openai-codex`). |
@@ -158,9 +159,10 @@ proven, so the generator blocks. The controls it evaluates:
 - **Text only**: any non-text item or unrecognized turn event aborts the turn;
   server-initiated requests are refused by `RpcClient`. Cancellation/timeout/
   provider errors interrupt the turn and terminate the app-server's own process
-  group — no success, no fallback. **Hard-parent cleanup is not covered**: only
-  the child's group is signalled, so a process a descendant re-parented outside
-  that group is *not* provably reclaimed, and that remains unqualified.
+  group — no success, no fallback. Hard-parent cleanup is delegated to the
+  group guardian below; a descendant that deliberately leaves the group
+  (for example with `setsid`) or a kernel-uninterruptible (`D`) process is
+  still *not* provably reclaimed and remains unqualified.
 
 ## Known limits and gaps (not closed)
 
@@ -198,10 +200,41 @@ proven, so the generator blocks. The controls it evaluates:
   implemented and controlled-fixture verified, but they are a *prerequisite*:
   generation still **blocks** on `unverified_runtime_toolset`, and this slice made
   **no live native call, login, account or model request** and started no service.
-- **Hard-parent cleanup remains unqualified.** Normal timeout/interrupt closes
-  the app-server's process group. Killing the Python transport from JavaScript
-  does not yet prove that its detached native group is reclaimed promptly.
-  That process-boundary acceptance remains open.
+- **Hard-parent cleanup prerequisite (implemented, real-process tested).**
+  `scripts/native-group-guardian.py` is launched by the reviewed `RpcClient`
+  (detached, `start_new_session=True`) as
+  `[sys.executable, native-group-guardian.py, --parent-pid P, --deadline D,
+  -- <native argv>]`, so it is the session/group leader that OWNS the native
+  process group. The generator wraps the fixed native argv in it and passes only
+  host-fixed values — `P = os.getpid()` and `D` the ORIGINAL captured monotonic
+  work deadline; a request JSON never reaches either. The guardian spawns the
+  native process with inherited stdin/stdout and `start_new_session=False`, so
+  `RpcClient` still speaks JSON-RPC directly to it. It installs its `SIGTERM`
+  handler BEFORE `PR_SET_PDEATHSIG(SIGTERM)` and checks the `prctl` result; it
+  refuses (before launch) an invalid parent (`<=1`, self, or a mismatched
+  `getppid`), an expired/dead deadline, an unsupported platform/`prctl`, or any
+  launch where the guardian is not BOTH the process-group and session leader
+  (a standalone invocation must not be able to kill a caller's group). The
+  parent is re-checked, together with the signal flag and the original deadline,
+  immediately before AND after the native spawn. It then monitors with bounded
+  polling (never an indefinite wait) and, on parent death/deadline/`TERM`/native
+  exit/startup failure, reclaims the owned group: `SIGTERM` the group, a FIXED
+  bounded grace (`<= 1 s`), then `SIGKILL` the whole group INCLUDING the
+  guardian so the group id cannot be reused while a member is still
+  unreachable. Further `SIGTERM` is ignored during cleanup, so a self-group
+  `TERM` or a repeated signal can neither recurse nor extend the grace. Its
+  stdout stays empty (that channel is the native RPC stream), stderr carries no
+  argv/env/config, and **a guardian exit is never a successful JSON-RPC
+  completion** — success is proven only by the native stream's exact
+  `turn/completed`, and a detach surfaces as `rpc_eof`. Real-process tests drive
+  a fake native/grandchild (no live native, account, model or network):
+  hard-`SIGKILL` of the Python parent while the native ignores EOF/`TERM`,
+  parent death at guardian startup, repeated `TERM`, the original deadline,
+  normal `RpcClient.close`, native early-exit with a surviving grandchild, and
+  invalid inputs/group-ownership/platform/`prctl` refusals — each tracking
+  process identity (start ticks) and non-running state with independent bounded
+  teardown. **This is a prerequisite, not a generation unblock**, and no GLOBAL
+  cleanup is claimed.
 - Installed-CLI feature-key names beyond the listed set are **not** confirmed;
   any key that proves unrecognized on the installed CLI must block, not be
   assumed away.
@@ -209,7 +242,8 @@ proven, so the generator blocks. The controls it evaluates:
 ## Verification (this slice)
 
 ```
-python3 -m unittest tests.ops.test_codex_generate   # 43 tests, process boundary + FakeRPC + contract/schema qualification + shared deadline
+python3 -m unittest tests.ops.test_codex_generate   # 45 tests, process boundary + FakeRPC + contract/schema qualification + shared deadline + guardian wrapper
+python3 -m unittest tests.ops.test_native_guardian  # 25 guardian process/race/observation checks (fake native/grandchild; no live native/account/model/network)
 node builder/eliza/native-model/native-model.fixture.mjs   # 19/19 controlled checks (draft handlers)
 python3 -m unittest tests.ops.test_codex_bridge      # 13 tests, dependency unchanged
 ```
@@ -226,4 +260,6 @@ Gap ledger entry (to be added to `docs/gaps.md` by the integrator, G05):
 native-Sol main text provider — pure-text handlers/transport implemented as a
 draft; **native generation blocked** because the installed build cannot prove a
 tool-free runtime toolset (experimental isolation fields confirmed, but the
-builtin registry is unqualified). Real native acceptance remains open.
+builtin registry is unqualified). The detached-group hard-parent cleanup
+prerequisite is now implemented and real-process verified (group guardian), but
+it does **not** unblock generation. Real native acceptance remains open.

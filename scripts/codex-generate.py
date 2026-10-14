@@ -297,6 +297,34 @@ def generation_codex_command(binary: str = "codex"):
     return command
 
 
+GUARDIAN = str(Path(__file__).resolve().parent / "native-group-guardian.py")
+
+
+def guardian_command(native_argv, deadline, parent_pid=None):
+    """Wrap the host-fixed native argv in the Linux process-group guardian.
+
+    ``parent_pid`` defaults to this process and ``deadline`` MUST be the ORIGINAL
+    captured absolute monotonic work deadline; a caller request JSON can never
+    supply either. ``RpcClient`` starts the guardian detached
+    (``start_new_session=True``) so the guardian is the session/group leader and
+    owns the native process group, letting it reclaim that group after a hard
+    parent death. The guardian never writes to stdout (that channel is the native
+    RPC stream) and its exit is never a successful JSON-RPC completion; the
+    native argv is preserved verbatim after ``--``.
+    """
+    pid = os.getpid() if parent_pid is None else parent_pid
+    return [
+        sys.executable,
+        GUARDIAN,
+        "--parent-pid",
+        str(pid),
+        "--deadline",
+        repr(float(deadline)),
+        "--",
+        *native_argv,
+    ]
+
+
 def _require_native_elf(binary: str) -> None:
     """Refuse any executable that is not the native ELF.
 
@@ -906,6 +934,11 @@ def execute(args, command=None, emit=None, qualify=None):
             if command is None:
                 command = generation_codex_command(bridge.resolve_codex_binary(args.codex_bin))
             _check_budget("app-server launch")
+            # The launched command is ALWAYS the guardian-wrapped native argv, so
+            # a hard parent death still reclaims the detached native group. The
+            # guardian receives the host PID and the ORIGINAL captured monotonic
+            # work deadline — never a value from the request JSON.
+            command = guardian_command(command, work_deadline)
             client = bridge.RpcClient(command, _budget_timeout(args.timeout))
             # Retain the ABSOLUTE clamp: the RPC client deadline can never exceed
             # the captured work deadline, even if the remaining budget shrank
