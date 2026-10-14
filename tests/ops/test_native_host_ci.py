@@ -626,6 +626,33 @@ class OrchestrationFixtureTests(unittest.TestCase):
             self.assertEqual(receipt["build_inputs"]["binary"]["sha256"],
                              ci.sha256_file(host._binary))
 
+    def test_absent_private_root_is_created_before_the_resource_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
+            host = FakeHost(tmp, patch_dir=patch_dir)
+            host._build = build
+            host._test_output = passing_output(ci.EXPECTED_TESTS)
+            # A fresh checkout has no private build root.  Mirror shutil.disk_usage,
+            # which raises FileNotFoundError on an absent directory: if the wrapper's
+            # mkdir is removed, the run fails with "os error during preflight" rather
+            # than creating the root first.
+            absent = Path(tmp) / "fresh" / "native-host"
+            self.assertFalse(absent.exists())
+            host.private_root = lambda root: absent
+
+            def strict_preflight(path):
+                if not Path(path).is_dir():
+                    raise FileNotFoundError(2, "No such file or directory", str(path))
+                host.calls.append(("preflight_resources", str(path)))
+                return {"free_disk_bytes": 20 * 1024 ** 3,
+                        "available_ram_bytes": 8 * 1024 ** 3}
+
+            host.preflight_resources = strict_preflight
+            qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
+                                                   lock_digest)
+            self.assertTrue(qualified, reason)
+            self.assertTrue(absent.is_dir())
+
     def test_build_failure_refuses_and_ships_no_qualified_binary(self):
         with tempfile.TemporaryDirectory() as tmp:
             patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
