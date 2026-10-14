@@ -42,6 +42,34 @@ verified unheld afterward. Sanitized failure evidence is retained in
 `.builder/current-workers/native-resource-fit/resource-fit-build-result.json`.
 The trusted source/toolchain/cache remain; compiled qualification is open.
 
+## Reviewed diagnostics, contributors and local credentials — 2026-10-14
+
+- Stop-evidence worker `3d0f20334d7b1b6d0879ca3eb7bb1b53cad149b3`, feature
+  `bb46b53`: independent source acceptance; root 103 focused tests in 30.885
+  seconds; 30 upstream and 25 guardian checks reported passing; CI
+  `38623378307` passed. Failure receipts remain diagnostic evidence only.
+- Contributor worker `4456779d5c1b57279badf773b7a182fa699b7dcb`, feature
+  `0961dfe`: independent source acceptance; root standalone ordered apply
+  changed actual target bytes and verified patch `3caae90b…a23c749`, target
+  `f4f70ca1…619208f`; CI `38622273763` passed. Four new tests remain uncompiled.
+- Local-credential worker `7a2615a93a4cd1788a757c40ba20595a7a2e3e30`, feature
+  `305b94c`: independent source acceptance; root 121 candidate tests in 19.162
+  seconds with two source-availability skips; CI `38622569264` passed. Root
+  separately ran the pinned production vault encrypt/recovery test in fresh
+  processes with no skip (0.205 seconds).
+
+The actual isolated host subsequently reached runtime-ready. Read-only HTTP
+receipts prove owner/no-Origin 200, missing credentials 401, foreign-Origin 403
+and a 29-view catalog. The UI Origin received `origin-not-configured` 403. The
+browser attempt occurred after the bounded host stopped and failed to connect;
+its namespace is retired. These results do not establish USER/gateway rejection,
+DynamicViewLoader mounting, new-chat persistence, live queues or native admission.
+Verbose sanitized receipts and quota-reserve checkpoint remain private.
+
+CI-wrapper candidate `d59f8b8` passed 38 fixture tests and was then rejected in
+source review for five material gaps. Its working repair is not accepted or
+integrated; no heavy native CI build or artifact import is claimed.
+
 # Checkpoint validation — 2026-10-11
 
 This is a runnable development foundation, not the completed CMS/game port.

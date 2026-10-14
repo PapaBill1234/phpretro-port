@@ -163,3 +163,37 @@ actual authenticated OWNER/USER transport, browser mounting, two-room new-chat
 persistence/reload and live queues remain unverified. A privately installed
 Chromium launched successfully, which establishes browser availability only.
 The expired original run and operator state were preserved. G05/G06 stay Partial.
+
+## G05/G06 reviewed continuation — 2026-10-14
+
+The accepted stop-evidence repair (`3d0f203`, feature `bb46b53`) now records
+atomic, sanitized failure receipts for pre-launch RAM refusal, launch/log I/O,
+cleanup and child failures, with explicit compiler-child scope. Root verified
+103 focused tests; worker CI `38623378307` passed. It does not establish the
+cause of the earlier failure or a completed native binary.
+
+The extension/hosted contributor artifact (`4456779`, feature `0961dfe`) passed
+independent source review and actual ordered apply/hash checks. Invalid
+`Arc::make_mut` calls on non-Clone Session/TurnContext were repaired. Its four
+tests remain uncompiled/unrun; real MCP catalog injection, executor dispatch
+and nested mappings remain open.
+
+Per-run local credentials (`7a2615a`, feature `305b94c`) passed independent
+review after FIFO-safe loading and complete parent validation fixes. Worker CI
+`38622569264` passed; root verified 121 candidate tests and actual pinned vault
+recovery across fresh processes. A fresh isolated production host reported
+runtime-ready. Live HTTP checks returned owner/no-Origin status 200, absent
+credentials 401, foreign Origin 403, and a 29-view catalog. The configured UI
+Origin was refused with `origin-not-configured`; its separate companion setting
+still needs wiring. USER/gateway acceptance, browser mounting and two-room
+new-chat persistence/reload remain open. No native model admission follows from
+the application's ready status. The bounded host stopped; its test namespace
+was retired after an uncaught browser connection error exposed its ephemeral
+test token. No credential was committed.
+
+The CI build design was reviewed for a larger hosted runner. Candidate `d59f8b8`
+was rejected for result parsing, unused parent-environment filtering, missing
+stop evidence/final preservation checks and stale artifact contents. A repair
+draft remains unreviewed. No heavy CI build, binary import or compiled
+qualification has run. Fresh quota reached the required 10% reserve; private
+handoff records the unfinished drafts. **G05/G06 remain Partial.**
