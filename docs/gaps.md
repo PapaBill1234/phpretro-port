@@ -232,7 +232,15 @@ cannot override it and the UI child never receives it. Worker commit `8e9e4b7`
 plus a doc-qualifier `5e0e863`, integrated as `29dc04b`/`1586212`. DeepSeek
 independent source review found no defects; standard Verify CI passed for both
 worker-branch SHAs (`38638478078`, `38638840061`); root `tests.ops.test_eliza_dashboard`
-Ran 66 tests OK and `scripts/repo-check.py` passed. This is a source-only change:
-live same-UI-Origin acceptance, browser mounting and USER/gateway boundaries
-remain unqualified and no native/generation admission follows. The native
-CI-wrapper repair is integrated separately (see the paragraph above).
+Ran 66 tests OK and `scripts/repo-check.py` passed. Live verification followed on
+2026-10-14 in a fresh namespace `acceptance-20261014-v41a` against `db95e6d`: an
+isolated acceptance host reached runtime-ready with `api`/`ui` running, and the
+API on `127.0.0.1:18831` answered unauthenticated `/api/status` and `/api/views`
+with 401, an empty bearer with 401, a foreign `Origin` with 403, the owner bearer
+with 200, and **owner bearer + the same UI origin** with 200 — the case that
+previously returned 403 `origin-not-configured` — while the foreign origin stayed
+403. The run was stopped cleanly (`terminated: ["api","ui","supervisor"]`) and no
+listener remained. Still unqualified: browser/UI mounting, the USER
+(non-owner) boundary, chat/two-room history and reload (generation is not
+admitted), and any native/compiled claim; no native/generation admission follows.
+The native CI-wrapper repair is integrated separately (see the paragraph above).
