@@ -263,4 +263,7 @@ The API child exports `PHP_RETRO_COMPANION_TRUSTED_ORIGINS` (the var the pinned
 companion plugin reads) from the immutable `profile.allowed_origins` — the exact
 same allowlist as `ELIZA_ALLOWED_ORIGINS`, on both `build_env` return paths.
 Ambient environment values cannot override it, and the UI child does not receive
-it, so the same-UI Origin is no longer denied as `origin-not-configured`.
+it, so the plugin's allowlist is no longer empty for a dashboard-launched API
+child and that `origin-not-configured` reason code cannot fire. Source-only
+change: live browser mounting and same-UI Origin acceptance remain unqualified,
+and **G06 stays Partial**.
