@@ -194,9 +194,23 @@ test token. No credential was committed.
 The CI build design was reviewed for a larger hosted runner. Candidate `d59f8b8`
 was rejected for result parsing, unused parent-environment filtering, missing
 stop evidence/final preservation checks and stale artifact contents. A repair
-draft remains unreviewed. No heavy CI build, binary import or compiled
-qualification has run. Fresh quota reached the required 10% reserve; private
-handoff records the unfinished drafts. **G05/G06 remain Partial.**
+`d7fc668` now addresses all five findings (module-qualified Rust result matching
+for the 19 published tests, full child-environment isolation, truthful
+stop/build receipts, post-test preservation rechecks, fresh atomic artifact
+publication); a **DeepSeek** bounded review passed all four checked scopes with
+no confirmed defects, `tests.ops.test_native_host_ci` Ran 59 tests OK and
+`tests.ops.test_native_host_setup` Ran 103 tests OK, and Verify CI passed on the
+worker branch. It is integrated as `bb9dc77`, and exact-SHA standard Verify CI
+passed for that push (`38641368485`). The push-only workflow then dispatched its
+first real hosted Ubuntu 24.04 run (`38641368461`), which refused in 9s with
+`"qualified": false, "reason": "os error during preflight"`: the wrapper called
+`shutil.disk_usage` on a private build root that a fresh checkout has not
+created yet. Creating that root (idempotent, before any heavy work) is repaired
+in the following commit; `tests.ops.test_native_host_ci` Ran 59 tests OK and
+`tests.ops.test_native_host_setup` Ran 103 tests OK against the repaired source.
+No compiled binary, artifact import or compiled qualification has been verified,
+and the hosted runner has not re-run since the repair. **G05/G06 remain
+Partial.**
 
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
@@ -209,5 +223,4 @@ worker-branch SHAs (`38638478078`, `38638840061`); root `tests.ops.test_eliza_da
 Ran 66 tests OK and `scripts/repo-check.py` passed. This is a source-only change:
 live same-UI-Origin acceptance, browser mounting and USER/gateway boundaries
 remain unqualified and no native/generation admission follows. The native
-CI-wrapper repair (`codex/eliza-native-ci-build-v41`) and any hosted compiled
-run remain open, unreviewed and unintegrated.
+CI-wrapper repair is integrated separately (see the paragraph above).

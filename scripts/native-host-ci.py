@@ -716,6 +716,10 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
             with scoped_gate_cutoff(host, deadline):
                 wrapper_stage = "preflight"
                 _enter_stage(outcome, wrapper_stage)
+                # A fresh checkout has no private build root yet, and the disk/
+                # RAM preflight must not fail on the absent directory itself.
+                # Creating the root is idempotent and precedes any heavy work.
+                private_root.mkdir(parents=True, exist_ok=True)
                 resources = host.preflight_resources(private_root)
                 wrapper_stage = "source"
                 _enter_stage(outcome, wrapper_stage)
