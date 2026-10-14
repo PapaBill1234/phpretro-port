@@ -340,6 +340,65 @@ class DeadlinePropagationTest(unittest.TestCase):
             self.assertFalse(host.plugins_custom_dir(root).exists())
 
 
+class CapturedDeadlineTest(unittest.TestCase):
+    """The effective caller/canonical cutoff must bound launch validation."""
+
+    def _run_start(self, root, namespace, canonical, saved, window):
+        cutoff = root / namespace / "cutoff.json"
+        cutoff.parent.mkdir(parents=True)
+        cutoff.write_text(json.dumps({"stop_at": saved}) + "\n")
+        before = cutoff.read_bytes()
+        seen = {}
+
+        def fake_validate(_root, deadline=None):
+            seen["deadline"] = deadline
+            seen["remaining"] = None if deadline is None else deadline - time.monotonic()
+            host._remaining(time.monotonic() - 1, "slow source validation")
+
+        with host._Namespace(namespace), \
+                mock.patch.object(host.dash, "require_window", return_value={"stop_at": canonical}), \
+                mock.patch.object(host.dash, "port_free"), \
+                mock.patch.object(host, "_reserve_ports"), \
+                mock.patch.object(host, "validate_overlay_source", side_effect=fake_validate), \
+                mock.patch.object(host.dash.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print"):
+            code = host.cmd_start(root, SimpleNamespace(deadline=window))
+        return code, before, cutoff, seen, popen
+
+    def test_start_threads_caller_window_into_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ns = host.RUNS_REL / "short"
+            now = datetime.now(timezone.utc)
+            later = (now + timedelta(hours=1)).isoformat()
+            code, before, cutoff, seen, popen = self._run_start(root, ns, later, later, 30)
+            self.assertEqual(code, 2)
+            popen.assert_not_called()                             # no child launch
+            self.assertEqual(cutoff.read_bytes(), before)         # saved bytes unchanged
+            self.assertIsNotNone(seen["deadline"])
+            self.assertLessEqual(seen["remaining"], 30)           # bounded by caller window
+            self.assertGreater(seen["remaining"], 0)
+            with host._Namespace(ns):                             # admission released
+                released = host.require_admission(root)
+                released.__enter__()
+                released.__exit__(None, None, None)
+
+    def test_shorter_canonical_reaches_validator_over_later_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ns = host.RUNS_REL / "canon"
+            now = datetime.now(timezone.utc)
+            code, before, cutoff, seen, popen = self._run_start(
+                root, ns, (now + timedelta(seconds=20)).isoformat(),
+                (now + timedelta(hours=1)).isoformat(), 300)
+            self.assertEqual(code, 2)
+            popen.assert_not_called()
+            self.assertEqual(cutoff.read_bytes(), before)
+            self.assertIsNotNone(seen["deadline"])
+            self.assertLessEqual(seen["remaining"], 20)           # bounded by canonical
+            self.assertGreater(seen["remaining"], 0)
+
+
 class PrivateBoundaryTest(unittest.TestCase):
     def test_symlinked_provenance_package_and_overlay_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

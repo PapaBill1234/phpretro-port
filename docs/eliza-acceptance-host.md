@@ -59,6 +59,14 @@ or state write, then revalidated under admission: `cutoff.json` is created
 or caller limits are computed in memory only, and `check` never captures a
 cutoff.
 
+`start` captures the effective cutoff (caller window vs current canonical vs
+saved) **once** under admission and threads that exact stop through the source
+validator, `launch_deadline`, `launch_problems` and every profile callback. Slow
+source validation is therefore bounded by the shorter of the caller deadline and
+the canonical window even when a longer cutoff was already saved — the saved file
+is never rewritten and the delegated supervisor's gate callback can only tighten
+against the current canonical, never extend the captured deadline.
+
 ## Private copy and provenance
 
 `setup` builds `.builder/eliza-acceptance/source` as **regular copies** of the

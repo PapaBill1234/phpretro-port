@@ -243,7 +243,7 @@ def _reject_namespace_symlinks(root):
 
 
 # --- source / profile -------------------------------------------------------
-def _acceptance_source(root, ns=None):
+def _acceptance_source(root, ns=None, captured_stop=None):
     ns = _current_rel() if ns is None else Path(ns)
     return {
         "name": "eliza-acceptance-overlay",
@@ -258,8 +258,9 @@ def _acceptance_source(root, ns=None):
         "vite": Path("node_modules") / "vite" / "bin" / "vite.js",
         "api_cwd": Path("."),
         "ui_cwd": Path("packages") / "app",
-        # Registered validator: overlay vs canonical runtimes; never a caller value.
-        "validate": _bound(ns, lambda root: validate_overlay_source(root, launch_deadline(root))),
+        # Registered validator: overlay vs canonical runtimes; never a caller
+        # value.  The effective captured deadline bounds the whole validation.
+        "validate": _bound(ns, lambda root: validate_overlay_source(root, launch_deadline(root, captured_stop))),
     }
 
 
@@ -281,8 +282,13 @@ def _verify_canonical_source(root, deadline=None):
     return state
 
 
-def launch_deadline(root):
-    stop = read_cutoff(root)
+def launch_deadline(root, captured_stop=None):
+    """Deadline for launch validation.
+
+    Prefers the effective cutoff captured by ``start`` (caller/canonical clamp)
+    and falls back to the immutable saved cutoff for other callers.
+    """
+    stop = captured_stop if captured_stop is not None else read_cutoff(root)
     if stop is None:
         return None
     deadline = time.monotonic() + stop.timestamp() - time.time() - 5
@@ -290,8 +296,8 @@ def launch_deadline(root):
     return deadline
 
 
-def launch_problems(root):
-    deadline = launch_deadline(root)
+def launch_problems(root, captured_stop=None):
+    deadline = launch_deadline(root, captured_stop)
     verify_overlay(root, deadline)
     if not _dropin_ready(root, deadline):
         return ["acceptance drop-ins not verified"]
@@ -316,11 +322,13 @@ def validate_overlay_source(root, deadline=None):
     return {"name": "eliza-acceptance-overlay", "pin": UPSTREAM_PIN, "readiness": True}
 
 
-def acceptance_profile(root, window_s=DEFAULT_WINDOW_S):
+def acceptance_profile(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
     """The single immutable acceptance launch profile.
 
     Every callback is bound to the namespace selected when the profile was
-    built, so a later namespace restore cannot move a running launch.
+    built, so a later namespace restore cannot move a running launch.  When
+    ``captured_stop`` is given (always from ``start``), it threads the effective
+    caller/canonical cutoff through validation and the gate.
     """
     ns = _current_rel()
     state = state_dir(root)
@@ -332,7 +340,7 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S):
         ui_port=UI_PORT,
         allowed_origins=ALLOWED_ORIGINS,
         allowed_hosts=API_HOST,
-        source=_acceptance_source(root, ns),
+        source=_acceptance_source(root, ns, captured_stop),
         run_path=overlay_dir(root),
         secrets=(),
         dotenv=None,
@@ -341,9 +349,9 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S):
         routing=False,
         home=state / "home",
         window_seconds=window_s,
-        gate=_bound(ns, lambda r: acceptance_gate(r, window_s)),
+        gate=_bound(ns, lambda r: acceptance_gate(r, window_s, captured_stop)),
         load_secrets=_bound(ns, lambda r, s: _acceptance_secrets(r)),
-        verify=_bound(ns, lambda r, s: launch_problems(r)),
+        verify=_bound(ns, lambda r, s: launch_problems(r, captured_stop)),
     )
 
 
@@ -410,12 +418,26 @@ def _ensure_cutoff(root, stop_at):
         handle.write(payload)
 
 
-def acceptance_gate(root, window_s=DEFAULT_WINDOW_S):
+def acceptance_gate(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
+    """Gate the run, capturing the effective cutoff once.
+
+    Without ``captured_stop`` this captures and returns the effective stop
+    (caller window vs canonical vs saved), creating ``cutoff.json`` once.  With
+    ``captured_stop`` (the gate callback invoked by the delegated supervisor) it
+    may only tighten against the current canonical and the saved file — it never
+    extends the captured deadline and never rewrites the file.
+    """
     root = Path(root)
-    stop_at = effective_cutoff(root, window_s)  # memory-only clamp
+    if captured_stop is None:
+        stop_at = effective_cutoff(root, window_s)  # capture, memory-only clamp
+    else:
+        stop_at = min(captured_stop, _canonical_stop(root))
+        saved = read_cutoff(root)
+        if saved is not None:
+            stop_at = min(stop_at, saved)
     if datetime.now(timezone.utc) >= stop_at:
         raise AcceptanceError("acceptance cutoff reached; no launch")
-    _ensure_cutoff(root, stop_at)  # created once, exclusively, under the run lock
+    _ensure_cutoff(root, stop_at)  # created once, exclusively, under admission
     return {"stop_at": stop_at.isoformat(), "allowed": True}
 
 
@@ -1071,7 +1093,11 @@ def cmd_start(root, _argv=None):
                               "reason": "namespace active"}))
             return 1
         _reserve_ports()  # both ports checked under admission
-        profile = acceptance_profile(root, window_s)
+        # Capture the effective caller/canonical cutoff once, under admission,
+        # and thread it through validation so slow work cannot overrun it.
+        captured = acceptance_gate(root, window_s)
+        captured_stop = datetime.fromisoformat(captured["stop_at"])
+        profile = acceptance_profile(root, window_s, captured_stop)
         return dash.cmd_start(root, profile.source, profile)
     finally:
         admission.__exit__(None, None, None)
