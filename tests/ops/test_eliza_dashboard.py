@@ -429,6 +429,49 @@ class DashboardTests(unittest.TestCase):
         for tier in dash.TEXT_TIERS:
             self.assertEqual(api_env[f"OPENAI_{tier}_MODEL"], "deepseek-flash")
 
+    def test_build_env_exports_companion_trusted_origins_to_api_only(self):
+        # Compat default profile: companion plugin env var carries the exact
+        # immutable profile allowlist, API child only.
+        profile = self.root / "prof"
+        profile.mkdir()
+        secrets = {"api_token": "apitok", "vault_passphrase": "vaultpw",
+                   "deepseek_key": KEY, "profile": profile}
+        api_env, ui_env = dash.build_env(self.source, secrets)
+        self.assertEqual(api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                         dash.DASHBOARD_PROFILE.allowed_origins)
+        self.assertEqual(api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                         api_env["ELIZA_ALLOWED_ORIGINS"])
+        self.assertNotIn("PHP_RETRO_COMPANION_TRUSTED_ORIGINS", ui_env)
+        # Non-compat local-auth acceptance profile (earlier return path).
+        nc = self._noncompat_profile(True)
+        nc_secrets = {"profile": Path("/tmp/runtime"),
+                      "api_token": "A" * 43, "vault_passphrase": "B" * 43}
+        api_env, ui_env = dash.build_env(self.source, nc_secrets, nc)
+        self.assertEqual(api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                         nc.allowed_origins)
+        self.assertNotIn("PHP_RETRO_COMPANION_TRUSTED_ORIGINS", ui_env)
+
+    def test_build_env_companion_origins_ignore_hostile_ambient(self):
+        # A foreign ambient value must never override the profile allowlist,
+        # and the ambient os.environ entries are left untouched.
+        profile = self.root / "prof"
+        profile.mkdir()
+        secrets = {"api_token": "apitok", "vault_passphrase": "vaultpw",
+                   "deepseek_key": KEY, "profile": profile}
+        with mock.patch.dict(os.environ, {
+                "PHP_RETRO_COMPANION_TRUSTED_ORIGINS": "https://evil.example",
+                "ELIZA_ALLOWED_ORIGINS": "https://evil.example"}):
+            api_env, ui_env = dash.build_env(self.source, secrets)
+            self.assertEqual(api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                             dash.DASHBOARD_PROFILE.allowed_origins)
+            self.assertNotEqual(api_env["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                                "https://evil.example")
+            self.assertEqual(os.environ["PHP_RETRO_COMPANION_TRUSTED_ORIGINS"],
+                             "https://evil.example")
+            self.assertEqual(os.environ["ELIZA_ALLOWED_ORIGINS"],
+                             "https://evil.example")
+        self.assertNotIn("PHP_RETRO_COMPANION_TRUSTED_ORIGINS", ui_env)
+
     # -- check / status (no inference, no launch) ---------------------------
     def test_check_does_not_launch_or_print_secrets(self):
         self._gate()

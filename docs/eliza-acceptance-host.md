@@ -256,3 +256,11 @@ probe output is booleans/status only; no plaintext credential is logged or
 committed. Adapter and dashboard suites pass (107 existing + new checks). The
 configured host startup and browser mounting remain unqualified, the native
 provider guard stays false, and **G06 stays Partial**.
+
+## Companion trusted origins for the API child — 2026-10-14
+
+The API child exports `PHP_RETRO_COMPANION_TRUSTED_ORIGINS` (the var the pinned
+companion plugin reads) from the immutable `profile.allowed_origins` — the exact
+same allowlist as `ELIZA_ALLOWED_ORIGINS`, on both `build_env` return paths.
+Ambient environment values cannot override it, and the UI child does not receive
+it, so the same-UI Origin is no longer denied as `origin-not-configured`.
