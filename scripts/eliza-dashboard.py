@@ -102,6 +102,80 @@ CONFIG_SOURCE = {
 
 SECRET_FILES = ("api.token", "vault.passphrase")
 
+
+# Fields whose value may be supplied as a zero-arg callable so the dashboard
+# profile reflects the live module constants (tests and operators adjust the
+# ports in place); a concrete value is returned verbatim.
+_DYNAMIC_PROFILE_FIELDS = frozenset({
+    "state_relative", "api_host", "api_port", "ui_port", "allowed_origins",
+    "allowed_hosts", "run_path",
+})
+
+# Defaults for optional fields omitted from a profile.
+_PROFILE_DEFAULTS = {
+    "secrets": (), "dotenv": None, "compat": True, "autonomy": True,
+    "routing": True, "home": None, "window_seconds": None, "gate": None,
+    "load_secrets": None, "verify": None,
+}
+
+
+class LaunchProfile:
+    """Immutable, internally registered launch identity.
+
+    Only profiles constructed in reviewed code exist; there is deliberately no
+    CLI flag that supplies a path, port, origin or policy.  The dashboard
+    default (``DASHBOARD_PROFILE``) reproduces the previously hard-coded values,
+    and reads the live module constants so existing behaviour and tests are
+    unchanged.  Instances are frozen after construction.
+    """
+    __slots__ = ("_fields",)
+
+    def __init__(self, **fields):
+        object.__setattr__(self, "_fields", dict(fields))
+
+    def __getattr__(self, name):
+        fields = object.__getattribute__(self, "_fields")
+        if name in fields:
+            value = fields[name]
+            if name in _DYNAMIC_PROFILE_FIELDS and callable(value):
+                return value()
+            return value
+        if name in _PROFILE_DEFAULTS:
+            return _PROFILE_DEFAULTS[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("launch profile is immutable")
+
+    def get(self, name, default=None):
+        try:
+            return getattr(self, name)
+        except AttributeError:
+            return default
+
+
+# The single reviewed dashboard profile: identical to the prior hard-coded
+# constants (read live), so default `check`/`start`/`status`/`stop` behaviour and
+# the existing dashboard tests are preserved.
+DASHBOARD_PROFILE = LaunchProfile(
+    name="eliza-dashboard",
+    state_relative=lambda: STATE_RELATIVE,
+    api_host=lambda: API_HOST,
+    api_port=lambda: API_PORT,
+    ui_port=lambda: UI_PORT,
+    allowed_origins=lambda: PUBLIC_ORIGIN,
+    allowed_hosts=lambda: PUBLIC_HOST,
+    source=CONFIG_SOURCE,
+    run_path=lambda: CONFIG_SOURCE["path"],
+    secrets=SECRET_FILES,
+    dotenv=DOTENV_RELATIVE,
+    compat=True,
+    autonomy=True,
+    routing=True,
+    gate=lambda root: require_window(root),
+    load_secrets=lambda root, state: load_secrets(root, state),
+)
+
 # Reviewed temporary deployment transport (independently approved by native Sol
 # after exact-contract tests). Embedded verbatim from the private reference so
 # this launcher is repeatable. It forces DeepSeek chat completions onto the
@@ -157,21 +231,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def state_path(root) -> Path:
-    return Path(root) / STATE_RELATIVE
+def state_path(root, profile=DASHBOARD_PROFILE) -> Path:
+    return Path(root) / profile.state_relative
 
 
 # --------------------------------------------------------------------------
 # Private filesystem helpers
 # --------------------------------------------------------------------------
 
-def ensure_state_dir(root) -> Path:
+def ensure_state_dir(root, profile=DASHBOARD_PROFILE) -> Path:
     """Create/validate the private state directory (0700, owned, no symlinks)."""
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise DashboardError("project root is not a safe directory")
     current = root
-    for part in STATE_RELATIVE.parts:
+    for part in profile.state_relative.parts:
         current = current / part
         try:
             info = current.lstat()
@@ -550,6 +624,10 @@ def validate_source(source=CONFIG_SOURCE, root=ROOT) -> dict:
     is executed. An injected/isolated source keeps its explicit paths and is
     checked directly, so a fixture never touches the private ROOT runtime tree.
     """
+    if callable(source.get("validate")):
+        # Explicitly registered source (e.g. the isolated acceptance overlay):
+        # it carries its own reviewed validator; no caller path is trusted.
+        return source["validate"](root)
     if source.get("managed"):
         return _validate_managed_source(root, source)
     src = Path(source["path"])
@@ -650,26 +728,32 @@ def load_secrets(root, state) -> dict:
     return values
 
 
-def build_env(source, secrets):
-    """Return (api_env, ui_env). The UI receives no key, passphrase or API token."""
+def build_env(source, secrets, profile=DASHBOARD_PROFILE):
+    """Return (api_env, ui_env). The UI receives no key, passphrase or API token.
+
+    The child environment is an allowlist built from scratch: nothing from the
+    ambient ``os.environ`` is inherited except an explicit private HOME (or the
+    operator HOME for the dashboard profile), so no DB URL, provider key or
+    profile leaks in.
+    """
     node_bin = Path(source["node"])
     bun_bin = Path(source["bun"])
     base = {
-        "HOME": os.environ.get("HOME", ""),
+        "HOME": str(profile.home) if profile.home else os.environ.get("HOME", ""),
         "USER": os.environ.get("USER", "ubuntu"),
         "LANG": "C.UTF-8",
         "PATH": f"{node_bin.parent}:{bun_bin.parent}:/usr/bin:/bin",
         "NO_COLOR": "1",
         "ELIZA_STATE_DIR": str(secrets["profile"]),
         "ELIZA_CONFIG_PATH": str(secrets["profile"] / "eliza.json"),
-        "ELIZA_API_BIND": API_HOST,
-        "ELIZA_API_PORT": str(API_PORT),
-        "ELIZA_UI_PORT": str(UI_PORT),
+        "ELIZA_API_BIND": profile.api_host,
+        "ELIZA_API_PORT": str(profile.api_port),
+        "ELIZA_UI_PORT": str(profile.ui_port),
         "ELIZA_NODE_PATH": str(node_bin),
         "ELIZA_REQUIRE_LOCAL_AUTH": "1",
-        "ELIZA_ALLOWED_ORIGINS": PUBLIC_ORIGIN,
-        "ELIZA_ALLOWED_HOSTS": PUBLIC_HOST,
-        "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": PUBLIC_HOST,
+        "ELIZA_ALLOWED_ORIGINS": profile.allowed_origins,
+        "ELIZA_ALLOWED_HOSTS": profile.allowed_hosts,
+        "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": profile.allowed_hosts,
         # Environment skips preserved from the reviewed launch design.
         "ELIZA_DISABLE_LOCAL_EMBEDDINGS": "1",
         "ELIZA_SKIP_LOCAL_VOICE_WARMUP": "1",
@@ -678,6 +762,15 @@ def build_env(source, secrets):
         "ELIZA_DISABLE_VAULT_PROFILE_RESOLVER": "1",
     }
     api_env = dict(base)
+    if not profile.compat:
+        # Acceptance profile: explicit private DB/workspace, no ambient URLs.
+        base["PGLITE_DATA_DIR"] = str(secrets["profile"] / "db")
+        base["ELIZA_WORKSPACE_DIR"] = str(secrets["profile"] / "workspace")
+        api_env.update(base)
+        # Acceptance profile: no model credential, no autonomy, no cloud keys.
+        api_env["ENABLE_AUTONOMY"] = "false"
+        api_env["ELIZA_AGENT_ORCHESTRATOR"] = "0"
+        return api_env, dict(base)
     api_env["ELIZA_API_TOKEN"] = secrets["api_token"]
     api_env["ELIZA_VAULT_PASSPHRASE"] = secrets["vault_passphrase"]
     api_env["ELIZA_VAULT_DISABLE_KEYCHAIN"] = "1"
@@ -690,15 +783,19 @@ def build_env(source, secrets):
     return api_env, dict(base)
 
 
-def child_commands(source, compat_path=None):
+def child_commands(source, compat_path=None, profile=DASHBOARD_PROFILE):
     src = Path(source["path"])
     api = [str(source["bun"]), "--no-install", "--conditions=eliza-source"]
+    if not profile.compat:
+        # Isolated acceptance launch: never read an ambient .env file.
+        api = [str(source["bun"]), "--no-env-file", "--no-install",
+               "--conditions=eliza-source"]
     if compat_path is not None:
         api += ["--preload", str(Path(compat_path).resolve())]
     api += ["packages/app/src/entry.ts", "start"]
     ui = [str(source["node"]), "--conditions=eliza-source", "--import", "tsx",
           str(src / "node_modules/vite/bin/vite.js"), "--configLoader", "bundle",
-          "--host", API_HOST, "--port", str(UI_PORT), "--strictPort"]
+          "--host", profile.api_host, "--port", str(profile.ui_port), "--strictPort"]
     return api, ui
 
 
@@ -846,10 +943,10 @@ def read_runtime(state):
 # Commands
 # --------------------------------------------------------------------------
 
-def cmd_check(root, source=CONFIG_SOURCE) -> int:
+def cmd_check(root, source=CONFIG_SOURCE, profile=DASHBOARD_PROFILE) -> int:
     problems, detail = [], {}
     try:
-        state = ensure_state_dir(root)
+        state = ensure_state_dir(root, profile)
     except DashboardError as exc:
         print(json.dumps({"command": "check", "ok": False, "problems": [str(exc)]}))
         return 2
@@ -858,7 +955,7 @@ def cmd_check(root, source=CONFIG_SOURCE) -> int:
     except DashboardError as exc:
         problems.append(str(exc))
     try:
-        window = require_window(root)
+        window = profile.gate(root)
         detail["window"] = {"allowed": True, "stop_at": window.get("stop_at")}
     except DashboardError as exc:
         problems.append(str(exc))
@@ -867,46 +964,56 @@ def cmd_check(root, source=CONFIG_SOURCE) -> int:
     if status == "error":
         problems.append("dashboard lock is unsafe")
     release_lock(fd)
-    for port in (API_PORT, UI_PORT):
+    for port in (profile.api_port, profile.ui_port):
         try:
-            port_free(port)
+            port_free(port, profile.api_host)
         except OSError:
             problems.append(f"loopback port {port} is busy")
-    missing = [name for name in SECRET_FILES if secret_state(Path(state) / name) == "missing"]
-    unsafe = [name for name in SECRET_FILES if secret_state(Path(state) / name) == "unsafe"]
-    if secret_state(Path(root) / DOTENV_RELATIVE) == "missing":
-        missing.append(str(DOTENV_RELATIVE))
-    if secret_state(Path(root) / DOTENV_RELATIVE) == "unsafe":
-        unsafe.append(str(DOTENV_RELATIVE))
+    missing, unsafe = [], []
+    for name in profile.secrets:
+        if secret_state(Path(state) / name) == "missing":
+            missing.append(name)
+        elif secret_state(Path(state) / name) == "unsafe":
+            unsafe.append(name)
+    if profile.dotenv is not None:
+        if secret_state(Path(root) / profile.dotenv) == "missing":
+            missing.append(str(profile.dotenv))
+        if secret_state(Path(root) / profile.dotenv) == "unsafe":
+            unsafe.append(str(profile.dotenv))
     if missing:
         problems.append("private setup files are missing")
     if unsafe:
         problems.append("a private secret file is unsafe: " + ", ".join(unsafe))
-    compat_state = compat_module_state(state)
-    detail["compat_module"] = compat_state
-    if compat_state == "conflict":
-        problems.append("local deepseek compat module differs from the reviewed source")
-    elif compat_state == "unsafe":
-        problems.append("local deepseek compat module path is unsafe")
-    if detect_incompatible_routing(state):
-        detail["routing"] = "incompatible"
-        problems.append("saved config selects a non-direct DeepSeek route")
-    else:
-        detail["routing"] = "compatible"
+    if profile.compat:
+        compat_state = compat_module_state(state)
+        detail["compat_module"] = compat_state
+        if compat_state == "conflict":
+            problems.append("local deepseek compat module differs from the reviewed source")
+        elif compat_state == "unsafe":
+            problems.append("local deepseek compat module path is unsafe")
+    if profile.verify is not None:
+        problems.extend(profile.verify(root, state))
+    if profile.routing:
+        if detect_incompatible_routing(state):
+            detail["routing"] = "incompatible"
+            problems.append("saved config selects a non-direct DeepSeek route")
+        else:
+            detail["routing"] = "compatible"
     detail["onboarding"] = "pending" if missing else "ready"
     print(json.dumps({"command": "check", "ok": not problems, "problems": problems,
                       "detail": detail}))
     return 0 if not problems else 2
 
 
-def probe_agent(state):
+def probe_agent(state, profile=DASHBOARD_PROFILE):
     """Bounded authenticated loopback probe; expose only readiness fields."""
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
     try:
         token = read_private_text(Path(state) / "api.token").strip()
-        request = urllib.request.Request(f"http://127.0.0.1:{API_PORT}/api/status",
+        request = urllib.request.Request(
+            f"http://{profile.api_host}:{profile.api_port}/api/status",
                                         headers={"Authorization": "Bearer " + token})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         with opener.open(request, timeout=2) as response:
@@ -925,13 +1032,13 @@ def probe_agent(state):
         return None
 
 
-def cmd_status(root) -> int:
-    state = state_path(root)
+def cmd_status(root, profile=DASHBOARD_PROFILE) -> int:
+    state = state_path(root, profile)
     report = {"command": "status", "status": "awaiting-onboarding", "ready": False}
-    missing = [name for name in SECRET_FILES if secret_state(state / name) != "safe"]
-    if missing or secret_state(Path(root) / DOTENV_RELATIVE) != "safe":
-        report["missing"] = missing + ([str(DOTENV_RELATIVE)]
-                                       if secret_state(Path(root) / DOTENV_RELATIVE) != "safe" else [])
+    missing = [name for name in profile.secrets if secret_state(state / name) != "safe"]
+    dotenv_unsafe = profile.dotenv is not None and secret_state(Path(root) / profile.dotenv) != "safe"
+    if missing or dotenv_unsafe:
+        report["missing"] = missing + ([str(profile.dotenv)] if dotenv_unsafe else [])
         print(json.dumps(report))
         return 0
     try:
@@ -954,7 +1061,7 @@ def cmd_status(root) -> int:
                            "phase": runtime.get("phase"), "running": running,
                            "stopAt": runtime.get("stopAt")})
             if len(running) == 2:
-                health = probe_agent(state)
+                health = probe_agent(state, profile)
                 if health:
                     report.update(health)
         else:
@@ -963,8 +1070,8 @@ def cmd_status(root) -> int:
     return 0
 
 
-def cmd_start(root, source=CONFIG_SOURCE) -> int:
-    state = ensure_state_dir(root)
+def cmd_start(root, source=CONFIG_SOURCE, profile=DASHBOARD_PROFILE) -> int:
+    state = ensure_state_dir(root, profile)
     status, fd = acquire_lock(state)
     if status == "error":
         print(json.dumps({"command": "start", "status": "error",
@@ -974,11 +1081,11 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         print(json.dumps({"command": "start", "status": "busy"}))
         return 1
     try:
-        if any(secret_state(state / name) != "safe" for name in SECRET_FILES):
+        if any(secret_state(state / name) != "safe" for name in profile.secrets):
             print(json.dumps({"command": "start", "status": "awaiting-onboarding"}))
             return 2
         try:
-            window = require_window(root)
+            window = profile.gate(root)
         except DashboardError as exc:
             print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
             return 2
@@ -987,12 +1094,16 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         original_stop_at = window.get("stop_at")
         try:
             validate_source(source, root)
-            for port in (API_PORT, UI_PORT):
-                port_free(port)
-            secrets = load_secrets(root, state)
-            compat_path = write_compat_module(state)
-            if detect_incompatible_routing(state):
+            for port in (profile.api_port, profile.ui_port):
+                port_free(port, profile.api_host)
+            secrets = profile.load_secrets(root, state) if profile.load_secrets else {}
+            compat_path = write_compat_module(state) if profile.compat else None
+            if profile.routing and detect_incompatible_routing(state):
                 raise DashboardError("saved config selects a non-direct DeepSeek route")
+            if profile.verify is not None:
+                extra = profile.verify(root, state)
+                if extra:
+                    raise DashboardError("; ".join(extra))
         except DashboardError as exc:
             print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
             return 2
@@ -1003,7 +1114,7 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
 
         # Fresh gate check after the slow prerequisite work, before any launch.
         try:
-            require_window(root)
+            profile.gate(root)
         except DashboardError as exc:
             print(json.dumps({"command": "start", "status": "blocked", "reason": str(exc)}))
             return 2
@@ -1014,8 +1125,8 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
                               "reason": "coding window cutoff is invalid"}))
             return 2
 
-        api_env, ui_env = build_env(source, secrets)
-        api_cmd, ui_cmd = child_commands(source, compat_path)
+        api_env, ui_env = build_env(source, secrets, profile)
+        api_cmd, ui_cmd = child_commands(source, compat_path, profile)
         src = Path(source["path"])
         plan = [("api", api_cmd, src / source["api_cwd"], api_env),
                 ("ui", ui_cmd, src / source["ui_cwd"], ui_env)]
@@ -1039,7 +1150,7 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
                     break
                 # Re-check the gate and the cutoff immediately before each spawn.
                 try:
-                    require_window(root)
+                    profile.gate(root)
                 except DashboardError:
                     abort_reason = "coding window closed before launch"
                     break
@@ -1059,7 +1170,7 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
                 data = {"supervisorPid": os.getpid(), "supervisorStart": pid_identity(os.getpid()),
                         "stopAt": original_stop_at, "sourcePin": source["pin"],
                         "phase": "running", "inferenceRequested": False,
-                        "apiPort": API_PORT, "uiPort": UI_PORT}
+                        "apiPort": profile.api_port, "uiPort": profile.ui_port}
                 for name, proc, _ in children:
                     data[f"{name}Pid"] = proc.pid
                     data[f"{name}Start"] = pid_identity(proc.pid)
@@ -1103,8 +1214,8 @@ def cmd_start(root, source=CONFIG_SOURCE) -> int:
         release_lock(fd)
 
 
-def cmd_stop(root) -> int:
-    state = state_path(root)
+def cmd_stop(root, profile=DASHBOARD_PROFILE) -> int:
+    state = state_path(root, profile)
     try:
         runtime = read_runtime(state)
     except DashboardError as exc:

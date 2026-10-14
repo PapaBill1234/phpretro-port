@@ -73,3 +73,44 @@ Results: 69 bootstrap tests passed in 13.048 seconds; public-file/document/confi
 and whitespace checks passed. Independent final Sol review accepted the five-file
 change without a P0/P1 finding. The repaired `--locked` build has reached actual
 Rust/C compilation, but completion and runtime qualification are not yet claimed.
+
+## G06-acceptance-takeover — actual source/loader/schema boundary
+
+Source: Eliza `28fef47c9d9d3acc7792be0fdaa3070020293cc5`; corrected worker
+`6453aa07867d2d0473f8d29df7194d2cecf60600`; six CI jobs passed in
+run `38570097604`. Independent scoped Sol reviews found deadline, execution-source
+and symlink gaps; root repaired each finding and final source review accepted.
+
+Actual evidence, with no host/model call:
+
+- All three reviewed new-chat patch outputs equal independent Git application.
+- Full regular-file overlay setup and complete source/wrapper provenance passed.
+  Three pinned internal aliases retain exact private targets; optional native
+  inference gitlinks are omitted and remain unqualified.
+- Actual Bun resolution selects overlay UI source.
+- Pinned `scanDropInPlugins` / `findRuntimePluginExport` discover and accept both
+  physical packages; companion has one view, native provider exposes four text slots.
+- Actual pinned `ElizaSchema.safeParse` accepts private config/workspace.
+- Adapter boundary checks cover deadlines, no writes after expired setup,
+  captured launch cutoff, canonical aliases, unexpected nested dependency links,
+  read-target symlinks, wrapper tampering and missing provenance. Dashboard checks
+  capture both child working directories and the Vite path to prevent validation/
+  execution mismatch. Configured host and browser acceptance remain pending.
+
+Private receipts live under `.builder/current-workers/root-acceptance-takeover/`
+and the neighboring root lock-repair loader-proof directory. Source/loader/schema
+success does not establish host startup, browser mounting, a native model turn,
+queue recovery or complete CMS/game coverage.
+
+Integrated-root results: 22 adapter tests passed in 0.527 seconds and 59 dashboard
+tests passed in 11.337 seconds. The actual root prerequisite check returned 0;
+snapshots of 32,918 acceptance paths showed identical namespace, inode, mode,
+size and modification time before/after. Independent Sol review accepted the
+no-write check adjustment (`d40fc9f`). Public-file/document/config and whitespace
+checks passed. No host or model was started.
+
+Native build continuation: repaired locked build reached compilation, timed out
+at 1,200 seconds, then a second bounded attempt reached `codex-core` and was
+stopped at 2,806 MiB available RAM, below the 3,072 MiB project floor. Owned group
+cleanup completed and cache/logs were retained. No native build/test success is
+claimed; a reviewed build plan within the resource floor is pending.

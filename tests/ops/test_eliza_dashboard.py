@@ -500,6 +500,7 @@ class DashboardTests(unittest.TestCase):
         self._secrets()
         self._gate()
         calls = []
+        executions = []
 
         class RunningChild:
             pid = 54321
@@ -510,6 +511,7 @@ class DashboardTests(unittest.TestCase):
                 return 0
 
         def popen(argv, **kwargs):
+            executions.append((argv, kwargs["cwd"]))
             if not calls:
                 calls.append("spawned")
                 return RunningChild()
@@ -520,6 +522,9 @@ class DashboardTests(unittest.TestCase):
                 mock.patch("builtins.print"):
             code = dash.cmd_start(self.root, self.source)
         self.assertEqual(code, 2)
+        self.assertEqual(Path(executions[0][1]), self.source_dir / self.source["api_cwd"])
+        self.assertEqual(Path(executions[1][1]), self.source_dir / self.source["ui_cwd"])
+        self.assertIn(str(self.source_dir / self.source["vite"]), executions[1][0])
         self.assertIn(signal.SIGTERM, calls)
         self.assertIn(signal.SIGKILL, calls)
         record = json.loads((self.state / "runtime.json").read_text())

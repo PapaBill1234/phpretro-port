@@ -184,3 +184,12 @@ Private diagnostic evidence: `.builder/native-host/logs/build.log`,
 transcripts remain private. Tests exercise external-entry preservation, refusal
 without writes, symlink refusal, stale provenance and a real controlled compiler
 that mutates the lockfile and must not publish new provenance.
+
+Actual continuation: the repaired `--locked` build reached Rust/C compilation.
+The first bounded run hit its 1,200-second limit without a compiler diagnostic.
+A second bounded run reused caches and reached `codex-core`; root stopped the
+owned helper when available RAM fell to 2,806 MiB, below the 3,072 MiB project
+floor (compiler RSS about 3 GiB, swap nearly full). The supervised group exited;
+no build processes remain. Cache/logs are retained privately. No completed CLI
+binary or compiled qualification is claimed. A reviewed build approach that
+fits available resources remains necessary before native admission.

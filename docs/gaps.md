@@ -92,3 +92,26 @@ checks are recorded in [validation](validation.md) and
 [bootstrap evidence](eliza-native-host.md). Native build, compiled qualification,
 MCP/contributor coverage and full-host/browser/live queue admission remain open.
 **G05/G06 remain Partial.**
+
+## G06 isolated host adapter and actual loading boundary — 2026-10-14
+
+Task G06-acceptance-takeover; Eliza pin
+`28fef47c9d9d3acc7792be0fdaa3070020293cc5`. The corrected adapter passed
+independent Sol source review and all six candidate CI jobs on `6453aa0`.
+Actual full private overlay setup and provenance checks passed; Bun resolves the
+patched overlay UI, the pinned loader discovers both physical companion/native
+packages, and the actual config schema accepts the generated private workspace.
+Caller deadlines reach setup and launch validation; unknown source changes,
+foreign symlinks, wrapper tampering and missing provenance are refused. The
+supervisor now executes the same source it validates, preserving the dashboard
+route and isolated-source callers. See [host evidence](eliza-acceptance-host.md)
+and [validation](validation.md). Configured full-host startup, authenticated
+owner/user/browser mounting, native text admission and funded live queue remain
+open. **G05/G06 stay Partial.**
+
+G05 resource evidence: two bounded repaired-lock builds reached actual dependency
+and workspace compilation; the first timed out at 1,200 seconds, and the second
+reached `codex-core` before root stopped it when available RAM fell below the
+3 GiB desktop floor. These are time/resource checkpoints, not passing build or
+Rust qualification evidence. Native guard remains false; no completed CLI binary,
+compiled qualification or main-model admission is claimed.
