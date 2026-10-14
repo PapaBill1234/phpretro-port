@@ -1,0 +1,303 @@
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 363cd88..2778813 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1,6 +1,8 @@
+ use crate::session::tests::update_turn_settings_for_test;
+ use std::collections::BTreeMap;
+ use std::sync::Arc;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
+ 
+ use codex_features::Feature;
+ use codex_login::AuthManager;
+@@ -3661,5 +3663,289 @@ async fn native_text_host_qualification_manager_started_code_mode_registry_is_em
+         .expect("shut down qualification thread");
+ }
+ 
++// ---------------------------------------------------------------------------
++// Native text-host qualification: extension-contributor and hosted-tool slice
++// (source-level, unbuilt here).
++//
++// Positive controls (explicit unrestricted unit fixtures) prove each fixture
++// really contributes by appearing in the finalized plan. Constrained paths use
++// the manager-captured empty ceiling and require the same fixtures to be denied.
++// MCP tool injection is NOT covered here (see the seam documented in the phase
++// report). No turn is submitted and no model/account/network call is made.
++// ---------------------------------------------------------------------------
++
++/// A counting extension tool executor (direct or deferred exposure).
++struct QualificationCountingExtensionTool {
++    tool_name: ToolName,
++    deferred: bool,
++    handle_calls: Arc<AtomicUsize>,
++}
++
++impl QualificationCountingExtensionTool {
++    fn direct(name: &str, handle_calls: Arc<AtomicUsize>) -> Self {
++        Self {
++            tool_name: ToolName::plain(name),
++            deferred: false,
++            handle_calls,
++        }
++    }
++
++    fn deferred(name: &str, handle_calls: Arc<AtomicUsize>) -> Self {
++        Self {
++            tool_name: ToolName::plain(name),
++            deferred: true,
++            handle_calls,
++        }
++    }
++}
++
++impl<'call> ToolExecutor<ExtensionToolCall<'call>> for QualificationCountingExtensionTool {
++    fn tool_name(&self) -> ToolName {
++        self.tool_name.clone()
++    }
++
++    fn spec(&self) -> ToolSpec {
++        ToolSpec::Function(ResponsesApiTool {
++            name: self.tool_name.name.clone(),
++            description: "Qualification counting extension tool.".to_string(),
++            strict: false,
++            defer_loading: None,
++            parameters: codex_tools::JsonSchema::default(),
++            output_schema: None,
++        })
++    }
++
++    fn exposure(&self) -> ToolExposure {
++        if self.deferred {
++            ToolExposure::Deferred
++        } else {
++            ToolExposure::Direct
++        }
++    }
++
++    fn handle<'a>(&'a self, _call: ExtensionToolCall<'call>) -> codex_tools::ToolExecutorFuture<'a>
++    where
++        'call: 'a,
++    {
++        let handle_calls = Arc::clone(&self.handle_calls);
++        Box::pin(async move {
++            handle_calls.fetch_add(1, Ordering::SeqCst);
++            Ok(Box::new(codex_tools::JsonToolOutput::new(json!({}))) as Box<dyn ToolOutput>)
++        })
++    }
++}
++
++/// A contributor that counts how often it is evaluated for a step.
++struct QualificationCountingContributor {
++    evaluations: Arc<AtomicUsize>,
++    executors: Vec<Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>>,
++}
++
++impl codex_extension_api::ToolContributor for QualificationCountingContributor {
++    fn tools(
++        &self,
++        _session_store: &codex_extension_api::ExtensionData,
++        _thread_store: &codex_extension_api::ExtensionData,
++    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>> {
++        self.evaluations.fetch_add(1, Ordering::SeqCst);
++        self.executors.clone()
++    }
++}
++
++/// Builds an isolated extension registry contributing the counting extension
++/// tools, so it can be supplied to a manager-started session through
++/// `IsolatedSessionExtensions` before startup (rather than mutated after the
++/// fact).
++fn qualification_extensions(
++    evaluations: &Arc<AtomicUsize>,
++    handle_calls: &Arc<AtomicUsize>,
++) -> Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>> {
++    let mut builder =
++        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
++    builder.tool_contributor(Arc::new(QualificationCountingContributor {
++        evaluations: Arc::clone(evaluations),
++        executors: vec![
++            Arc::new(QualificationCountingExtensionTool::direct(
++                "qualification_ext_echo",
++                Arc::clone(handle_calls),
++            )),
++            Arc::new(QualificationCountingExtensionTool::deferred(
++                "qualification_ext_deferred",
++                Arc::clone(handle_calls),
++            )),
++        ],
++    }));
++    Arc::new(builder.build())
++}
++
++/// Enables the hosted web-search capability on a turn.
++fn qualification_enable_hosted(turn: &mut TurnContext) {
++    use_chatgpt_auth(turn);
++    set_web_search_mode(turn, WebSearchMode::Live);
++    update_turn_settings_for_test(turn, |settings| {
++        let model = Arc::make_mut(&mut settings.model_info);
++        model.supports_search_tool = true;
++        model.use_responses_lite = false;
++    });
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_extension_contributor_positive_control_registers_tools() {
++    let (mut session, turn) = make_session_and_context().await;
++    session.tool_policy = Arc::new(codex_extension_api::ToolPolicy::default());
++    let evaluations = Arc::new(AtomicUsize::new(0));
++    let handle_calls = Arc::new(AtomicUsize::new(0));
++    session.services.extensions = qualification_extensions(&evaluations, &handle_calls);
++
++    let turn = Arc::new(turn);
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build unrestricted positive-control router");
++
++    assert!(
++        evaluations.load(Ordering::SeqCst) > 0,
++        "the contributor must actually be evaluated"
++    );
++    let names = router.registered_tool_names_for_test();
++    assert!(
++        names.iter().any(|name| name.name == "qualification_ext_echo"),
++        "unrestricted control must register the direct extension tool"
++    );
++    assert!(
++        names
++            .iter()
++            .any(|name| name.name == "qualification_ext_deferred"),
++        "unrestricted control must register the deferred extension tool"
++    );
++    assert_eq!(
++        handle_calls.load(Ordering::SeqCst),
++        0,
++        "planning must never execute the extension executor"
++    );
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_extension_contributor_constrained_session_denied() {
++    let evaluations = Arc::new(AtomicUsize::new(0));
++    let handle_calls = Arc::new(AtomicUsize::new(0));
++    let registry = qualification_extensions(&evaluations, &handle_calls);
++
++    let (_temp_dir, _manager, started) = nr_start_qualification_thread(move |options| {
++        options
++            .thread_extension_init
++            .insert(codex_extension_api::SessionIsolation::Isolated);
++        options.thread_extension_init.insert(
++            codex_extension_api::IsolatedSessionExtensions(registry),
++        );
++    })
++    .await;
++    let session = started.thread.session.as_ref();
++
++    let turn = session.new_default_turn().await;
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build constrained router");
++
++    nr_assert_empty_tool_router(&router);
++    assert!(
++        evaluations.load(Ordering::SeqCst) > 0,
++        "the contributor must still be evaluated on the constrained path"
++    );
++    assert_eq!(
++        handle_calls.load(Ordering::SeqCst),
++        0,
++        "no extension executor may run under the empty ceiling"
++    );
++
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down qualification thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_hosted_web_search_positive_control_is_visible() {
++    let (mut session, mut turn) = make_session_and_context().await;
++    session.tool_policy = Arc::new(codex_extension_api::ToolPolicy::default());
++    qualification_enable_hosted(&mut turn);
++
++    let turn = Arc::new(turn);
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build unrestricted hosted positive-control router");
++
++    assert!(
++        router
++            .model_visible_specs()
++            .iter()
++            .any(|spec| spec.name() == "web_search"),
++        "positive control must emit the hosted web_search spec"
++    );
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_hosted_web_search_constrained_session_denied() {
++    let (_temp_dir, _manager, started) = nr_start_qualification_thread(|_| {}).await;
++    let session = Arc::clone(&started.thread.session);
++
++    let mut turn = session.new_default_turn().await;
++    qualification_enable_hosted(Arc::get_mut(&mut turn).expect("unshared qualification turn"));
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build constrained hosted router");
++
++    nr_assert_empty_tool_router(&router);
++    assert!(
++        !router
++            .model_visible_specs()
++            .iter()
++            .any(|spec| spec.name() == "web_search"),
++        "hosted web_search must be denied under the empty ceiling"
++    );
++
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down qualification thread");
++}
++
+ #[path = "spec_plan_strict_third_party_tests.rs"]
+ mod strict_third_party;
