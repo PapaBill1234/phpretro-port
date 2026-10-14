@@ -19,10 +19,12 @@ after execution):
   * fresh off-peak window and fresh subscription quota each call (unknown quota
     or any exhausted window blocks);
   * a UNIQUE new stateless thread per generation (never resumed), with
-    ``environments: []`` (no default environment access), ``dynamicTools: []``,
-    ``selectedCapabilityRoots: []``, host-fixed instructions and an empty
-    host-derived workspace;
-  * ``allowProviderModelFallback: false`` — no provider/model fallback;
+    host-fixed instructions and an empty host-derived workspace; when the
+    installed EXPERIMENTAL schema is offline-confirmed to define them, it also
+    pins ``environments: []`` (no default environment access), ``dynamicTools:
+    []``, ``selectedCapabilityRoots: []`` and ``allowProviderModelFallback:
+    false`` (no provider/model fallback), and pins ``environments: []`` on the
+    turn;
   * read-only sandbox, ``approval_policy=never``, no MCP connectors and the
     side-effecting builtin features disabled in the launch config.
 
@@ -113,14 +115,34 @@ EXTRA_RELEVANT_FEATURES = (
 RELEVANT_FEATURES = SIDE_EFFECTING_FEATURES + EXTRA_RELEVANT_FEATURES
 # Candidate overrides probed against the real installed metadata (never assumed).
 FEATURE_OVERRIDES = tuple(("features." + name, "false") for name in RELEVANT_FEATURES)
-# ThreadStartParams fields the design once relied on for isolation. The installed
-# generated schema (v2) does NOT define them, so they cannot isolate a turn.
+# ThreadStartParams isolation fields the design relies on. They are only present
+# in the installed EXPERIMENTAL protocol schema; they are sent only when the
+# actual installed schema is offline-confirmed to define them (see
+# ``thread_params_supported``).
 REQUIRED_THREAD_FIELDS = (
     "environments",
     "dynamicTools",
     "selectedCapabilityRoots",
     "allowProviderModelFallback",
 )
+# Offline experimental-schema detection bounds. The generator runs the RAW ELF
+# with an EMPTY HOME/CODEX_HOME and asks it to emit the protocol schema; these
+# bound the subprocess runtime, the single schema file it reads and its path.
+SCHEMA_TIMEOUT = 60.0
+SCHEMA_FILE_MAX_BYTES = 8 * 1024 * 1024
+SCHEMA_OUTPUT_SUBDIR = "schema"
+SCHEMA_THREAD_FILE = ("v2", "ThreadStartParams.json")
+THREAD_SCHEMA_TITLE = "ThreadStartParams"
+# Exact declared shape each isolation field must have in the installed
+# experimental schema. A field is trusted only when its declared ``type`` (and,
+# for the array fields, its item ``$ref``) matches EXACTLY; anything else is an
+# unknown schema and the turn stays blocked (fail closed).
+THREAD_FIELD_SHAPES = {
+    "environments": {"types": frozenset({"array", "null"}), "items": "TurnEnvironmentParams"},
+    "dynamicTools": {"types": frozenset({"array", "null"}), "items": "DynamicToolSpec"},
+    "selectedCapabilityRoots": {"types": frozenset({"array", "null"}), "items": "SelectedCapabilityRoot"},
+    "allowProviderModelFallback": {"types": frozenset({"boolean"}), "items": None},
+}
 # Recognized, currently-true features that merely CONTAIN a side-effect keyword
 # but are not model-invokable tools; excluding them avoids false blocks.
 BENIGN_TRUE_FEATURES = frozenset({"skill_mcp_dependency_install", "compaction_image_budget"})
@@ -196,16 +218,12 @@ def generation_codex_command(binary: str = "codex"):
     return command
 
 
-def probe_feature_list(binary: str, overrides=()):
-    """Offline `features list` metadata probe (EMPTY HOME/CODEX_HOME, no login).
+def _require_native_elf(binary: str) -> None:
+    """Refuse any executable that is not the native ELF.
 
-    Runs the RAW installed binary (never the PATH wrapper, which rewrites
-    ``CODEX_HOME``) and parses STDOUT only with the installed CLI's exact line
-    format ``<name>  <stage>  <true|false>``. stderr warnings are ignored so a
-    key name mentioned only in a warning can never satisfy a check. ``overrides``
-    are ``(key, value)`` pairs applied as ``-c key=value`` BEFORE the subcommand,
-    so the returned states are the ACTUAL effective states, not assumed ones.
-    The temp dir is always cleaned up.
+    The PATH ``codex`` entry point is a shell wrapper that rewrites
+    ``CODEX_HOME``; running it would silently touch an ordinary profile. Only the
+    raw installed ELF is trusted for offline qualification.
     """
     try:
         with open(binary, "rb") as executable:
@@ -217,6 +235,20 @@ def probe_feature_list(binary: str, overrides=()):
             "unsupported_executable",
             "Offline qualification requires the native ELF; profile-changing wrappers are refused.",
         )
+
+
+def probe_feature_list(binary: str, overrides=()):
+    """Offline `features list` metadata probe (EMPTY HOME/CODEX_HOME, no login).
+
+    Runs the RAW installed binary (never the PATH wrapper, which rewrites
+    ``CODEX_HOME``) and parses STDOUT only with the installed CLI's exact line
+    format ``<name>  <stage>  <true|false>``. stderr warnings are ignored so a
+    key name mentioned only in a warning can never satisfy a check. ``overrides``
+    are ``(key, value)`` pairs applied as ``-c key=value`` BEFORE the subcommand,
+    so the returned states are the ACTUAL effective states, not assumed ones.
+    The temp dir is always cleaned up.
+    """
+    _require_native_elf(binary)
     home = tempfile.mkdtemp(prefix="codex-empty-home-")
     try:
         codex_home = os.path.join(home, ".codex")
@@ -264,11 +296,112 @@ def _is_side_effecting(name: str) -> bool:
     return any(pattern in name for pattern in _SIDE_EFFECT_PATTERNS)
 
 
-def thread_params_supported(binary: str) -> bool:
-    """Whether the installed ThreadStartParams schema defines the isolation fields.
+def _declared_types(property_schema) -> frozenset:
+    value = property_schema.get("type")
+    if isinstance(value, str):
+        return frozenset({value})
+    if isinstance(value, list) and value and all(isinstance(item, str) for item in value):
+        return frozenset(value)
+    return frozenset()
 
-    The installed generated schema (v2) does not, so this is fail-closed False:
-    empty/ignored thread fields cannot isolate a turn. Injectable for tests.
+
+def _item_reference(property_schema):
+    items = property_schema.get("items")
+    if isinstance(items, dict) and isinstance(items.get("$ref"), str):
+        return items["$ref"].rsplit("/", 1)[-1]
+    return None
+
+
+def thread_params_supported(binary: str) -> bool:
+    """Offline: does the installed EXPERIMENTAL schema define the isolation fields?
+
+    Runs the RAW installed ELF (never the PATH wrapper, which rewrites
+    ``CODEX_HOME``) with an EMPTY ``HOME``/``CODEX_HOME`` and generates the
+    app-server protocol schema into a bounded temporary directory with
+    ``--experimental``. There is no login, account, model, thread, turn or
+    network use: this is offline protocol metadata only, and the ordinary
+    profile is never searched. The ``v2/ThreadStartParams`` bundle is parsed and
+    every ``REQUIRED_THREAD_FIELDS`` entry must be present with its EXACT declared
+    shape (types + item ``$ref``); a non-ELF (wrapper), a schema-generation
+    failure, or an unknown/renamed/mistyped schema yields ``False`` so the turn
+    stays blocked. The temp dir is always cleaned up.
+    """
+    _require_native_elf(binary)
+    home = tempfile.mkdtemp(prefix="codex-empty-home-")
+    try:
+        codex_home = os.path.join(home, ".codex")
+        os.makedirs(codex_home, mode=0o700, exist_ok=True)
+        out_dir = os.path.join(home, SCHEMA_OUTPUT_SUBDIR)
+        env = bridge.child_environment()
+        env["HOME"] = home
+        env["CODEX_HOME"] = codex_home
+        command = [binary, "app-server", "generate-json-schema", "--experimental", "--out", out_dir]
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=SCHEMA_TIMEOUT,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise bridge.BridgeError(
+                "thread_params_unsupported",
+                "Installed Codex experimental schema cannot be generated; refusing to dispatch.",
+            ) from None
+        if completed.returncode != 0:
+            raise bridge.BridgeError(
+                "thread_params_unsupported",
+                "Installed Codex experimental schema is unavailable; refusing to dispatch.",
+            )
+        base = Path(out_dir).resolve()
+        path = base.joinpath(*SCHEMA_THREAD_FILE).resolve()
+        if base not in path.parents:
+            return False
+        try:
+            if path.stat().st_size > SCHEMA_FILE_MAX_BYTES:
+                return False
+            raw = path.read_bytes()
+        except OSError:
+            return False
+        try:
+            schema = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            return False
+        if not isinstance(schema, dict) or schema.get("title") != THREAD_SCHEMA_TITLE:
+            return False
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return False
+        for name, expected in THREAD_FIELD_SHAPES.items():
+            prop = properties.get(name)
+            if not isinstance(prop, dict):
+                return False
+            if _declared_types(prop) != expected["types"]:
+                return False
+            if expected["items"] is not None and _item_reference(prop) != expected["items"]:
+                return False
+        return True
+    finally:
+        import shutil
+
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def runtime_toolset_verified(binary: str = None) -> bool:
+    """Whether the installed build's exact builtin tool registry is qualified.
+
+    The experimental schema only confirms that the isolation FIELDS exist; it
+    does NOT prove which native tools the runtime actually exposes to a turn.
+    The remaining ``unified_exec`` flag is transport-only: official config
+    documents it as always enabled with user opt-outs ignored, while
+    ``shell_tool`` controls command-execution tools (and is already disabled).
+    Feature/config/transport flags are DIAGNOSTICS, not a per-thread effective
+    native-tool-catalog proof, and the experimental method catalog exposes no
+    native-tool-catalog/list API or ``thread/start`` dry-run. The exact builtin
+    registry qualification is therefore still pending, so this is fail-closed
+    ``False`` and generation MUST stay blocked even when every experimental
+    field is present.
     """
     return False
 
@@ -277,6 +410,7 @@ def qualify_native_contract(
     binary: str,
     probe=probe_feature_list,
     thread_probe=thread_params_supported,
+    runtime_probe=runtime_toolset_verified,
 ) -> dict:
     """Qualify the installed contract for a tool-free turn, or report why not.
 
@@ -284,9 +418,11 @@ def qualify_native_contract(
     ``features list`` once at baseline and once with ``FEATURE_OVERRIDES``
     applied, then requires every ``RELEVANT_FEATURES`` capability to read
     ``false`` in the CANDIDATE output. Also rejects a recognized, active
-    side-effecting feature outside the guarded set, and any unsupported
-    ThreadStartParams isolation field. ``qualified`` is True only when every
-    condition holds; otherwise generation MUST block.
+    side-effecting feature outside the guarded set. Independently confirms the
+    installed EXPERIMENTAL ``ThreadStartParams`` schema defines the isolation
+    fields (``schema_supported``) and that the exact builtin runtime toolset is
+    qualified (``runtime_probe`` — currently always unverified). ``qualified`` is
+    True only when every condition holds; otherwise generation MUST block.
     """
     baseline = probe(binary, overrides=())
     candidate = probe(binary, overrides=FEATURE_OVERRIDES)
@@ -306,10 +442,14 @@ def qualify_native_contract(
             and _is_side_effecting(name)
         ):
             reasons.append("unknown_active:" + name)
-    if not thread_probe(binary):
+    schema_supported = thread_probe(binary)
+    if not schema_supported:
         reasons.append("thread_params_unsupported")
+    if not runtime_probe(binary):
+        reasons.append("unverified_runtime_toolset")
     return {
         "qualified": not reasons,
+        "schema_supported": schema_supported,
         "reasons": tuple(reasons),
         "baseline": baseline,
         "candidate": candidate,
@@ -467,14 +607,19 @@ def _delta_text(params):
     return None
 
 
-def run_turn(client, request, emit, workspace: Path):
-    """Drive one native turn; yield deltas; return the validated final payload."""
-    # NOTE: the installed generated ThreadStartParams schema (v2) does NOT define
-    # `environments`, `dynamicTools`, `selectedCapabilityRoots` or
-    # `allowProviderModelFallback`. They are omitted rather than sent as empty
-    # no-ops, because sending them implies isolation they do not provide. Tool
-    # isolation is established (or the turn is blocked) by the pre-turn contract
-    # qualification, not by these fields.
+def run_turn(client, request, emit, workspace: Path, isolation_fields: bool = False):
+    """Drive one native turn; yield deltas; return the validated final payload.
+
+    ``isolation_fields`` is set only when the installed EXPERIMENTAL
+    ``ThreadStartParams`` schema has been offline-confirmed to define them (see
+    ``thread_params_supported``). When confirmed, the thread declares empty
+    ``environments``/``dynamicTools``/``selectedCapabilityRoots`` and
+    ``allowProviderModelFallback=False``, and the turn pins ``environments=[]``
+    to disable environment access for that turn. When NOT confirmed the fields
+    are omitted (they would be unknown to the app-server and imply isolation they
+    do not provide). In either case tool isolation is established — or the turn
+    is blocked — by the pre-turn contract qualification, never by these fields.
+    """
     thread_params = {
         "model": MODEL,
         "modelProvider": PROVIDER,
@@ -485,6 +630,15 @@ def run_turn(client, request, emit, workspace: Path):
         "developerInstructions": GENERATION_DEVELOPER_INSTRUCTIONS,
         "ephemeral": True,
     }
+    if isolation_fields:
+        thread_params.update(
+            {
+                "environments": [],
+                "dynamicTools": [],
+                "selectedCapabilityRoots": [],
+                "allowProviderModelFallback": False,
+            }
+        )
     thread = client.request("thread/start", thread_params)
     try:
         thread_id = thread["thread"]["id"]
@@ -495,17 +649,17 @@ def run_turn(client, request, emit, workspace: Path):
     if thread.get("model") != MODEL or thread.get("modelProvider") != PROVIDER:
         raise bridge.BridgeError("model_mismatch", "App-server selected an unexpected model route.")
 
-    start = client.request(
-        "turn/start",
-        {
-            "threadId": thread_id,
-            "model": MODEL,
-            "effort": "high",
-            "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-            "input": serialize_input(request["system"], request["messages"]),
-        },
-    )
+    turn_params = {
+        "threadId": thread_id,
+        "model": MODEL,
+        "effort": "high",
+        "approvalPolicy": "never",
+        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        "input": serialize_input(request["system"], request["messages"]),
+    }
+    if isolation_fields:
+        turn_params["environments"] = []
+    start = client.request("turn/start", turn_params)
     try:
         turn_id = start["turn"]["id"]
     except (KeyError, TypeError):
@@ -640,7 +794,9 @@ def execute(args, command=None, emit=None, qualify=None):
                 verify_version(binary)
                 qualification = qualify_native_contract(binary)
             else:
-                qualification = {"qualified": True}  # caller-emulated qualified host
+                # Caller-emulated qualified host: no offline schema detection is
+                # performed, so isolation fields are NOT sent (fail closed).
+                qualification = {"qualified": True, "schema_supported": False}
             if not qualification.get("qualified"):
                 raise bridge.BridgeError(
                     "unsupported_contract",
@@ -661,7 +817,13 @@ def execute(args, command=None, emit=None, qualify=None):
                 )
             if not available:
                 raise bridge.BridgeError("model_unavailable", "The pinned model is unavailable on this account.")
-            final = run_turn(client, request, emit, _empty_workspace(directory))
+            final = run_turn(
+                client,
+                request,
+                emit,
+                _empty_workspace(directory),
+                isolation_fields=bool(qualification.get("schema_supported")),
+            )
             emit(final)
             result.update(final=final)
             success = True

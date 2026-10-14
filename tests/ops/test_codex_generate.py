@@ -125,27 +125,40 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual(final["usage"], {"last": {"inputTokens": 10, "outputTokens": 5}})
         self.assertEqual(final["finishReason"], "stop")
 
-    def test_thread_start_serializes_message_roles_and_omits_unsupported_fields(self):
+    def test_thread_start_serializes_message_roles_and_omits_unconfirmed_fields(self):
         self.run_generate(request={"system": "be terse", "messages": [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "u1"},
             {"role": "assistant", "content": "a1"},
         ]})
         thread = next(row["params"] for row in self.rows() if row.get("method") == "thread/start")
-        # These isolation fields are absent from the installed schema; they are
-        # not sent and are not relied upon.
+        # With no offline schema confirmation (caller-emulated host), the
+        # isolation fields are NOT sent — they must never be assumed.
         for absent in generate.REQUIRED_THREAD_FIELDS:
             self.assertNotIn(absent, thread)
         self.assertTrue(thread["ephemeral"])
         self.assertEqual(thread["developerInstructions"], generate.GENERATION_DEVELOPER_INSTRUCTIONS)
         self.assertNotIn("source review", thread["developerInstructions"].lower())
         turn = next(row["params"] for row in self.rows() if row.get("method") == "turn/start")
+        self.assertNotIn("environments", turn)
         texts = [item["text"] for item in turn["input"]]
         self.assertEqual(texts[0], "[system]\nbe terse")
         self.assertTrue(texts[1].startswith("[system]\nsys"))
         self.assertTrue(texts[2].startswith("[user]\nu1"))
         self.assertTrue(texts[3].startswith("[assistant]\na1"))
         self.assertNotIn("thread/resume", self.methods())
+
+    def test_thread_and_turn_pin_isolation_fields_only_when_schema_confirmed(self):
+        # The experimental schema is offline-confirmed -> the isolation fields are
+        # sent as explicit empty/false values on the thread and turn.
+        self.run_generate(qualify=lambda: {"qualified": True, "schema_supported": True})
+        thread = next(row["params"] for row in self.rows() if row.get("method") == "thread/start")
+        self.assertEqual(thread["environments"], [])
+        self.assertEqual(thread["dynamicTools"], [])
+        self.assertEqual(thread["selectedCapabilityRoots"], [])
+        self.assertIs(thread["allowProviderModelFallback"], False)
+        turn = next(row["params"] for row in self.rows() if row.get("method") == "turn/start")
+        self.assertEqual(turn["environments"], [])
 
     def test_private_account_data_never_reaches_output(self):
         _, events = self.run_generate()
@@ -310,24 +323,35 @@ class GenerateTests(unittest.TestCase):
 
     def test_qualify_passes_only_when_candidate_overrides_disable_every_relevant_feature(self):
         result = generate.qualify_native_contract(
-            "x", probe=self._probe_factory(), thread_probe=lambda _b: True
+            "x",
+            probe=self._probe_factory(),
+            thread_probe=lambda _b: True,
+            runtime_probe=lambda _b: True,
         )
         self.assertTrue(result["qualified"])
+        self.assertTrue(result["schema_supported"])
         self.assertEqual(result["reasons"], ())
 
     def test_qualify_blocks_when_a_override_does_not_take_effect(self):
         # unified_exec stays true even with the candidate override (the real bug).
         result = generate.qualify_native_contract(
-            "x", probe=self._probe_factory(sticky=["unified_exec"]), thread_probe=lambda _b: True
+            "x",
+            probe=self._probe_factory(sticky=["unified_exec"]),
+            thread_probe=lambda _b: True,
+            runtime_probe=lambda _b: True,
         )
         self.assertFalse(result["qualified"])
         self.assertIn("active:unified_exec", result["reasons"])
 
     def test_qualify_blocks_unsupported_thread_fields_and_unknown_active_feature(self):
         threads_off = generate.qualify_native_contract(
-            "x", probe=self._probe_factory(), thread_probe=lambda _b: False
+            "x",
+            probe=self._probe_factory(),
+            thread_probe=lambda _b: False,
+            runtime_probe=lambda _b: True,
         )
         self.assertFalse(threads_off["qualified"])
+        self.assertFalse(threads_off["schema_supported"])
         self.assertIn("thread_params_unsupported", threads_off["reasons"])
 
         def probe(binary, overrides=()):
@@ -335,9 +359,24 @@ class GenerateTests(unittest.TestCase):
             features["shell_tool_v2"] = {"stage": "stable", "state": True}
             return features
 
-        unknown = generate.qualify_native_contract("x", probe=probe, thread_probe=lambda _b: True)
+        unknown = generate.qualify_native_contract(
+            "x", probe=probe, thread_probe=lambda _b: True, runtime_probe=lambda _b: True
+        )
         self.assertFalse(unknown["qualified"])
         self.assertIn("unknown_active:shell_tool_v2", unknown["reasons"])
+
+    def test_qualify_blocks_on_unverified_runtime_toolset_even_when_schema_supported(self):
+        # Metadata support is reported honestly (schema_supported True) but MUST
+        # NOT relax generation: the exact builtin runtime toolset is unverified.
+        result = generate.qualify_native_contract(
+            "x",
+            probe=self._probe_factory(),
+            thread_probe=lambda _b: True,
+            runtime_probe=generate.runtime_toolset_verified,
+        )
+        self.assertTrue(result["schema_supported"])
+        self.assertFalse(result["qualified"])
+        self.assertIn("unverified_runtime_toolset", result["reasons"])
 
     def test_probe_applies_overrides_and_parses_stdout_only(self):
         response = generate.subprocess.CompletedProcess([], 0,
@@ -367,10 +406,83 @@ class GenerateTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_execute_blocks_before_starting_rpc_on_unqualified_contract(self):
-        result, events = self.run_generate(qualify=lambda: {"qualified": False, "reasons": ("active:unified_exec",)})
-        self.assertFalse(result["ok"])
-        self.assertEqual(events[-1]["code"], "unsupported_contract")
-        self.assertFalse(self.record.exists())  # the app-server never started
+        for reason in ("active:unified_exec", "thread_params_unsupported", "unverified_runtime_toolset"):
+            with self.subTest(reason=reason):
+                self.record.unlink(missing_ok=True)
+                result, events = self.run_generate(qualify=lambda: {"qualified": False, "reasons": (reason,)})
+                self.assertFalse(result["ok"])
+                self.assertEqual(events[-1]["code"], "unsupported_contract")
+                self.assertFalse(self.record.exists())  # the app-server never started
+
+    def test_schema_probe_reads_experimental_bundle_within_bounds(self):
+        binary = self.root / "codex-elf"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 8)
+
+        def fake_run(command, **kwargs):
+            # Offline only: no account/model/thread/turn. The probe must use an
+            # empty HOME/CODEX_HOME and the --experimental schema subcommand.
+            env = kwargs["env"]
+            self.assertNotEqual(env["HOME"], os.environ.get("HOME"))
+            self.assertNotEqual(env["CODEX_HOME"], os.environ.get("CODEX_HOME"))
+            self.assertIn("generate-json-schema", command)
+            self.assertIn("--experimental", command)
+            out = Path(command[command.index("--out") + 1])
+            (out / "v2").mkdir(parents=True)
+            (out / "v2" / "ThreadStartParams.json").write_text(json.dumps({
+                "title": "ThreadStartParams",
+                "properties": {
+                    "environments": {"type": ["array", "null"], "items": {"$ref": "#/definitions/TurnEnvironmentParams"}},
+                    "dynamicTools": {"type": ["array", "null"], "items": {"$ref": "#/definitions/DynamicToolSpec"}},
+                    "selectedCapabilityRoots": {"type": ["array", "null"], "items": {"$ref": "#/definitions/SelectedCapabilityRoot"}},
+                    "allowProviderModelFallback": {"type": "boolean"},
+                },
+            }))
+            return generate.subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with patch.object(generate.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(generate.thread_params_supported(str(binary)))
+
+    def test_schema_probe_rejects_unknown_or_mistyped_schema(self):
+        binary = self.root / "codex-elf"
+        binary.write_bytes(b"\x7fELF" + b"\x00" * 8)
+
+        def bundle(title="ThreadStartParams", mutate=lambda props: None):
+            props = {
+                "environments": {"type": ["array", "null"], "items": {"$ref": "#/definitions/TurnEnvironmentParams"}},
+                "dynamicTools": {"type": ["array", "null"], "items": {"$ref": "#/definitions/DynamicToolSpec"}},
+                "selectedCapabilityRoots": {"type": ["array", "null"], "items": {"$ref": "#/definitions/SelectedCapabilityRoot"}},
+                "allowProviderModelFallback": {"type": "boolean"},
+            }
+            mutate(props)
+            return {"title": title, "properties": props}
+
+        cases = {
+            "wrong-title": bundle(title="SomethingElse"),
+            "missing-field": bundle(mutate=lambda p: p.pop("dynamicTools")),
+            "renamed-field": bundle(mutate=lambda p: p.update({"env": p.pop("environments")})),
+            "wrong-type": bundle(mutate=lambda p: p.__setitem__("allowProviderModelFallback", {"type": "string"})),
+            "wrong-item-ref": bundle(mutate=lambda p: p.__setitem__("environments", {"type": ["array", "null"], "items": {"$ref": "#/definitions/Other"}})),
+        }
+        for label, schema in cases.items():
+            with self.subTest(case=label):
+
+                def fake_run(command, **kwargs):
+                    out = Path(command[command.index("--out") + 1])
+                    (out / "v2").mkdir(parents=True)
+                    (out / "v2" / "ThreadStartParams.json").write_text(json.dumps(schema))
+                    return generate.subprocess.CompletedProcess(command, 0, b"", b"")
+
+                with patch.object(generate.subprocess, "run", side_effect=fake_run):
+                    self.assertFalse(generate.thread_params_supported(str(binary)))
+
+    def test_schema_probe_refuses_wrapper_before_execution(self):
+        wrapper = self.root / "wrapper"
+        wrapper.write_text("#!/bin/sh\nexit 0\n")
+        with patch.object(generate.subprocess, "run") as run:
+            with self.assertRaises(generate.bridge.BridgeError) as error:
+                generate.thread_params_supported(str(wrapper))
+            self.assertEqual(error.exception.code, "unsupported_executable")
+            run.assert_not_called()
 
     def test_effective_config_with_retained_mcp_connector_is_refused(self):
         _, events = self.run_generate("connectors")
@@ -387,10 +499,16 @@ class GenerateTests(unittest.TestCase):
         baseline = generate.probe_feature_list(binary)
         self.assertGreater(len(baseline), 50)
         self.assertIn("shell_tool", baseline)
+        # The installed build's EXPERIMENTAL schema DOES define the isolation
+        # fields (the earlier stable-only "absence" conclusion was wrong), but
+        # generation must STAY blocked on the separate unverified runtime toolset.
+        self.assertTrue(generate.thread_params_supported(binary))
         result = generate.qualify_native_contract(binary)
+        self.assertTrue(result["schema_supported"])
         self.assertFalse(result["qualified"])
         self.assertIn("active:unified_exec", result["reasons"])
-        self.assertIn("thread_params_unsupported", result["reasons"])
+        self.assertIn("unverified_runtime_toolset", result["reasons"])
+        self.assertNotIn("thread_params_unsupported", result["reasons"])
 
 
 if __name__ == "__main__":
