@@ -142,19 +142,28 @@ budget stops mid-run, the worktree checkpoints at the precise stage (`source`,
 
 ## Acceptance status
 
-The helper is verified by its own isolated tests (87 focused tests: source/patch/
+The helper is verified by its own isolated tests (103 focused tests: source/patch/
 digest/tar/path/deadline/resource refusal, containment dotdot/symlink refusal
 before any write, bounded downloads and archive members, tampered-cache
 refetch, stale-build binding, no-signal-after-reap ordering, cutoff-clamped
 probes and extraction, blocked archive scanning/member extraction with no
 installation or provenance publication, nested alarm restoration, strict
-MemAvailable unit/value parsing, fixed release-profile env/contract and
+MemAvailable unit/value parsing (including an undecodable file failing closed),
+fixed release-profile env/contract and
 per-field profile freshness rejection, a real controlled compiler that proves
 the actual argv and profile environment it receives, owned-group resource stops
-on low and unknown RAM after real children recorded their PIDs, and the real
+on low and unknown RAM after real children recorded their PIDs with the exact
+supervisor `stop_reason`/measurements/cleanup reported, and the real
 public manifest schema
 probed offline) against controlled fixtures; there are no public-network,
 install or build calls, and the tests do not assert that a real build succeeded.
+The failure-receipt tests drive the real `build` path and assert that a nonzero
+child exit, a pre-launch RAM refusal, a cleanup/state exception, a launch
+`Popen` `OSError`, an unusable log path and a failed publication each leave the
+expected sanitized evidence (or preserve the previous receipt, without exception
+text) while never writing success provenance. A non-compile stage records
+`compiler_cleanup: not_applicable` rather than falsely claiming the compiler
+child never started.
 The upstream regression suite (30 tests) and the repository public-file/
 document-link check still pass. A **real Root toolchain install and codex-cli
 build is still pending** and is executed by Root after independent review; the
@@ -232,6 +241,41 @@ process group with the same unreaped-leader TERM/KILL cleanup and the original
 cutoff, and reports a **nonzero resource stop even if the child later exits
 zero**; no success provenance is written. The stop is bounded by the same
 immutable cutoff as every other step.
+
+### Bounded stop diagnostics — 2026-10-14
+
+A failed build previously left only a generic exit code. The supervisor now
+accepts an optional caller-owned `outcome` dict and, without changing any return
+value, populates it with the sanitized decision of the run: the exact
+`stop_reason` (`ram_low`/`ram_unknown` for a RAM stop; `completed`, `child_exit`,
+`interrupted`, `timeout`, `signal`, `supervisor_error` or `cleanup_or_state`
+otherwise), the **measured** available bytes that triggered a stop (or `null`
+when unusable), the floor, the compiler child's status, whether the compiler
+child's cleanup succeeded (`cleaned`, `unknown` or `not_started`) and the
+reported code. A launch or log open `OSError` is caught as well as a
+`SetupError`, so the outcome is still populated while the original exception is
+re-raised unchanged and its text is never copied. Callers that pass no `outcome`
+are unchanged.
+
+`build` persists a bounded, sanitized receipt of the last **failed** attempt at
+`.builder/native-host/logs/build-last-attempt.json`: captured cutoff, failing
+stage (`gate`/`toolchain`/`prepare`/`preflight`/`supervise`/`postcheck`), exit,
+compiler-child status, compiler cleanup state, stop reason, the measured/floor
+RAM values and the current fixed profile. The compiler-child fields are scoped:
+only the `supervise` (compile) stage reports them, and any other stage reports
+`compiler_cleanup: not_applicable` — a non-compile stage never claims the
+compiler child started, ran or was cleaned. The receipt records **no** argv,
+environment, provider payload, secret or exception text, and is written for a
+pre-launch RAM refusal, a caught `OSError` at any stage or a cleanup/state
+exception as well as a nonzero child exit. Publication is atomic: a contained
+`0600` `O_EXCL` temp file is `fsync`-ed and `os.replace`-d into the owned logs
+dir, so an interrupted or failed write leaves any previous valid receipt
+untouched. A successful build writes **real provenance only** and never this
+receipt. The pre-launch RAM check now also records its curated reason before
+refusing. The `MemAvailable` parser additionally treats an undecodable file as
+unusable
+(`UnicodeError` fails closed). These are diagnostics, not qualification; the
+profile, floor, source, toolchain and guard are unchanged.
 
 A real Root build of the exact resulting binary is still pending, so `qualified`
 stays `false` and the guard stays `false`; this is a build-input/resource-fit

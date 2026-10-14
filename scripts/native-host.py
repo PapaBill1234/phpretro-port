@@ -86,6 +86,7 @@ RELEASE_PROFILE = (
     ("incremental", "false"),
 )
 RAM_POLL_SECONDS = 1.0  # fixed bounded interval between owned-run RAM samples
+BUILD_ATTEMPT_NAME = "build-last-attempt.json"  # sanitized receipt of the last failed build
 RESOURCE_STOP_EXIT = 1  # a resource stop stays failure even if the child exits 0
 LOG_LIMIT_BYTES = 4 * 1024 * 1024
 PROBE_TIMEOUT_SECONDS = 30  # bounded read-only git probes outside a gated stage
@@ -561,7 +562,8 @@ def _drain(pump, cutoff):
 
 
 def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BYTES,
-                   ram_floor_bytes=None, ram_probe=None, ram_interval=RAM_POLL_SECONDS):
+                   ram_floor_bytes=None, ram_probe=None, ram_interval=RAM_POLL_SECONDS,
+                   outcome=None):
     """Run argv in its own session, bounded in time, log size and group cleanup.
 
     The cutoff is required and validated before the child is launched, the
@@ -578,23 +580,57 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
     unreaped-leader cleanup and original cutoff and reports a nonzero resource
     stop even if the child later exits zero.  Without a floor the behaviour of
     other callers is unchanged.
+
+    ``outcome`` is an optional caller-owned dict.  When given, it is populated
+    with the sanitized decision of the run — ``stop_reason`` (for a resource
+    stop, the exact ``ram_low``/``ram_unknown``; otherwise ``completed``,
+    ``interrupted``, ``timeout`` or ``cleanup_or_state``), the measured
+    ``available_ram_bytes`` reading that triggered a RAM stop (None when not
+    measured or when the reading was unusable), the ``ram_floor_bytes`` and the
+    reported ``code``.  No argv, environment or process output is ever recorded,
+    so a caller can persist it without leaking provider data or secrets.
     """
     cutoff = require_future_cutoff(stop_at)
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     probe = ram_probe or available_ram_bytes
     if ram_floor_bytes is not None:
-        require_available_ram(probe(), ram_floor_bytes, "job")  # fail closed pre-launch
+        ram = probe()
+        if ram is None or ram < ram_floor_bytes:
+            # Record the curated refusal BEFORE raising, so a pre-launch stop is
+            # observable and never looks like an unstarted or completed run.
+            if outcome is not None:
+                outcome.update({"stop_reason": "ram_unknown" if ram is None else "ram_low",
+                                "available_ram_bytes": ram, "ram_floor_bytes": ram_floor_bytes,
+                                "code": None, "compiler_child_status": None,
+                                "compiler_cleanup": "not_started"})
+            require_available_ram(ram, ram_floor_bytes, "job")  # fail closed pre-launch
     stopped = []
     state = {"overflow": False}
     child = None
     pump = None
     handle = None
     old = {}
+    ram_reason = None
+    ram_reading = None
+    launched = False  # set once the child exists, so cleanup state is never invented
     cleaned = False  # set once the group is killed and the leader reaped
 
     def stop(sig, frame):
         stopped.append(True)
+
+    def note_error(reason):
+        """Record a sanitized failure outcome; never copy the exception text."""
+        if outcome is None:
+            return
+        outcome.setdefault("stop_reason", reason)
+        outcome.setdefault("available_ram_bytes", ram_reading)
+        outcome.setdefault("ram_floor_bytes", ram_floor_bytes)
+        outcome.setdefault("code", 1)
+        outcome.setdefault("compiler_child_status", None)
+        outcome.setdefault("compiler_cleanup", "not_started")
+        if launched:
+            outcome["compiler_cleanup"] = "unknown"  # a live child's cleanup is unproven
 
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):  # installed before Popen
@@ -602,6 +638,7 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
         handle = open(log_path, "wb")
         child = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, start_new_session=True)
+        launched = True
         pump = threading.Thread(target=_pump, args=(child.stdout.fileno(), handle, max_log_bytes,
                                                     state, cutoff), daemon=True)
         pump.start()
@@ -616,6 +653,8 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
                 ram = probe()
                 if ram is None or ram < ram_floor_bytes:
                     resource_stop = True
+                    ram_reason = "ram_unknown" if ram is None else "ram_low"
+                    ram_reading = ram
                     break
                 next_sample = time.time() + ram_interval
             time.sleep(0.2)
@@ -629,18 +668,34 @@ def run_supervised(argv, cwd, env, log_path, stop_at, max_log_bytes=LOG_LIMIT_BY
         _drain(pump, cutoff)
         code = child.returncode
         if stopped:
-            return 143
-        if resource_stop:
-            return RESOURCE_STOP_EXIT  # a resource stop is failure, never success
-        if halted:
-            return 75
-        if not group_gone:
-            return 1  # a surviving descendant was not cleaned: not success
-        if code is None:
-            return 1
-        if code < 0:  # killed by a signal: report 128+signum, never success
-            return 128 - code
-        return code
+            result, reason = 143, "interrupted"
+        elif resource_stop:
+            result, reason = RESOURCE_STOP_EXIT, ram_reason  # failure, never success
+        elif halted:
+            result, reason = 75, "timeout"
+        elif not group_gone:
+            result, reason = 1, "cleanup_or_state"  # surviving descendant: not success
+        elif code is None:
+            result, reason = 1, "cleanup_or_state"
+        elif code < 0:  # killed by a signal: report 128+signum, never success
+            result, reason = 128 - code, "signal"
+        else:
+            result, reason = code, ("completed" if code == 0 else "child_exit")
+        if outcome is not None:
+            outcome.update({"stop_reason": reason, "available_ram_bytes": ram_reading,
+                            "ram_floor_bytes": ram_floor_bytes, "code": result,
+                            "compiler_child_status": code,
+                            "compiler_cleanup": "cleaned" if group_gone else "unknown"})
+        return result
+    except OSError:
+        # A launch/log I/O failure: record why, never copy the exception text.
+        note_error("supervisor_error")
+        raise
+    except SetupError:
+        # A cleanup/state exception: never claim cleanup succeeded when the group
+        # state could not be proven.  Preserve the original exception unchanged.
+        note_error("cleanup_or_state")
+        raise
     finally:
         if child is not None and not cleaned:
             try:
@@ -1171,8 +1226,8 @@ def available_ram_bytes(meminfo=Path("/proc/meminfo")):
     """
     try:
         text = Path(meminfo).read_text()
-    except OSError:
-        return None
+    except (OSError, UnicodeError):
+        return None  # an undecodable reading is unusable: fail closed
     for line in text.splitlines():
         if not line.startswith("MemAvailable:"):
             continue
@@ -1388,30 +1443,111 @@ def command_toolchain(root):
     return 0
 
 
+def record_build_attempt(root, deadline, outcome, code):
+    """Persist a bounded, sanitized receipt of the last failed build attempt.
+
+    A failed build must leave *why* it stopped observable.  The receipt records
+    only the captured cutoff, the failing stage, the current fixed release-profile
+    contract and the supervisor's sanitized stop reason/measurements/status.  It
+    never carries argv, the environment, provider payloads or secrets, is written
+    under the private logs dir, and is a diagnostic only — never a success and
+    never a qualification.
+
+    Publication is atomic: a contained 0600 temp file (``O_EXCL``) in the owned
+    logs dir is ``fsync``-ed and then ``os.replace``-d over the receipt, so an
+    interruption or write failure can never truncate previously valid evidence.
+    A failure here is swallowed (returning False) so it never masks the original
+    build failure.
+    """
+    try:
+        target = assert_private(root, logs_dir(root) / BUILD_ATTEMPT_NAME, "write build receipt")
+    except (SetupError, OSError):
+        return False  # containment unprovable: skip, never mask the build failure
+    stage = outcome.get("stage")
+    compile_scope = stage == "supervise"  # only here is the compiler child in scope
+    receipt = {
+        "command": "build",
+        "deadline": deadline,
+        "stage": stage,
+        "exit": code,
+        # The compiler child's status is only meaningful in the compile/supervise
+        # scope; another stage never claims the compiler ran or was cleaned.
+        "compiler_child_status": outcome.get("compiler_child_status") if compile_scope else None,
+        "compiler_cleanup": (outcome.get("compiler_cleanup", "unknown")
+                             if compile_scope else "not_applicable"),
+        "resource_stop": outcome.get("stop_reason") in ("ram_low", "ram_unknown"),
+        "stop_reason": outcome.get("stop_reason"),
+        "available_ram_bytes": outcome.get("available_ram_bytes"),
+        "ram_floor_bytes": outcome.get("ram_floor_bytes"),
+        "profile": build_profile_contract(),
+    }
+    data = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+    tmp = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".build-attempt-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                fd = -1  # the file object now owns the descriptor
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.replace(tmp, target)
+        tmp = None
+    except OSError:
+        return False  # the previous receipt (if any) is untouched
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return True
+
+
 def command_build(root):
     require_platform()
     with setup_lock(root):
-        deadline = gate_cutoff()
-        cargo = ensure_toolchain(root, deadline=deadline)
-        assert_private(root, cargo_home(root), "cargo home")
-        assert_private(root, target_dir(root), "cargo target")
-        assert_private(root, logs_dir(root) / "build.log", "build log")
-        build, patch, digest = prepare_build(root, deadline=deadline)
-        resources = preflight_resources(private_root(root))
-        lock = build / "codex-rs" / "Cargo.lock"
-        verify_sha256(lock, LOCK_BUILD_SHA256)
-        argv = build_argv(cargo)
-        code = run_supervised(argv, cwd=build / "codex-rs", env=build_env(root),
-                              log_path=logs_dir(root) / "build.log", stop_at=deadline,
-                              ram_floor_bytes=RAM_MIN_AVAILABLE_BYTES)
-        if code != 0:
-            raise SetupError("codex-cli build did not complete (exit %s); checkpoint at build" % code, code=1)
-        lock_digest = sha256_file(lock)
-        if lock_digest != LOCK_BUILD_SHA256:
-            raise SetupError("build lockfile changed during Cargo; refusing provenance")
-        binary = target_dir(root) / "release" / BIN
-        if not binary.is_file():
-            raise SetupError("build produced no %s binary; refusing" % BIN, code=1)
+        outcome = {"stage": "gate"}
+        deadline = None
+        try:
+            deadline = gate_cutoff()
+            outcome["stage"] = "toolchain"
+            cargo = ensure_toolchain(root, deadline=deadline)
+            assert_private(root, cargo_home(root), "cargo home")
+            assert_private(root, target_dir(root), "cargo target")
+            assert_private(root, logs_dir(root) / "build.log", "build log")
+            outcome["stage"] = "prepare"
+            build, patch, digest = prepare_build(root, deadline=deadline)
+            outcome["stage"] = "preflight"
+            resources = preflight_resources(private_root(root))
+            lock = build / "codex-rs" / "Cargo.lock"
+            verify_sha256(lock, LOCK_BUILD_SHA256)
+            argv = build_argv(cargo)
+            outcome["stage"] = "supervise"
+            code = run_supervised(argv, cwd=build / "codex-rs", env=build_env(root),
+                                  log_path=logs_dir(root) / "build.log", stop_at=deadline,
+                                  ram_floor_bytes=RAM_MIN_AVAILABLE_BYTES, outcome=outcome)
+            if code != 0:
+                raise SetupError("codex-cli build did not complete (exit %s); checkpoint at build" % code, code=1)
+            outcome["stage"] = "postcheck"
+            lock_digest = sha256_file(lock)
+            if lock_digest != LOCK_BUILD_SHA256:
+                raise SetupError("build lockfile changed during Cargo; refusing provenance")
+            binary = target_dir(root) / "release" / BIN
+            if not binary.is_file():
+                raise SetupError("build produced no %s binary; refusing" % BIN, code=1)
+        except (SetupError, OSError) as error:
+            # Record the failing stage/reason/status/cleanup before propagating the
+            # original exception unchanged; no success provenance is ever written
+            # and the exception text is never copied into the receipt.
+            record_build_attempt(root, deadline, outcome,
+                                 outcome.get("code") or getattr(error, "code", 1))
+            raise
         data = load_provenance(root)
         bins = (data.get("toolchain") or {}).get("binaries") or {}
         data["build"] = {

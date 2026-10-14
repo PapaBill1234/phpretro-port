@@ -433,7 +433,7 @@ class ProcessBounds(unittest.TestCase):
             self.assertLessEqual(len(text), 4096 + 128)
             self.assertIn("truncated at limit", text)
 
-    def _resource_stop(self, later):
+    def _resource_stop(self, later, outcome=None):
         """Run a real leader+TERM-resistant descendant, then feed a bad reading."""
         readings = iter([host.RAM_MIN_AVAILABLE_BYTES + 1, *later])
         with tempfile.TemporaryDirectory() as directory:
@@ -444,7 +444,7 @@ class ProcessBounds(unittest.TestCase):
                 [sys.executable, "-c", self.GRANDCHILD, str(pidfile)],
                 cwd=d, env={"PATH": "/usr/bin:/bin"}, log_path=d / "run.log",
                 stop_at=future_deadline(20), ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
-                ram_probe=lambda: next(readings), ram_interval=0.2)
+                ram_probe=lambda: next(readings), ram_interval=0.2, outcome=outcome)
             self.assertEqual(code, host.RESOURCE_STOP_EXIT)  # failure, never the child's 0
             pids = self._pids(pidfile)  # real children recorded their pids first
             self.assertTrue(pids)
@@ -459,6 +459,34 @@ class ProcessBounds(unittest.TestCase):
     def test_resource_stop_cleans_group_on_unknown_ram(self):
         self._resource_stop([None])  # unusable reading after launch
 
+    def test_resource_stop_reports_low_ram_outcome(self):
+        outcome = {}
+        self._resource_stop([12345], outcome=outcome)  # group still cleaned
+        self.assertEqual(outcome["stop_reason"], "ram_low")  # exact reason, not a guess
+        self.assertEqual(outcome["available_ram_bytes"], 12345)  # the measured reading
+        self.assertEqual(outcome["ram_floor_bytes"], host.RAM_MIN_AVAILABLE_BYTES)
+        self.assertEqual(outcome["code"], host.RESOURCE_STOP_EXIT)
+
+    def test_resource_stop_reports_unknown_ram_outcome(self):
+        outcome = {}
+        self._resource_stop([None], outcome=outcome)
+        self.assertEqual(outcome["stop_reason"], "ram_unknown")  # distinct from low
+        self.assertIsNone(outcome["available_ram_bytes"])  # nothing trustworthy measured
+        self.assertEqual(outcome["ram_floor_bytes"], host.RAM_MIN_AVAILABLE_BYTES)
+        self.assertEqual(outcome["code"], host.RESOURCE_STOP_EXIT)
+
+    def test_successful_run_reports_completed_outcome(self):
+        outcome = {}
+        with tempfile.TemporaryDirectory() as directory:
+            code = host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                       env={"PATH": "/usr/bin:/bin"},
+                                       log_path=Path(directory) / "run.log",
+                                       stop_at=future_deadline(20), outcome=outcome)
+        self.assertEqual(code, 0)
+        self.assertEqual(outcome["stop_reason"], "completed")
+        self.assertEqual(outcome["code"], 0)
+        self.assertIsNone(outcome["ram_floor_bytes"])  # no floor: unchanged behaviour
+
     def test_resource_stop_pre_launch_fails_closed(self):
         # A bad reading before launch refuses without starting any child.
         with tempfile.TemporaryDirectory() as directory:
@@ -470,6 +498,38 @@ class ProcessBounds(unittest.TestCase):
                                     ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
                                     ram_probe=lambda: None)
 
+    def test_pre_launch_low_ram_reports_outcome(self):
+        outcome = {}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(host.SetupError):
+                host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                    env={"PATH": "/usr/bin:/bin"},
+                                    log_path=Path(directory) / "run.log",
+                                    stop_at=future_deadline(20),
+                                    ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
+                                    ram_probe=lambda: 5, outcome=outcome)
+        # Curated before the SetupError, and honestly unstarted (never "cleaned").
+        self.assertEqual(outcome["stop_reason"], "ram_low")
+        self.assertEqual(outcome["available_ram_bytes"], 5)
+        self.assertEqual(outcome["ram_floor_bytes"], host.RAM_MIN_AVAILABLE_BYTES)
+        self.assertIsNone(outcome["code"])
+        self.assertIsNone(outcome["compiler_child_status"])
+        self.assertEqual(outcome["compiler_cleanup"], "not_started")
+
+    def test_pre_launch_unknown_ram_reports_outcome(self):
+        outcome = {}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(host.SetupError):
+                host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                    env={"PATH": "/usr/bin:/bin"},
+                                    log_path=Path(directory) / "run.log",
+                                    stop_at=future_deadline(20),
+                                    ram_floor_bytes=host.RAM_MIN_AVAILABLE_BYTES,
+                                    ram_probe=lambda: None, outcome=outcome)
+        self.assertEqual(outcome["stop_reason"], "ram_unknown")
+        self.assertIsNone(outcome["available_ram_bytes"])
+        self.assertEqual(outcome["compiler_cleanup"], "not_started")
+
     def test_no_ram_floor_leaves_other_callers_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             code = host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
@@ -477,6 +537,35 @@ class ProcessBounds(unittest.TestCase):
                                        log_path=Path(directory) / "run.log",
                                        stop_at=future_deadline(20))
             self.assertEqual(code, 0)
+
+    def test_launch_oserror_reports_outcome_without_text(self):
+        outcome = {}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(host.subprocess, "Popen", side_effect=OSError("boom-secret")):
+                with self.assertRaises(OSError):
+                    host.run_supervised([sys.executable, "-c", "pass"], cwd=directory,
+                                        env={"PATH": "/usr/bin:/bin"},
+                                        log_path=Path(directory) / "run.log",
+                                        stop_at=future_deadline(20), outcome=outcome)
+        self.assertEqual(outcome["stop_reason"], "supervisor_error")
+        self.assertEqual(outcome["compiler_cleanup"], "not_started")  # never launched
+        self.assertIsNone(outcome["compiler_child_status"])
+        self.assertEqual(outcome["code"], 1)
+        self.assertNotIn("boom-secret", json.dumps(outcome))  # no exception text
+
+    def test_log_open_oserror_reports_outcome(self):
+        outcome = {}
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            logdir = d / "logdir"
+            logdir.mkdir()
+            with self.assertRaises(OSError):
+                host.run_supervised([sys.executable, "-c", "pass"], cwd=d,
+                                    env={"PATH": "/usr/bin:/bin"}, log_path=logdir,
+                                    stop_at=future_deadline(20), outcome=outcome)
+        self.assertEqual(outcome["stop_reason"], "supervisor_error")
+        self.assertEqual(outcome["compiler_cleanup"], "not_started")
+        self.assertEqual(outcome["code"], 1)
 
 
 class ProcStatStrictness(unittest.TestCase):
@@ -683,6 +772,13 @@ class RamParsing(unittest.TestCase):
     def test_unreadable_file_fails_closed(self):
         self.assertIsNone(host.available_ram_bytes(Path("/nonexistent/meminfo")))
 
+    def test_undecodable_file_fails_closed(self):
+        # An invalid byte sequence must fail closed, not raise UnicodeError.
+        with tempfile.TemporaryDirectory() as directory:
+            meminfo = Path(directory) / "meminfo"
+            meminfo.write_bytes(b"MemAvailable: 3072 kB\n\xff\xfe")
+            self.assertIsNone(host.available_ram_bytes(meminfo))
+
     def test_require_available_ram_refuses_none_and_low(self):
         with self.assertRaises(host.SetupError):
             host.require_available_ram(None, host.RAM_MIN_AVAILABLE_BYTES)
@@ -807,6 +903,8 @@ class BuildContract(unittest.TestCase):
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
                     patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
                 self.assertEqual(host.command_build(root), 0)
+                # A successful build writes real provenance, never a failure receipt.
+                self.assertFalse((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).exists())
                 # The real subprocess proves the actual argv and profile env it
                 # received, not just the helpers we called.
                 observed = json.loads((host.target_dir(root) / "fixture-observation.json").read_text())
@@ -912,6 +1010,190 @@ class BuildContract(unittest.TestCase):
                 with self.assertRaises(host.SetupError):
                     host.command_build(root)
             self.assertFalse(host.provenance_path(root).exists())  # no success provenance
+            # A bounded sanitized receipt makes the exact stop reason observable.
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["command"], "build")
+            self.assertEqual(receipt["stop_reason"], "ram_low")
+            self.assertEqual(receipt["exit"], host.RESOURCE_STOP_EXIT)
+            self.assertTrue(receipt["resource_stop"])
+            self.assertEqual(receipt["available_ram_bytes"], 1)
+            self.assertEqual(receipt["ram_floor_bytes"], host.RAM_MIN_AVAILABLE_BYTES)
+            self.assertEqual(receipt["profile"], host.build_profile_contract())
+            self.assertEqual(receipt["deadline"], deadline)
+            self.assertNotIn("argv", receipt)  # no full argv / env / secrets recorded
+
+    def test_child_exit_failure_records_receipt_without_provenance(self):
+        # The observed real failure: the compiler exits nonzero with no diagnostic.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = host.build_dir(root)
+            workspace = build / "codex-rs"
+            workspace.mkdir(parents=True)
+            (workspace / "Cargo.toml").write_text('[workspace]\n')
+            (workspace / "Cargo.lock").write_bytes(b"fixture lock")
+            compiler = root / "cargo-fixture"
+            compiler.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1)\n')
+            compiler.chmod(0o700)
+            patch_path = root / "reviewed.patch"
+            patch_path.write_text("controlled patch")
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
+                with self.assertRaises(host.SetupError):
+                    host.command_build(root)
+            self.assertFalse(host.provenance_path(root).exists())  # no success provenance
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["exit"], 1)  # the child's own code, unrelaxed
+            self.assertFalse(receipt["resource_stop"])
+            self.assertEqual(receipt["stop_reason"], "child_exit")  # not a RAM stop
+            self.assertEqual(receipt["compiler_child_status"], 1)
+            self.assertEqual(receipt["compiler_cleanup"], "cleaned")
+            self.assertEqual(receipt["deadline"], deadline)
+            self.assertEqual(receipt["profile"], host.build_profile_contract())
+
+    def _build_fixture(self, root, compiler_text):
+        build = host.build_dir(root)
+        workspace = build / "codex-rs"
+        workspace.mkdir(parents=True)
+        (workspace / "Cargo.toml").write_text('[workspace]\n')
+        (workspace / "Cargo.lock").write_bytes(b"fixture lock")
+        compiler = root / "cargo-fixture"
+        compiler.write_text(compiler_text)
+        compiler.chmod(0o700)
+        patch_path = root / "reviewed.patch"
+        patch_path.write_text("controlled patch")
+        return build, compiler, patch_path
+
+    def test_pre_launch_ram_failure_records_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, compiler, patch_path = self._build_fixture(root, "unused")
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "available_ram_bytes", lambda *a, **k: 1), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
+                with self.assertRaises(host.SetupError):
+                    host.command_build(root)  # fails before the child is launched
+            self.assertFalse(host.provenance_path(root).exists())
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stage"], "supervise")
+            self.assertEqual(receipt["stop_reason"], "ram_low")
+            self.assertEqual(receipt["compiler_cleanup"], "not_started")  # never started
+            self.assertIsNone(receipt["compiler_child_status"])
+            self.assertEqual(receipt["exit"], 1)
+
+    def test_cleanup_exception_records_receipt_without_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, compiler, patch_path = self._build_fixture(
+                root, '#!' + sys.executable + '\npass\n')
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()), \
+                    patch.object(host, "_kill_group", side_effect=host.SetupError("unprovable group")):
+                with self.assertRaises(host.SetupError):
+                    host.command_build(root)  # cleanup state cannot be proven
+            self.assertFalse(host.provenance_path(root).exists())
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stop_reason"], "cleanup_or_state")
+            self.assertEqual(receipt["compiler_cleanup"], "unknown")  # success never invented
+            self.assertEqual(receipt["stage"], "supervise")
+
+    def test_toolchain_failure_records_stage_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", side_effect=host.SetupError("no toolchain")):
+                with self.assertRaises(host.SetupError):
+                    host.command_build(root)
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stage"], "toolchain")
+            # The compiler child is out of scope here: never "not_started".
+            self.assertEqual(receipt["compiler_cleanup"], "not_applicable")
+            self.assertIsNone(receipt["compiler_child_status"])
+            self.assertEqual(receipt["exit"], 1)
+
+    def test_supervisor_popen_oserror_records_receipt(self):
+        # A launch OSError is caught, preserving the exception and the receipt.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, compiler, patch_path = self._build_fixture(root, "unused")
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()), \
+                    patch.object(host.subprocess, "Popen", side_effect=OSError("no-fork-secret")):
+                with self.assertRaises(OSError):
+                    host.command_build(root)
+            self.assertFalse(host.provenance_path(root).exists())
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stage"], "supervise")
+            self.assertEqual(receipt["stop_reason"], "supervisor_error")
+            self.assertEqual(receipt["compiler_cleanup"], "not_started")  # never launched
+            self.assertEqual(receipt["exit"], 1)
+            self.assertNotIn("no-fork-secret", json.dumps(receipt))  # no exception text
+
+    def test_supervisor_log_ioerror_records_receipt(self):
+        # An unusable log path is a caught OSError, still leaving a receipt.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, compiler, patch_path = self._build_fixture(root, "unused")
+            (host.logs_dir(root) / "build.log").mkdir(parents=True)  # a dir cannot be opened
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=compiler), \
+                    patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
+                    patch.object(host, "preflight_resources", return_value={"fixture": True}), \
+                    patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
+                with self.assertRaises(OSError):
+                    host.command_build(root)
+            self.assertFalse(host.provenance_path(root).exists())
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stage"], "supervise")
+            self.assertEqual(receipt["stop_reason"], "supervisor_error")
+            self.assertEqual(receipt["compiler_cleanup"], "not_started")
+            self.assertEqual(receipt["exit"], 1)
+
+    def test_stage_oserror_records_receipt_without_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deadline = future_deadline(30)
+            with patch.object(host, "gate_cutoff", return_value=deadline), \
+                    patch.object(host, "ensure_toolchain", return_value=root / "cargo"), \
+                    patch.object(host, "prepare_build", side_effect=OSError("io-secret")):
+                with self.assertRaises(OSError):
+                    host.command_build(root)
+            self.assertFalse(host.provenance_path(root).exists())
+            receipt = json.loads((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).read_text())
+            self.assertEqual(receipt["stage"], "prepare")
+            self.assertEqual(receipt["compiler_cleanup"], "not_applicable")  # out of scope
+            self.assertEqual(receipt["exit"], 1)
+            self.assertNotIn("io-secret", json.dumps(receipt))
+
+    def test_receipt_publication_failure_preserves_previous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = host.logs_dir(root) / host.BUILD_ATTEMPT_NAME
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("PREVIOUS VALID RECEIPT")
+            with patch.object(host.os, "replace", side_effect=OSError("disk full")):
+                ok = host.record_build_attempt(root, "cutoff", {"stage": "supervise"}, 1)
+            self.assertFalse(ok)  # best-effort: never masks the build failure
+            self.assertEqual(target.read_text(), "PREVIOUS VALID RECEIPT")  # old kept
+            self.assertEqual([p.name for p in target.parent.iterdir()],
+                             [host.BUILD_ATTEMPT_NAME])  # temp cleaned up
 
     def test_state_never_claims_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
