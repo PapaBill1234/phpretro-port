@@ -190,7 +190,7 @@ index f2b5844..363cd88 100644
 +
 +    let mut turn = session.new_default_turn().await;
 +    {
-+        let turn = Arc::make_mut(&mut turn);
++        let turn = Arc::get_mut(&mut turn).expect("fresh turn context is unshared");
 +        set_feature(turn, Feature::CodeModeOnly, /*enabled*/ true);
 +        update_turn_settings_for_test(turn, |settings| {
 +            Arc::make_mut(&mut settings.model_info).tool_mode = None;
@@ -232,7 +232,7 @@ index f2b5844..363cd88 100644
 +
 +    let mut turn = session.new_default_turn().await;
 +    {
-+        let turn = Arc::make_mut(&mut turn);
++        let turn = Arc::get_mut(&mut turn).expect("fresh turn context is unshared");
 +        turn.code_mode_available = true;
 +        set_feature(turn, Feature::CodeMode, /*enabled*/ true);
 +        update_turn_settings_for_test(turn, |settings| {

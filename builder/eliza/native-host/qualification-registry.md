@@ -9,10 +9,10 @@ made. `git apply --check` succeeding is **not** test-passing evidence.
 | Field | Value |
 | --- | --- |
 | Source pin | `c1382380de69521303b416720a52f42d51af6248` (openai/codex `rust-v0.162.0`) |
-| `qualification-registry.patch` SHA-256 | `21a127fac8bad33aa71dddea6def0b58196303c6b7aba5586e9f73843c8d0408` |
+| `qualification-registry.patch` SHA-256 | `87cb1a63c68a1103b4028f88fd159ae825301822413732e743a5aabefab754ad` |
 | Patch targets | `codex-rs/core/src/tools/spec_plan_tests.rs`, `codex-rs/core/src/tools/registry_tests.rs` (test files **only**) |
 | Adds | 298 lines; 3 `#[tokio::test]` tests + fixtures |
-| `spec_plan_tests.rs` base / patched SHA-256 | `d068a2b6…d3342` / `cef566b0…be09c` |
+| `spec_plan_tests.rs` base / patched SHA-256 | `d068a2b6…d3342` / `d45fc796…75579` |
 | `registry_tests.rs` base / patched SHA-256 | `91fc8a06…eb590` / `6d1621dc…8c2b7` |
 
 Generated as an **incremental** diff from the accepted private baseline (which has

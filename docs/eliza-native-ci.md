@@ -161,9 +161,9 @@ functions: nine startup/resume, eight spec-plan, two registry.
 | --- | --- | --- |
 | `text-only.patch` | `09b3ef5a…66c7f` | `thread_manager.rs` = `d65c1697…88bf8` |
 | `qualification-tests.patch` | `c2c2f0bb…3fc57` | `thread_manager_tests.rs` = `4e0ec767…28d3e0` |
-| `qualification-registry.patch` | `21a127fa…8d0408` | `spec_plan_tests.rs` = `cef566b0…be09c`; `registry_tests.rs` = `6d1621dc…8c2b7` |
-| `qualification-adversarial.patch` | `952355fb…cb5edc` | `thread_manager_tests.rs` = `13b3e918…618aa`; `spec_plan_tests.rs` = `569d21b9…d3dc4`; `registry_tests.rs` = `ffb81085…08570857` |
-| `qualification-contributors.patch` | `3caae90b…a23c749` | `spec_plan_tests.rs` = `f4f70ca1…c619208f` |
+| `qualification-registry.patch` | `87cb1a63…ab754ad` | `spec_plan_tests.rs` = `d45fc796…75579`; `registry_tests.rs` = `6d1621dc…8c2b7` |
+| `qualification-adversarial.patch` | `3c668046…3d27648` | `thread_manager_tests.rs` = `13b3e918…618aa`; `spec_plan_tests.rs` = `688cec9b…c9481`; `registry_tests.rs` = `ffb81085…08570857` |
+| `qualification-contributors.patch` | `3caae90b…a23c749` | `spec_plan_tests.rs` = `73a843f2…b225a4` |
 
 The full digests are embedded in `scripts/native-host-ci.py`; the reviewed docs
 give the leading/trailing segments shown here.

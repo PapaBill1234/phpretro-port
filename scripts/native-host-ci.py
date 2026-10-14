@@ -122,22 +122,22 @@ TEST_PATCH_MANIFEST = (
     },
     {
         "file": "qualification-registry.patch",
-        "sha256": "21a127fac8bad33aa71dddea6def0b58196303c6b7aba5586e9f73843c8d0408",
+        "sha256": "87cb1a63c68a1103b4028f88fd159ae825301822413732e743a5aabefab754ad",
         "targets": {
             "codex-rs/core/src/tools/spec_plan_tests.rs":
-                "cef566b0c85bc19b909e6ee14997b9f5d24f117a7e023beaf48ff59fc28be09c",
+                "d45fc796727af4bbfc7e826248df3a073efa10bb30931e57040e99b395f75579",
             "codex-rs/core/src/tools/registry_tests.rs":
                 "6d1621dcdc8fe1a11003c5c3a99bf1619c032c60ffca443afbace0de5d28c2b7",
         },
     },
     {
         "file": "qualification-adversarial.patch",
-        "sha256": "952355fb2a0fda2bf10f0479c53bb607e14f70c9d6fdb805f89f45d7fccb5edc",
+        "sha256": "3c6680469db60cd9cf4b2cbe555d10f9c97e1ee02b843b4157f40b0403d27648",
         "targets": {
             "codex-rs/core/src/thread_manager_tests.rs":
                 "13b3e91819a20cdca3ac33b3b69d01bf8554de51c835d90984ebc1d8f52618aa",
             "codex-rs/core/src/tools/spec_plan_tests.rs":
-                "569d21b9380c23384a056190157971d41bfef6c060db1e4231d3a0de4bbd3dc4",
+                "688cec9ba6d528763d406ee3a35bdc156b242053bdf138b83a27b660e52c9481",
             "codex-rs/core/src/tools/registry_tests.rs":
                 "ffb81085ada72230327724ca40c5c990184ab2f7e35853825833e68a98570857",
         },
@@ -146,7 +146,7 @@ TEST_PATCH_MANIFEST = (
         "file": "qualification-contributors.patch",
         "sha256": "3caae90b957f958aba5410fb1f9a27cae53d7a4a77b13ce494afdeeeda23c749",
         "targets": {"codex-rs/core/src/tools/spec_plan_tests.rs":
-                    "f4f70ca1f84b2970bf8519370b29ca429b4e8f3c14121023bb196634c619208f"},
+                    "73a843f296b982f7f5030beea185248f4c0e0e866a209732809d8eb225b225a4"},
     },
 )
 

@@ -395,6 +395,28 @@ class PatchScopeTests(unittest.TestCase):
         ci.verify_patch_digest(ci.PATCH_DIR / ci.PRODUCTION_PATCH["file"],
                                ci.PRODUCTION_PATCH["sha256"], "text-only.patch")
 
+    def test_qualification_test_patches_do_not_clone_turn_context(self):
+        """The pinned `TurnContext` derives only `Debug` (no `Clone`).
+
+        A patched test that mutates a turn created by
+        `Session::new_default_turn` must therefore reach through the fresh,
+        unshared `Arc` with `Arc::get_mut`. `Arc::make_mut(&mut turn)` demands
+        `TurnContext: Clone` (E0277 `CloneToUninit`) and exited the hosted
+        runner with 101 before any test ran, so no test patch may reintroduce
+        it. `Arc::make_mut(&mut turn.config)` targets the inner `Arc<Config>`
+        and is unaffected by this exact-string check.
+        """
+        for entry in ci.TEST_PATCH_MANIFEST:
+            text = (ci.PATCH_DIR / entry["file"]).read_text()
+            self.assertNotIn(
+                "Arc::make_mut(&mut turn)",
+                text,
+                "%s must not require TurnContext: Clone" % entry["file"],
+            )
+        for name in ("qualification-registry.patch", "qualification-adversarial.patch"):
+            text = (ci.PATCH_DIR / name).read_text()
+            self.assertIn("Arc::get_mut(&mut turn)", text, name)
+
     def test_tampered_patch_digest_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / "p.patch"

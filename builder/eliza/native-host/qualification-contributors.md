@@ -11,7 +11,7 @@ was used. `git apply --check` succeeding is **not** test-passing evidence.
 | Source pin | `c1382380de69521303b416720a52f42d51af6248` (openai/codex `rust-v0.162.0`) |
 | `qualification-contributors.patch` SHA-256 | `3caae90b957f958aba5410fb1f9a27cae53d7a4a77b13ce494afdeeeda23c749` |
 | Patch targets | `codex-rs/core/src/tools/spec_plan_tests.rs` (test module only; +286; 2 hunks) |
-| `spec_plan_tests.rs` patched SHA-256 | `f4f70ca1f84b2970bf8519370b29ca429b4e8f3c14121023bb196634c619208f` |
+| `spec_plan_tests.rs` patched SHA-256 | `73a843f296b982f7f5030beea185248f4c0e0e866a209732809d8eb225b225a4` |
 | Baseline (private) | pin `c1382380` + `text-only` + `qualification-tests` + `qualification-registry` + `qualification-adversarial` (committed; excludes the old candidate) |
 
 ## Required ordered apply (verified on a clean pin)
@@ -23,7 +23,7 @@ incremental diff was regenerated against the committed production+startup+regist
 adversarial baseline, then independently replayed in a second standalone `git init`
 repository (toplevel = scratch dir, empty prefix); the replay applies cleanly, changes
 **only** `spec_plan_tests.rs`, and its changed bytes match the staged target
-(sha256 `f4f70ca1…`). Exit status alone was not treated as proof — changed bytes were
+(sha256 `73a843f2…`). Exit status alone was not treated as proof — changed bytes were
 compared (`cmp`).
 
 ## Positive controls vs constrained paths

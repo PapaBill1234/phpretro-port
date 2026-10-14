@@ -9,10 +9,10 @@ made. `git apply --check` succeeding is **not** test-passing evidence.
 | Field | Value |
 | --- | --- |
 | Source pin | `c1382380de69521303b416720a52f42d51af6248` (openai/codex `rust-v0.162.0`) |
-| `qualification-adversarial.patch` SHA-256 | `952355fb2a0fda2bf10f0479c53bb607e14f70c9d6fdb805f89f45d7fccb5edc` |
+| `qualification-adversarial.patch` SHA-256 | `3c6680469db60cd9cf4b2cbe555d10f9c97e1ee02b843b4157f40b0403d27648` |
 | Patch targets | `thread_manager_tests.rs` (+102), `tools/spec_plan_tests.rs` (+85), `tools/registry_tests.rs` (+59) — 246 lines, test modules **only** |
 | `thread_manager_tests.rs` SHA-256 | `13b3e918…618aa` |
-| `tools/spec_plan_tests.rs` SHA-256 | `569d21b9…d3dc4` |
+| `tools/spec_plan_tests.rs` SHA-256 | `688cec9b…c9481` |
 | `tools/registry_tests.rs` SHA-256 | `ffb81085ada72230327724ca40c5c990184ab2f7e35853825833e68a98570857` |
 
 This is the **incremental** diff on top of the baseline that already carries

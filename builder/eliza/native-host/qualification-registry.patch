@@ -290,7 +290,7 @@ index 395cc95..f2b5844 100644
 +
 +    let mut turn = session.new_default_turn().await;
 +    {
-+        let turn = Arc::make_mut(&mut turn);
++        let turn = Arc::get_mut(&mut turn).expect("fresh turn context is unshared");
 +        turn.dynamic_tools.push(dynamic_tool(
 +            None,
 +            "qualification_dynamic_fn",
