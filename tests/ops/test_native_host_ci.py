@@ -603,6 +603,32 @@ class FailureDiagnosticTests(unittest.TestCase):
         self.assertIsNone(ci.sanitize_compiler_excerpt(
             "   Compiling codex-core v0.1.0\nFinished `test` profile in 1.2s\n"))
 
+    def test_offline_test_excerpt_keeps_failure_structure_not_stdout(self):
+        test_name = "tools::registry::tests::native_text_host_qualification_captured_policy_denies_dispatch"
+        text = """\
+test %s ... FAILED
+failures:
+---- %s stdout ----
+thread '%s' panicked at /home/runner/work/repo/repo/build/codex-rs/core/src/tools/registry_tests.rs:123:9:
+assertion `left == right` failed: API_KEY=do-not-publish
+failures:
+test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.2s
+error: test failed, to rerun pass `-p codex-core --lib`
+""" % (test_name, test_name, test_name)
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        self.assertEqual(excerpt["lines"], [
+            "test %s ... FAILED" % test_name,
+            "failures:",
+            "---- %s stdout ----" % test_name,
+            "thread '%s' panicked at codex-rs/core/src/tools/registry_tests.rs:123:9:" % test_name,
+            "failures:",
+            "test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.2s",
+            "error: test failed, to rerun pass `-p codex-core --lib`",
+        ])
+        self.assertNotIn("API_KEY", json.dumps(excerpt))
+        self.assertNotIn("do-not-publish", json.dumps(excerpt))
+        self.assertNotIn("/home/runner", json.dumps(excerpt))
+
     def test_stage_diagnostic_is_none_for_missing_or_absent_log(self):
         self.assertIsNone(ci._stage_diagnostic(None))
         with tempfile.TemporaryDirectory() as tmp:
@@ -619,6 +645,23 @@ class FailureDiagnosticTests(unittest.TestCase):
             self.assertIsNotNone(excerpt)
             self.assertEqual(excerpt["lines"], ["error: last prior error"])
             self.assertNotIn("first-line-outside-the-tail", json.dumps(excerpt))
+
+    def test_offline_stage_diagnostic_keeps_failed_test_summary_and_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.log"
+            path.write_text(
+                "test tools::registry::tests::native_text_host_qualification_x ... FAILED\n"
+                "thread 'tools::registry::tests::native_text_host_qualification_x' "
+                "panicked at /work/build/codex-rs/core/src/tools/registry_tests.rs:9:2:\n"
+                "assertion failed: private_fixture\n"
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; "
+                "0 filtered out; finished in 0.1s\n")
+            excerpt = ci._stage_diagnostic(path, "offline-tests")
+            self.assertIn("... FAILED", excerpt["lines"][0])
+            self.assertIn("codex-rs/core/src/tools/registry_tests.rs:9:2",
+                          "\n".join(excerpt["lines"]))
+            self.assertIn("test result: FAILED.", "\n".join(excerpt["lines"]))
+            self.assertNotIn("private_fixture", json.dumps(excerpt))
 
 
 class ArtifactAllowlistTests(unittest.TestCase):
@@ -866,6 +909,34 @@ class OrchestrationFixtureTests(unittest.TestCase):
             blob = json.dumps(receipt)
             self.assertNotIn("/home/runner", blob)
             self.assertNotIn("repo/build", blob)
+            self.assertFalse(receipt["native_admission"])
+            self.assertTrue(receipt["guard_unchanged"])
+
+    def test_offline_test_failure_receipt_keeps_failed_test_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
+            host = FakeHost(tmp, test_code=101, patch_dir=patch_dir)
+            host._build = build
+            failed = sorted(ci.EXPECTED_TESTS)[0]
+            host._test_output = (
+                "test %s ... FAILED\n" % failed +
+                "failures:\n" +
+                "---- %s stdout ----\n" % failed +
+                "thread '%s' panicked at /work/build/codex-rs/core/src/tools/registry_tests.rs:91:7:\n" % failed +
+                "assertion failed: sensitive_fixture\n" +
+                "test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; "
+                "0 filtered out; finished in 1.2s\n" +
+                "error: test failed, to rerun pass `-p codex-core --lib`\n")
+            qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
+                                                   lock_digest)
+            self.assertFalse(qualified)
+            self.assertIn("qualification results rejected", reason)
+            diagnostic = receipt["failure"]["diagnostic"]
+            blob = json.dumps(diagnostic)
+            self.assertIn("test %s ... FAILED" % failed, blob)
+            self.assertIn("test result: FAILED. 18 passed; 1 failed", blob)
+            self.assertIn("registry_tests.rs:91:7", blob)
+            self.assertNotIn("sensitive_fixture", blob)
             self.assertFalse(receipt["native_admission"])
             self.assertTrue(receipt["guard_unchanged"])
 

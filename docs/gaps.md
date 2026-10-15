@@ -236,6 +236,17 @@ amended revision; `tests.ops.test_native_host_ci` Ran 72 tests OK and
 artifact import or compiled qualification has been verified, and no admission
 follows. **G05/G06 remain Partial.**
 
+The next hosted run, `38655519222` on `0631a53`, reached `offline-tests` and
+exited 101. Its receipt showed no test outcome or summary lines and only Cargo's
+generic `test failed` message; the available artifact/logs do not establish which
+test or assertion failed. Source review found the receipt's stage diagnostic
+always used the compiler-only line filter, which discarded the Rust test
+harness's failure name, summary and panic location. The bounded offline-test
+excerpt now retains those structural lines while dropping assertion/stdout
+payloads. This fixes future failure evidence only; it does not recover the
+missing hosted log or establish that any qualification test passes. Admission
+remains false and G05/G06 remain Partial.
+
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
 `PHP_RETRO_COMPANION_TRUSTED_ORIGINS` into the API child environment only, from

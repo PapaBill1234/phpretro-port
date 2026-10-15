@@ -461,6 +461,9 @@ DIAGNOSTIC_LINE_RE = re.compile(
 DIAGNOSTIC_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.\-])/[^\s:`'\"()\[\],]*")
 DIAGNOSTIC_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://\S*")
 DIAGNOSTIC_ENV_VALUE_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})=\S+")
+TEST_FAILURE_HEADER_RE = re.compile(r"^---- ([A-Za-z0-9_:]+) stdout ----$")
+TEST_PANIC_LOCATION_RE = re.compile(
+    r"^thread '([A-Za-z0-9_:]+)' panicked at (.+):(\d+):(\d+):$")
 
 
 def _redact_diagnostic_line(line):
@@ -507,7 +510,59 @@ def sanitize_compiler_excerpt(text, max_lines=DIAGNOSTIC_MAX_LINES,
     return {"lines": lines, "truncated": truncated}
 
 
-def _stage_diagnostic(log_path):
+def sanitize_offline_test_excerpt(text, max_lines=DIAGNOSTIC_MAX_LINES,
+                                  max_chars=DIAGNOSTIC_MAX_CHARS):
+    """Keep bounded test-failure structure without arbitrary test stdout.
+
+    Failure receipts need the failed test and summary, but test stdout can
+    contain arbitrary fixture data. Retain only harness result/summary lines,
+    failure headings, and panic source locations; drop assertion payloads.
+    """
+    kept = []
+    truncated = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        result = _RESULT_RE.match(line)
+        summary = _SUMMARY_RE.match(line)
+        header = TEST_FAILURE_HEADER_RE.match(line)
+        panic = TEST_PANIC_LOCATION_RE.match(line)
+        if result and result.group(2) == "FAILED":
+            safe_line = line
+        elif summary:
+            safe_line = line
+        elif line == "failures:" or header:
+            safe_line = line
+        elif panic:
+            path = panic.group(2).replace("\\", "/")
+            marker = "/codex-rs/"
+            relative = path[path.rfind(marker) + 1:] if marker in path else Path(path).name
+            safe_line = "thread '%s' panicked at %s:%s:%s:" % (
+                panic.group(1), relative, panic.group(3), panic.group(4))
+        elif line == "error: test failed, to rerun pass `-p codex-core --lib`":
+            safe_line = line
+        else:
+            continue
+        if len(kept) >= max_lines:
+            truncated = True
+            break
+        kept.append(_redact_diagnostic_line(safe_line))
+    if not kept:
+        return None
+    lines = []
+    used = 0
+    for line in kept:
+        if used + len(line) + 1 > max_chars:
+            truncated = True
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if not lines:
+        lines = [kept[0][:max_chars]]
+        truncated = True
+    return {"lines": lines, "truncated": truncated}
+
+
+def _stage_diagnostic(log_path, stage=None):
     """Bounded sanitized diagnostics from a failing stage log, else ``None``.
 
     At most ``DIAGNOSTIC_TAIL_BYTES`` are read from the end of the log; a
@@ -524,7 +579,10 @@ def _stage_diagnostic(log_path):
             tail = handle.read(DIAGNOSTIC_TAIL_BYTES)
     except OSError:
         return None
-    return sanitize_compiler_excerpt(tail.decode("utf-8", errors="replace"))
+    text = tail.decode("utf-8", errors="replace")
+    if stage == "offline-tests":
+        return sanitize_offline_test_excerpt(text)
+    return sanitize_compiler_excerpt(text)
 
 
 def _sanitized_failure(wrapper_stage, outcome, reason, diagnostic=None):
@@ -928,7 +986,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
         except Exception:
             pass
         failure = _sanitized_failure(wrapper_stage, outcome, reason,
-                                     _stage_diagnostic(stage_log))
+                                     _stage_diagnostic(stage_log, wrapper_stage))
         receipt = build_receipt(identity, deadline, {"seconds": elapsed}, None,
                                 {"source_pin": getattr(host, "CODEX_PIN", None)}, None,
                                 False, failure)
