@@ -213,7 +213,7 @@ def selected_test_names():
 EXPECTED_TESTS = selected_test_names()
 
 _RESULT_RE = re.compile(r"^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored|bench)$")
-_STARTED_TEST_RE = re.compile(r"^test ([A-Za-z0-9_:]+) +\.\.\.$")
+_STARTED_TEST_RE = re.compile(r"^test ([A-Za-z0-9_:]+) +\.\.\.(.*)$")
 _SUMMARY_RE = re.compile(
     r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; "
     r"(\d+) filtered out; finished in ([\d.]+)s$")
@@ -561,11 +561,26 @@ def sanitize_offline_test_excerpt(text, max_lines=DIAGNOSTIC_MAX_LINES,
                 continue
             safe_line = line
         elif not in_test_stdout and (started := _STARTED_TEST_RE.match(line)):
-            # With --test-threads=1 libtest flushes the test name before running
-            # it. Preserve only this fixed-shape name if the process dies before
-            # emitting its outcome; arbitrary test stdout remains excluded.
+            # libtest flushes the serial test prefix without a newline. Cargo's
+            # generic failure line can therefore share that physical log line.
+            # Accept only the standalone prefix or that one exact suffix; never
+            # carry arbitrary bytes from appended text into the receipt.
+            suffix = started.group(2)
+            if suffix not in ("", " " + CARGO_TEST_FAILED_LINE):
+                continue
             harness_seen = True
             safe_line = "test %s ... (started; no result recorded)" % started.group(1)
+            if suffix:
+                if pending_shared_library is not None:
+                    if not keep(pending_shared_library):
+                        break
+                    pending_shared_library = None
+                if not keep(safe_line):
+                    break
+                cargo_failure_seen = True
+                if not keep(CARGO_TEST_FAILED_LINE):
+                    break
+                continue
         elif summary:
             harness_seen = True
             in_test_stdout = False

@@ -119,7 +119,9 @@ is unchanged.
     - the serialized Rust 1.95 libtest run flushes `test <name> ... ` before
       invoking each test ([pinned formatter source](https://github.com/rust-lang/rust/blob/1.95.0/library/test/src/formatters/pretty.rs)).
       If the child exits before the result, the offline excerpt may retain only
-      that fixed-shape qualified name as `started; no result recorded`; it
+      that fixed-shape qualified name as `started; no result recorded`. If
+      Cargo's exact generic test-failure line is appended before a newline, the
+      sanitizer emits it separately; all other suffix text is discarded. It
       never retains test stdout or assertion data;
     - at most the **last 256 KiB** of the stage log is read, and the excerpt is
       hard-capped to **40 lines / 4000 characters** with a `truncated` flag;

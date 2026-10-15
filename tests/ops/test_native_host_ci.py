@@ -685,6 +685,38 @@ Caused by:
         self.assertNotIn("/tmp/private", rendered)
         self.assertNotIn("running 19 tests", rendered)
 
+    def test_offline_test_excerpt_splits_cargo_failure_from_unterminated_started_test(self):
+        test_name = "thread_manager::tests::native_text_host_qualification_cold_resume_captures_empty_ceiling"
+        text = (
+            "test %s ... %s\nCaused by:\n"
+            "  process didn't exit successfully: `/tmp/private/test-binary SECRET=value` "
+            "(signal: 6, SIGABRT: process abort signal)\n"
+        ) % (test_name, ci.CARGO_TEST_FAILED_LINE)
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertIn("test %s ... (started; no result recorded)" % test_name, rendered)
+        self.assertIn(ci.CARGO_TEST_FAILED_LINE, rendered)
+        self.assertIn("process child signal: 6 (SIGABRT)", rendered)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("/tmp/private", rendered)
+        self.assertNotIn("process abort signal", rendered)
+
+    def test_offline_test_excerpt_drops_unrecognized_started_test_suffix(self):
+        text = """\
+test thread_manager::tests::fixture ... fixture payload SECRET=value
+error: test failed, to rerun pass `-p codex-core --lib`
+Caused by:
+  process didn't exit successfully: `/tmp/private/test-binary` (signal: 6, SIGABRT: process abort signal)
+"""
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertIn(ci.CARGO_TEST_FAILED_LINE, rendered)
+        self.assertIn("process child signal: 6 (SIGABRT)", rendered)
+        self.assertNotIn("thread_manager::tests::fixture", rendered)
+        self.assertNotIn("fixture payload", rendered)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("/tmp/private", rendered)
+
     def test_offline_test_excerpt_drops_process_shaped_fixture_stdout(self):
         text = """\
 failures:
