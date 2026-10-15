@@ -109,6 +109,13 @@ is unchanged.
     - absolute paths, URLs, the literal `$HOME` and `KEY=value` environment
       values are redacted (`<path>`, `<url>`, `<home>`, `<redacted>`); relative
       paths such as `core/src/tools/registry.rs` are kept;
+    - for `offline-tests`, the excerpt keeps Rust harness failure names,
+      summaries and panic locations while dropping test stdout and assertion
+      payloads. After Cargo's generic test-failure line it may also keep a
+      normalized child exit status, signal, or OS-error number. A narrowly
+      matched shared-library startup failure keeps only the library basename
+      and only when Cargo confirms the failed test command. Raw commands,
+      executable paths, loader messages and signal descriptions are dropped;
     - at most the **last 256 KiB** of the stage log is read, and the excerpt is
       hard-capped to **40 lines / 4000 characters** with a `truncated` flag;
     - a missing, unreadable or diagnostic-free log yields `null` — nothing is

@@ -639,6 +639,57 @@ error: test failed, to rerun pass `-p codex-core --lib`
         self.assertNotIn("do-not-publish", json.dumps(excerpt))
         self.assertNotIn("/home/runner", json.dumps(excerpt))
 
+    def test_offline_test_excerpt_keeps_normalized_loader_and_cargo_cause(self):
+        text = """\
+/home/runner/work/repo/repo/target/debug/deps/core-123: error while loading shared libraries: libcrypto.so.3: cannot open shared object file: No such file or directory
+error: test failed, to rerun pass `-p codex-core --lib`
+Caused by:
+  process didn't exit successfully: `/home/runner/work/repo/repo/target/debug/deps/core-123 SECRET_TOKEN=private` (exit status: 127)
+"""
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertIn("shared library startup failure: libcrypto.so.3 (not found)", rendered)
+        self.assertIn(ci.CARGO_TEST_FAILED_LINE, rendered)
+        self.assertIn("Caused by:", rendered)
+        self.assertIn("process child exit status: 127", rendered)
+        self.assertNotIn("/home/runner", rendered)
+        self.assertNotIn("SECRET_TOKEN", rendered)
+        self.assertNotIn("private", rendered)
+
+    def test_offline_test_excerpt_keeps_normalized_signal_without_test_stdout(self):
+        text = """\
+error: test failed, to rerun pass `-p codex-core --lib`
+Caused by:
+  process didn't exit successfully: `/tmp/private/core-test` (signal: 11, SIGSEGV: invalid memory reference)
+"""
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertIn("process child signal: 11 (SIGSEGV)", rendered)
+        self.assertNotIn("invalid memory reference", rendered)
+        self.assertNotIn("/tmp/private", rendered)
+
+    def test_offline_test_excerpt_drops_process_shaped_fixture_stdout(self):
+        text = """\
+failures:
+---- fixture_test stdout ----
+Caused by:
+process didn't exit successfully: `/private/path` (exit status: 9)
+/tmp/fixture: error while loading shared libraries: libsecret.so: cannot open shared object file: No such file or directory
+fixture assertion payload API_KEY=private
+failures:
+error: test failed, to rerun pass `-p codex-core --lib`
+Caused by:
+  process didn't exit successfully: `/private/path` (exit status: 9)
+"""
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertEqual(rendered.count("Caused by:"), 1)
+        self.assertIn("process child exit status: 9", rendered)
+        self.assertNotIn("libsecret.so", rendered)
+        self.assertNotIn("fixture assertion payload", rendered)
+        self.assertNotIn("API_KEY", rendered)
+        self.assertNotIn("/private/path", rendered)
+
     def test_stage_diagnostic_is_none_for_missing_or_absent_log(self):
         self.assertIsNone(ci._stage_diagnostic(None))
         with tempfile.TemporaryDirectory() as tmp:

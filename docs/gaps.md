@@ -263,6 +263,20 @@ payloads. This fixes future failure evidence only; it does not recover the
 missing hosted log or establish that any qualification test passes. Admission
 remains false and G05/G06 remain Partial.
 
+Hosted run `38727894425` on `6c8be60` again exited 101 in `offline-tests` after
+about 24 minutes. Its published artifact contains only `qualification-receipt.json`;
+the receipt has Cargo's generic failure line but no harness result, and no stage
+log was available for inspection. The exact failure cause therefore remains
+unknown. The stage capture source still records combined stdout/stderr to its
+own bounded log, but the offline-test receipt filter previously discarded Cargo
+process-launch details that could explain a failure before the test harness
+started. The filter now retains only normalized process exit status, signal,
+OS-error number, and a narrowly matched missing shared-library basename after
+Cargo's generic failure line. It still drops raw commands, paths, loader text,
+and arbitrary test stdout. Fixture tests cover these cases. This improves
+future evidence only; it does not recover run `38727894425`'s log or identify its
+cause. Admission remains false and G05/G06 remain Partial.
+
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
 `PHP_RETRO_COMPANION_TRUSTED_ORIGINS` into the API child environment only, from

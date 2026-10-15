@@ -461,6 +461,16 @@ DIAGNOSTIC_ENV_VALUE_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})=\S+")
 TEST_FAILURE_HEADER_RE = re.compile(r"^---- ([A-Za-z0-9_:]+) stdout ----$")
 TEST_PANIC_LOCATION_RE = re.compile(
     r"^thread '([A-Za-z0-9_:]+)' panicked at (.+):(\d+):(\d+):$")
+CARGO_TEST_FAILED_LINE = "error: test failed, to rerun pass `-p codex-core --lib`"
+CARGO_PROCESS_EXIT_RE = re.compile(
+    r"^process didn't exit successfully: .+ \(exit status: ([0-9]+)\)$")
+CARGO_PROCESS_SIGNAL_RE = re.compile(
+    r"^process didn't exit successfully: .+ \(signal: ([0-9]+), (SIG[A-Z0-9]+)(?:: [^)]*)?\)$")
+CARGO_OS_ERROR_RE = re.compile(r"^[A-Za-z ]+ \(os error ([0-9]+)\)$")
+SHARED_LIBRARY_START_RE = re.compile(
+    r"^(?:.+: )?error while loading shared libraries: "
+    r"(lib[A-Za-z0-9_+.-]+\.so(?:\.[A-Za-z0-9_+.-]+)*): "
+    r"cannot open shared object file: No such file or directory$")
 
 
 def _redact_diagnostic_line(line):
@@ -517,32 +527,74 @@ def sanitize_offline_test_excerpt(text, max_lines=DIAGNOSTIC_MAX_LINES,
     """
     kept = []
     truncated = False
+    harness_seen = False
+    in_test_stdout = False
+    cargo_failure_seen = False
+    pending_shared_library = None
+
+    def keep(line):
+        nonlocal truncated
+        if len(kept) >= max_lines:
+            truncated = True
+            return False
+        kept.append(_redact_diagnostic_line(line))
+        return True
+
     for raw in text.splitlines():
         line = raw.strip()
         result = _RESULT_RE.match(line)
         summary = _SUMMARY_RE.match(line)
         header = TEST_FAILURE_HEADER_RE.match(line)
         panic = TEST_PANIC_LOCATION_RE.match(line)
-        if result and result.group(2) == "FAILED":
+        if line == "failures:":
+            harness_seen = True
+            in_test_stdout = False
+            safe_line = line
+        elif header:
+            harness_seen = True
+            in_test_stdout = True
+            safe_line = line
+        elif result:
+            harness_seen = True
+            if result.group(2) != "FAILED":
+                continue
             safe_line = line
         elif summary:
-            safe_line = line
-        elif line == "failures:" or header:
+            harness_seen = True
+            in_test_stdout = False
             safe_line = line
         elif panic:
+            harness_seen = True
             path = panic.group(2).replace("\\", "/")
             marker = "/codex-rs/"
             relative = path[path.rfind(marker) + 1:] if marker in path else Path(path).name
             safe_line = "thread '%s' panicked at %s:%s:%s:" % (
                 panic.group(1), relative, panic.group(3), panic.group(4))
-        elif line == "error: test failed, to rerun pass `-p codex-core --lib`":
+        elif not in_test_stdout and line == CARGO_TEST_FAILED_LINE:
+            cargo_failure_seen = True
+            if pending_shared_library is not None:
+                if not keep(pending_shared_library):
+                    break
+                pending_shared_library = None
             safe_line = line
+        elif not in_test_stdout and cargo_failure_seen and line == "Caused by:":
+            safe_line = line
+        elif not in_test_stdout and cargo_failure_seen and (match := CARGO_PROCESS_EXIT_RE.match(line)):
+            safe_line = "process child exit status: " + match.group(1)
+        elif not in_test_stdout and cargo_failure_seen and (match := CARGO_PROCESS_SIGNAL_RE.match(line)):
+            safe_line = "process child signal: %s (%s)" % (match.group(1), match.group(2))
+        elif not in_test_stdout and cargo_failure_seen and (match := CARGO_OS_ERROR_RE.match(line)):
+            safe_line = "process launch OS error: " + match.group(1)
+        elif not in_test_stdout and not harness_seen and (match := SHARED_LIBRARY_START_RE.match(line)):
+            # Cargo may print the dynamic loader error before its generic failure
+            # line. Hold the normalized basename until Cargo confirms this was a
+            # failed test command; never retain its executable path or raw line.
+            pending_shared_library = "shared library startup failure: %s (not found)" % match.group(1)
+            continue
         else:
             continue
-        if len(kept) >= max_lines:
-            truncated = True
+        if not keep(safe_line):
             break
-        kept.append(_redact_diagnostic_line(safe_line))
     if not kept:
         return None
     lines = []
