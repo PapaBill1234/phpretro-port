@@ -1,5 +1,9 @@
 # OpenCode 2 bootstrap
 
+Current continuation: [migration plan](opencode-migration-plan.md) and
+[gap/acceptance checklist](opencode-migration-checklist.md). The plan is proposed,
+not architecture-locked; runtime enforcement and live acceptance remain open.
+
 OpenCode 2.0.29 is pinned from the official `@opencode/cli-linux-x64` npm
 package. The bootstrap checks the published SHA-512 integrity value, validates
 the package identity and contents, and extracts only the native CLI binary

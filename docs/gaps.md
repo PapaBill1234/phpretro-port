@@ -1,5 +1,15 @@
 # Known gaps against the requested PHPRetro port
 
+## Current builder migration status (2026-10-15)
+
+OpenCode 2 migration is tracked in [the plan](opencode-migration-plan.md) and
+[current gap/acceptance checklist](opencode-migration-checklist.md). PHPRetro
+CMS/themes/game remain paused. Eliza orchestration and the custom subscription
+bridge are retired; historical evidence below does not authorize resuming them.
+OC2-M01 adds planning evidence only, not runtime parity or live qualification.
+
+## Historical port evidence
+
 Last reviewed/updated: 2026-10-14. Target: pinned PHPRetro feature behavior, Polaris/Octane compatibility, and the current Habbo public-site layout recreated with original assets. This structure is inspired by [PhotoCraft's gaps ledger](https://github.com/storytold/photocraft/blob/52e130d481c9017b6ec8321784776b33b04ad2c4/docs/gaps.md); project facts and estimates are specific to this port.
 
 This is the work queue. Every entry has one owner/claim in the durable task store, evidence and an exit condition. Implementation coverage is **not yet measured**. A planning document is not a closed application feature. Priority is release risk and user impact, then dependency order. Estimates remain uncalibrated until a real vertical slice is complete.
