@@ -63,7 +63,7 @@ RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 # it is always restored in ``finally``.
 _NAMESPACE = contextvars.ContextVar("acceptance_namespace", default=ACCEPTANCE_REL)
 PATCH_REL = Path("builder") / "eliza" / "patches" / "new-chat.patch"
-PATCH_SHA256 = "caf755bed336361427796f1d33d088013c097f8dbc99c497cc0b27b52804ffb9"
+PATCH_SHA256 = "79c302be725fbf99e6b9639dc352ca0a9f68e95071f722d1456731fd820ebb63"
 ENTRY_REL = Path("packages") / "app" / "src" / "entry.ts"
 
 API_HOST = "127.0.0.1"
@@ -74,6 +74,7 @@ ALLOWED_ORIGINS = "http://127.0.0.1:%d,http://127.0.0.1:%d" % (UI_PORT, API_PORT
 # The only paths the reviewed patch may change.  Any other overlay difference
 # from the pinned canonical checkout is treated as an unknown change and refused.
 EXPECTED_CHANGED = frozenset({
+    "packages/ui/src/styles/styles.css",
     "packages/ui/src/components/shell/ChatOverlay.tsx",
 })
 EXPECTED_ADDED = frozenset({

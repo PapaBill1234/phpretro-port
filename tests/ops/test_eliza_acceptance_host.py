@@ -126,6 +126,10 @@ class OverlayTest(unittest.TestCase):
         (source / "packages/ui/src/components/shell").mkdir(parents=True)
         target = source / self.PATCHED
         target.write_text("old\n")
+        for rel in host.EXPECTED_CHANGED:
+            member = source / rel
+            member.parent.mkdir(parents=True, exist_ok=True)
+            member.write_text("old\n")
         (source / "node_modules/@elizaos").mkdir(parents=True)
         (source / "node_modules/@elizaos/ui").symlink_to("../../packages/ui")
         (source / "node_modules/react").mkdir()
@@ -146,8 +150,8 @@ class OverlayTest(unittest.TestCase):
         patch = root / host.PATCH_REL
         patch.parent.mkdir(parents=True)
         patch.write_text(
-            "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-old\n+new\n"
-            % (self.PATCHED, self.PATCHED, self.PATCHED, self.PATCHED)
+            "".join("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-old\n+new\n"
+                    % (name, name, name, name) for name in sorted(host.EXPECTED_CHANGED))
             + "".join("diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1 @@\n+added\n"
                       % (name, name, name) for name in sorted(host.EXPECTED_ADDED)))
         return target, patch
@@ -156,7 +160,6 @@ class OverlayTest(unittest.TestCase):
         target, patch = self._fixture(tmp)
         pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=host.canonical_source(Path(tmp)), text=True).strip()
         with mock.patch.object(host.upstream, "UPSTREAM_PIN", pin), \
-                mock.patch.object(host, "EXPECTED_CHANGED", frozenset({self.PATCHED})), \
                 mock.patch.object(host, "PATCH_SHA256", host.sha256_file(patch)):
             host.build_overlay(Path(tmp), deadline=None)
         return target
@@ -362,7 +365,7 @@ class OverlayTest(unittest.TestCase):
             root = Path(tmp)
             with mock.patch.object(host, "PATCH_SHA256", host.sha256_file(root / host.PATCH_REL)):
                 self.assertTrue(host.verify_overlay(root))
-                for rel in [self.PATCHED, *sorted(host.EXPECTED_ADDED)]:
+                for rel in sorted(host.EXPECTED_CHANGED | host.EXPECTED_ADDED):
                     path = host.overlay_dir(root) / rel
                     original = path.read_bytes()
                     path.write_bytes(b"tampered\n")

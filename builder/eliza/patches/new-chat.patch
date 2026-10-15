@@ -247,3 +247,12 @@ index 00000000..8c5e2197
 +  }, [startNewConversation]);
 +  return { startNewChat, pending };
 +}
+diff --git a/packages/ui/src/styles/styles.css b/packages/ui/src/styles/styles.css
+--- a/packages/ui/src/styles/styles.css
++++ b/packages/ui/src/styles/styles.css
+@@ -53,3 +53,5 @@
++/* Dependency links form cycles in the isolated source overlay. */
++@source not "../../../../**/node_modules";
+ @source "..";
+ @source "../../../ui/src";
+ @source "../../../../plugins/app-lifeops/src";

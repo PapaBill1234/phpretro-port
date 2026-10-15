@@ -306,3 +306,23 @@ owner+same-UI-origin 200). Each probe stopped its host cleanly
 reload (generation is not admitted), and any native/compiled claim; no
 native/generation admission follows. The native CI-wrapper repair is integrated
 separately (see the paragraph above).
+
+## G06 UI dependency scan boundary — 2026-10-15
+
+The pinned acceptance overlay's workspace links form normal dependency cycles.
+A native filesystem trace identified `@tailwindcss/oxide` 4.3.3 traversing those
+cycles under the desktop platform's `node_modules`, blocking the Vite main
+thread. Before the change, `/`, `/site.webmanifest` and `/@vite/client` all
+returned no bytes before a 20-second timeout; UI RSS reached approximately
+2.6 GiB after 90 seconds. A short trace counted 108,036 filesystem/signal calls
+in four seconds. These are local diagnostic observations, not a benchmark.
+
+The reviewed overlay patch explicitly excludes dependency directories from
+Tailwind class discovery with `@source not "../../../../**/node_modules"`.
+Existing app, shared UI and plugin source registration stays intact. The
+canonical upstream checkout is unchanged; the stylesheet joins the exact
+changed-file allowlist and the patch digest is updated. In a controlled UI-only
+run, the manifest returned 200 in 0.08s, the HTML document 200 (26,336 bytes) in
+0.19s, and the Vite client 200 in 0.08s. This establishes request responsiveness;
+real browser mounting, authenticated views and room persistence still require
+full-host acceptance. Private traces remain under `.builder/evidence/`.
