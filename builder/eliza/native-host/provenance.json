@@ -1,0 +1,63 @@
+{
+  "artifact": "eliza-native-host-text-only-source-patch",
+  "status": "unbuilt_unqualified",
+  "reviewed": "2026-10-14",
+  "note": "Source patch only. No binary was built, no runtime isolation was proven, and no account/model/service call was made. This is not runtime readiness.",
+  "upstream": {
+    "project": "openai/codex",
+    "tag": "rust-v0.162.0",
+    "commit": "c1382380de69521303b416720a52f42d51af6248",
+    "codex_cli_version": "0.162.0",
+    "release_elf_sha256": "50ed828f357c655a3c82054d346cab8434f24901f14ec19b8267571bdd008b38"
+  },
+  "toolchain": {
+    "rust_channel": "1.95.0",
+    "components": [
+      "clippy",
+      "rustfmt",
+      "rust-src"
+    ],
+    "source": "codex-rs/rust-toolchain.toml"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "file": "LICENSE",
+    "sha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+    "source_path_at_pin": "LICENSE"
+  },
+  "patch": {
+    "file": "text-only.patch",
+    "sha256": "09b3ef5a7b09914f4013e23f5abc4797d41c42b022b4b05e9532861c2d566c7f",
+    "paths": [
+      "codex-rs/core/src/thread_manager.rs"
+    ],
+    "applies_to_commit": "c1382380de69521303b416720a52f42d51af6248",
+    "apply_command": "git apply --check text-only.patch",
+    "target_file": {
+      "path": "codex-rs/core/src/thread_manager.rs",
+      "base_sha256": "3b613970b46385d16c423b130a92fcb2749478aaa385d668b9e2ae38133b6e0b",
+      "patched_sha256": "d65c1697520b64acd27016f4b6c077ae50e3f4cf0650a9a1becb1337dad88bf8"
+    }
+  },
+  "change": {
+    "summary": "Insert an unconditional empty ToolPolicy ceiling immediately after the SessionIsolation insert in the central ThreadManagerState::spawn_thread funnel (codex-rs/core/src/thread_manager.rs).",
+    "inserted_value": {
+      "allowed_tools": "Some(Vec::new())",
+      "require_managed_sandbox": false,
+      "require_unified_exec": false,
+      "expose_additional_permissions": false
+    },
+    "rationale": "SessionIsolation is inserted once in the single production spawn funnel; ThreadManagerState::spawn_thread -> Session::spawn -> Session::spawn_internal -> Session::new is the sole production caller of Session::new. Inserting the ceiling here overwrites any caller-supplied ToolPolicy (including the Guardian reviewer init) with no role exception and no manager/config/RPC knob that could relax it. Session::new captures the policy once, before extension initialization."
+  },
+  "not_done": [
+    "No compile, test, or build was run in this phase (toolchain not installed here).",
+    "Runtime registry-emptiness qualification is not claimed; the finalized registry must still be measured on a real build.",
+    "Source-reviewed startup/registry/adversarial test patches are implemented but uncompiled and unrun; full MCP/contributor and compiled CLI qualification remain open."
+  ],
+  "notice": {
+    "file": "NOTICE",
+    "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+    "source_path_at_pin": "NOTICE",
+    "distribution_requirement": "Preserve applicable upstream and dependency notices with any future CLI binary distribution."
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@phpretro/eliza-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone PHPRetro builder integration on the real elizaOS runtime and its canonical coding-agent orchestration plugin.",
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "eliza-builder-runtime": "./src/main.mjs"
+  },
+  "scripts": {
+    "start": "node src/main.mjs serve",
+    "status": "node src/main.mjs status",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "provenance": "node scripts/record-provenance.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.34.0",
+    "@elizaos/core": "2.0.3-beta.7",
+    "@elizaos/plugin-agent-orchestrator": "2.0.3-beta.7",
+    "@elizaos/plugin-sql": "2.0.3-beta.7"
+  }
+}

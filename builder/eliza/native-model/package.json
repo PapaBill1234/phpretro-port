@@ -1,0 +1,25 @@
+{
+  "name": "@phpretro/eliza-native-model",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native-Sol main text provider plugin for the Eliza runtime (provider openai-codex, model gpt-6.1-sol).",
+  "main": "./index.mjs",
+  "exports": {
+    ".": {
+      "import": "./index.mjs",
+      "default": "./index.mjs"
+    },
+    "./transport": {
+      "import": "./transport.mjs",
+      "default": "./transport.mjs"
+    }
+  },
+  "elizaos": {
+    "plugin": {
+      "name": "openai-codex",
+      "main": "./index.mjs"
+    }
+  },
+  "dependencies": {}
+}

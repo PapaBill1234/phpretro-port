@@ -1,0 +1,22 @@
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index ea4dee3..7e93d5b 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -2131,6 +2131,17 @@ impl ThreadManagerState {
+                 }
+             });
+         thread_extension_init.insert(isolation);
++        // Dedicated text host ceiling. This generation-only build denies every tool
++        // for every thread, unconditionally overwriting any caller-supplied policy
++        // (including the Guardian reviewer init) with no role exception and no
++        // manager/config/RPC flag that could relax it. Captured before extension
++        // initialization in `Session::new`.
++        thread_extension_init.insert(codex_extension_api::ToolPolicy {
++            allowed_tools: Some(Vec::new()),
++            require_managed_sandbox: false,
++            require_unified_exec: false,
++            expose_additional_permissions: false,
++        });
+         let environment_requests = environment_requests
+             .or_else(|| {
+                 let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) = &session_source

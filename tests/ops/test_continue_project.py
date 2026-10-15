@@ -16,6 +16,13 @@ spec.loader.exec_module(runner)
 
 
 class ContinuationRunnerTests(unittest.TestCase):
+    # Per proc(5) the stat field 3 codes are: R/S/D running-or-sleeping, T/t
+    # stopped, and the terminal Z (zombie) / X (dead). A definitely-dead
+    # process therefore reports Z, X, or is already reaped ("gone"); any
+    # live code must keep failing so a running group cannot pass.
+    TERMINAL_STATES = ("Z", "X", "gone")
+    LIVE_STATES = ("R", "S", "D", "T", "t", "I", "W", "P")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -134,12 +141,13 @@ class ContinuationRunnerTests(unittest.TestCase):
             self.assertIsNotNone(proc.poll())
             for _ in range(50):
                 state = self._proc_state(grandchild)
-                if state in ("Z", "gone"):
+                if state in self.TERMINAL_STATES:
                     break
                 import time
                 time.sleep(0.02)
             state = self._proc_state(grandchild)
-            self.assertIn(state, ("Z", "gone"))
+            self.assertNotIn(state, self.LIVE_STATES)
+            self.assertIn(state, self.TERMINAL_STATES)
         finally:
             if proc.poll() is None:
                 runner.terminate_group(proc, 0.05)

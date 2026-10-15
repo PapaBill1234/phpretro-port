@@ -1,0 +1,258 @@
+diff --git a/packages/ui/src/components/shell/ChatOverlay.tsx b/packages/ui/src/components/shell/ChatOverlay.tsx
+index d081e089..0acbd490 100644
+--- a/packages/ui/src/components/shell/ChatOverlay.tsx
++++ b/packages/ui/src/components/shell/ChatOverlay.tsx
+@@ -200,6 +200,7 @@ import {
+   type ShellMessage,
+ } from "./shell-state";
+ import { type PullGestureBinding, usePullGesture } from "./use-pull-gesture";
++import { useNewChatAction } from "./useNewChatAction";
+ import type { ShellController } from "./useShellController";
+ import { WALLPAPER_FLOAT_SHADOW, WALLPAPER_TEXT } from "./wallpaper-idiom";
+ 
+@@ -643,6 +644,7 @@ export function ChatOverlay({
+   const {
+     handleChatEdit,
+     handleChatRetry,
++    handleNewConversation,
+     elizaCloudLoginFallbackUrl,
+     cloudLoginHasError,
+     handleSelectConversation,
+@@ -652,6 +654,9 @@ export function ChatOverlay({
+     // sending the corrected text as a fresh turn leaves the typo in history.
+     handleChatEdit: s.handleChatEdit,
+     handleChatRetry: s.handleChatRetry,
++    // New chat activates a fresh persisted conversation without deleting the
++    // current thread; ownership/room isolation happens inside the handler.
++    handleNewConversation: s.handleNewConversation,
+     elizaCloudLoginFallbackUrl: s.elizaCloudLoginFallbackUrl,
+     cloudLoginHasError: Boolean(s.elizaCloudLoginError),
+     // Search-jump (#14279): select the hit's conversation, then (if the hit is
+@@ -666,6 +671,19 @@ export function ChatOverlay({
+   // True while a clear/swipe is fetching an uncached thread — gates the empty
+   // thread's loading spinner. Defaulted for minimal mock controllers.
+   const conversationLoading = controller.conversationLoading ?? false;
++  // New chat: create+activate a fresh persisted conversation via the shared
++  // handler (state/useChatCallbacks.ts) — the same helper the conversations
++  // sidebar's "New chat" uses. It preserves the current thread (only an empty
++  // draft is ever pruned), resets message ownership and isolates the room so no
++  // old context leaks into the new thread, and rolls itself back to the current
++  // chat if creation fails. `useNewChatAction` adds the once-only guard + the
++  // pending flag the composer menu disables on.
++  const { startNewChat, pending: newChatPending } = useNewChatAction({
++    startNewConversation: handleNewConversation,
++    onError: (err) => {
++      logger.warn({ err }, "[ChatOverlay] new chat failed");
++    },
++  });
+   // Copy a message (reveal-row Copy). Stable identity so the memoized row isn't
+   // re-rendered every parent tick. Copy is fire-and-forget UX, but the promise
+   // must still be OBSERVED: an unhandled writeText rejection (permission-denied
+@@ -5378,9 +5396,9 @@ export function ChatOverlay({
+ 
+                 {/* Sheet header — shown at the HALF detent and up (not just FULL).
+       One infinite thread (#13531): no maximize/minimize (that's a
+-      vertical pull now) and no clear/new-chat (the thread never resets).
+-      It carries NO buttons — Home/search/upload live in the composer
+-      "+" menu — so the chat stops acting like a second app nav bar. The bar remains only to reserve
++      vertical pull now). It carries NO buttons — New chat, Home, search
++      and upload live in the composer "+" menu — so the chat stops acting
++      like a second app nav bar. The bar remains only to reserve
+       the safe-area top inset at full-bleed and host the transcribe badge. */}
+                 {threadPresented ? (
+                   <motion.div
+@@ -5941,6 +5959,25 @@ export function ChatOverlay({
+                               Back to Home
+                             </DropdownMenuItem>
+                           ) : null}
++                          <DropdownMenuItem
++                            className="cursor-pointer gap-2.5 data-[highlighted]:bg-bg-hover"
++                            disabled={
++                              booting ||
++                              firstRunOpen ||
++                              responding ||
++                              conversationLoading ||
++                              newChatPending
++                            }
++                            onSelect={() => {
++                              void startNewChat();
++                            }}
++                          >
++                            <FileText
++                              className="size-4 shrink-0 text-muted"
++                              aria-hidden
++                            />
++                            New chat
++                          </DropdownMenuItem>
+                           <DropdownMenuItem
+                             className="cursor-pointer gap-2.5 data-[highlighted]:bg-bg-hover"
+                             onSelect={() => openSearch()}
+diff --git a/packages/ui/src/components/shell/__e2e__/new-chat.test.tsx b/packages/ui/src/components/shell/__e2e__/new-chat.test.tsx
+new file mode 100644
+index 00000000..e75b3377
+--- /dev/null
++++ b/packages/ui/src/components/shell/__e2e__/new-chat.test.tsx
+@@ -0,0 +1,101 @@
++// @vitest-environment jsdom
++/**
++ * New chat from the shell overlay. The composer "+" menu's "New chat" runs the
++ * shared persisted-conversation creator (`handleNewConversation`) through
++ * {@link useNewChatAction}: one fresh conversation per gesture, the current
++ * thread preserved by the handler, and a create failure surfaces without
++ * throwing or losing the current chat.
++ */
++import {
++  cleanup,
++  fireEvent,
++  render,
++  screen,
++  waitFor,
++} from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import { useNewChatAction } from "../useNewChatAction";
++
++afterEach(cleanup);
++
++function Harness({
++  startNewConversation,
++  onError,
++}: {
++  startNewConversation: (title?: string) => Promise<void>;
++  onError?: (err: unknown) => void;
++}) {
++  const { startNewChat, pending } = useNewChatAction({
++    startNewConversation,
++    onError,
++  });
++  return (
++    <div>
++      <button type="button" onClick={() => void startNewChat()}>
++        New chat
++      </button>
++      <span data-testid="pending">{pending ? "pending" : "idle"}</span>
++    </div>
++  );
++}
++
++describe("useNewChatAction (New chat menu)", () => {
++  it("activates one fresh conversation through the shared creator", async () => {
++    const startNewConversation = vi.fn(async () => {});
++    render(<Harness startNewConversation={startNewConversation} />);
++
++    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
++
++    await waitFor(() => expect(startNewConversation).toHaveBeenCalledTimes(1));
++    // Pending clears once the create settles so the item re-enables.
++    await waitFor(() =>
++      expect(screen.getByTestId("pending").textContent).toBe("idle"),
++    );
++  });
++
++  it("ignores a double tap while the first create is still in flight", async () => {
++    let resolveCreate: () => void = () => {};
++    const startNewConversation = vi.fn(
++      () =>
++        new Promise<void>((resolve) => {
++          resolveCreate = resolve;
++        }),
++    );
++    render(<Harness startNewConversation={startNewConversation} />);
++
++    const button = screen.getByRole("button", { name: "New chat" });
++    fireEvent.click(button);
++    fireEvent.click(button);
++    // Same-frame taps must not enqueue a second conversation.
++    expect(startNewConversation).toHaveBeenCalledTimes(1);
++    await waitFor(() =>
++      expect(screen.getByTestId("pending").textContent).toBe("pending"),
++    );
++
++    resolveCreate();
++    await waitFor(() =>
++      expect(screen.getByTestId("pending").textContent).toBe("idle"),
++    );
++    expect(startNewConversation).toHaveBeenCalledTimes(1);
++  });
++
++  it("reports a create failure without throwing and releases pending", async () => {
++    const err = new Error("create failed");
++    const startNewConversation = vi.fn(async () => {
++      throw err;
++    });
++    const onError = vi.fn();
++    render(
++      <Harness startNewConversation={startNewConversation} onError={onError} />,
++    );
++
++    // The click handler must not reject into the gesture handler.
++    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
++
++    await waitFor(() => expect(onError).toHaveBeenCalledWith(err));
++    await waitFor(() =>
++      expect(screen.getByTestId("pending").textContent).toBe("idle"),
++    );
++  });
++});
+diff --git a/packages/ui/src/components/shell/useNewChatAction.ts b/packages/ui/src/components/shell/useNewChatAction.ts
+new file mode 100644
+index 00000000..8c5e2197
+--- /dev/null
++++ b/packages/ui/src/components/shell/useNewChatAction.ts
+@@ -0,0 +1,47 @@
++import * as React from "react";
++
++/**
++ * New chat activation for the shell overlay.
++ *
++ * Wraps the shared persisted-conversation creator (`handleNewConversation`,
++ * state/useChatCallbacks.ts) so the composer "+" menu can start a fresh
++ * conversation without deleting the current thread:
++ *
++ * - The helper only CREATES and ACTIVATES a new conversation; the previous
++ *   thread stays reachable (a non-empty conversation is always preserved, and
++ *   the cross-conversation message-ownership reset inside the handler keeps the
++ *   old context from leaking into the new one).
++ * - `pending` gates the menu item so a second tap cannot create a duplicate
++ *   conversation; a synchronous ref closes the same-frame double-tap gap before
++ *   React can paint the disabled item.
++ * - A create failure (the handler rolls itself back to the current chat) is
++ *   reported through `onError` and never thrown into the gesture handler.
++ */
++export function useNewChatAction(options: {
++  startNewConversation: (title?: string) => Promise<void>;
++  onError?: (err: unknown) => void;
++}): { startNewChat: () => Promise<void>; pending: boolean } {
++  const { startNewConversation, onError } = options;
++  const [pending, setPending] = React.useState(false);
++  const inFlightRef = React.useRef(false);
++  // Read the latest error sink through a ref so an inline logger closure does
++  // not churn `startNewChat`'s identity every render.
++  const onErrorRef = React.useRef(onError);
++  onErrorRef.current = onError;
++  const startNewChat = React.useCallback(async () => {
++    if (inFlightRef.current) return;
++    inFlightRef.current = true;
++    setPending(true);
++    try {
++      await startNewConversation();
++    } catch (err) {
++      // error-policy:J7 best-effort new chat — reported, never thrown into the
++      // gesture handler (matches the copy affordance above).
++      onErrorRef.current?.(err);
++    } finally {
++      inFlightRef.current = false;
++      setPending(false);
++    }
++  }, [startNewConversation]);
++  return { startNewChat, pending };
++}
+diff --git a/packages/ui/src/styles/styles.css b/packages/ui/src/styles/styles.css
+--- a/packages/ui/src/styles/styles.css
++++ b/packages/ui/src/styles/styles.css
+@@ -53,3 +53,5 @@
++/* Dependency links form cycles in the isolated source overlay. */
++@source not "../../../../**/node_modules";
+ @source "..";
+ @source "../../../ui/src";
+ @source "../../../../plugins/app-lifeops/src";

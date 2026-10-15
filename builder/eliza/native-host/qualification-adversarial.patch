@@ -1,0 +1,272 @@
+diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
+index 8299817..478d677 100644
+--- a/codex-rs/core/src/thread_manager_tests.rs
++++ b/codex-rs/core/src/thread_manager_tests.rs
+@@ -3608,3 +3608,105 @@ async fn native_text_host_qualification_cold_resume_captures_empty_ceiling() {
+         .await
+         .expect("shut down resumed thread");
+ }
++
++/// Warm resume: `start_thread` with `InitialHistory::Resumed` for an already
++/// live conversation returns the *same* live session (no new session is built),
++/// so a conflicting caller init cannot relax the captured ceiling.
++#[tokio::test]
++async fn native_text_host_qualification_warm_resume_keeps_live_session_and_ceiling() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    let started = manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(ThreadHistoryMode::Legacy),
++            ..StartThreadOptions::new(config.clone())
++        })
++        .await
++        .expect("start live thread");
++    qh_assert_empty_ceiling(&started);
++
++    let resumed = manager
++        .start_thread(StartThreadOptions {
++            initial_history: InitialHistory::Resumed(ResumedHistory {
++                conversation_id: started.thread_id,
++                history: Arc::new(Vec::<RolloutItem>::new()),
++                history_revision: None,
++                rollout_path: None,
++            }),
++            thread_extension_init: qh_init_with(qh_conflicting_policy()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .expect("warm resume must return the live session");
++
++    assert_eq!(
++        resumed.thread_id, started.thread_id,
++        "warm resume must keep the same thread identity"
++    );
++    assert!(
++        Arc::ptr_eq(&resumed.thread.session, &started.thread.session),
++        "warm resume must return the same live session, not a new one"
++    );
++    qh_assert_empty_ceiling(&resumed);
++
++    resumed
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down warm-resumed thread");
++}
++
++/// Cold resume: the public `start_thread` accepts `InitialHistory::Resumed`
++/// together with a caller-supplied `thread_extension_init`, so the constructor
++/// matrix can be exercised for unrestricted and conflicting init. The ceiling
++/// must still be captured empty.
++#[tokio::test]
++async fn native_text_host_qualification_cold_resume_constructor_matrix_captures_ceiling() {
++    let (_temp_dir, manager, config) = qh_manager().await;
++    for policy in [qh_unrestricted_policy(), qh_conflicting_policy()] {
++        let original = manager
++            .start_thread(StartThreadOptions {
++                history_mode: Some(ThreadHistoryMode::Legacy),
++                ..StartThreadOptions::new(config.clone())
++            })
++            .await
++            .expect("start cold-resume source thread");
++        original.thread.ensure_rollout_materialized().await;
++        original
++            .thread
++            .flush_rollout()
++            .await
++            .expect("flush source rollout");
++        let rollout_path = original
++            .thread
++            .rollout_path()
++            .expect("source rollout path should exist");
++        let original_id = original.thread_id;
++        original
++            .thread
++            .shutdown_and_wait()
++            .await
++            .expect("shut down source thread");
++        let _ = manager.remove_thread(&original_id).await;
++
++        let history = RolloutRecorder::get_rollout_history(&rollout_path)
++            .await
++            .expect("read resume rollout history");
++        let resumed = manager
++            .start_thread(StartThreadOptions {
++                initial_history: history,
++                thread_extension_init: qh_init_with(policy),
++                ..StartThreadOptions::new(config.clone())
++            })
++            .await
++            .expect("cold resume via public start_thread");
++
++        assert_eq!(resumed.thread_id, original_id);
++        qh_assert_empty_ceiling(&resumed);
++
++        resumed
++            .thread
++            .shutdown_and_wait()
++            .await
++            .expect("shut down cold-resumed thread");
++    }
++}
+diff --git a/codex-rs/core/src/tools/registry_tests.rs b/codex-rs/core/src/tools/registry_tests.rs
+index 2f5ce1b..5dd26d5 100644
+--- a/codex-rs/core/src/tools/registry_tests.rs
++++ b/codex-rs/core/src/tools/registry_tests.rs
+@@ -987,3 +987,62 @@ async fn native_text_host_qualification_captured_policy_rejects_registration() {
+         .await
+         .expect("shut down qualification thread");
+ }
++
++/// The production dispatch path must deny every representative tool class when
++/// the registry was built from the captured empty ceiling, and must never run a
++/// handler. A counting handler is registered first (rejected) so that any leak
++/// through to dispatch would be observable.
++#[tokio::test]
++async fn native_text_host_qualification_captured_policy_denies_dispatch() {
++    let (_temp_dir, _manager, started) = nr_captured_policy_session().await;
++    let session = Arc::clone(&started.thread.session);
++    let policy = Arc::clone(&session.tool_policy);
++    let turn = session.new_default_turn().await;
++
++    let invocations = Arc::new(AtomicUsize::new(0));
++    let mut registry = ToolRegistry::with_tool_policy(policy);
++    registry.register_trusted(nr_counting_handler("exec_command", &invocations));
++    assert_eq!(
++        registry.entries().count(),
++        0,
++        "no tool may be registered under the captured empty ceiling"
++    );
++
++    for tool_name in [
++        codex_tools::ToolName::plain("exec_command"),
++        codex_tools::ToolName::plain("write_stdin"),
++        codex_tools::ToolName::plain("apply_patch"),
++        codex_tools::ToolName::plain("qualification_dynamic_fn"),
++        codex_tools::ToolName::namespaced("mcp__qualification", "remote_tool"),
++        codex_tools::ToolName::plain("qualification_external"),
++    ] {
++        let err = registry
++            .dispatch_any_with_state(
++                test_invocation(
++                    Arc::clone(&session),
++                    Arc::clone(&turn),
++                    "qualification-call",
++                    tool_name.clone(),
++                ),
++                /*call_state*/ None,
++            )
++            .await
++            .err().expect("dispatch must be denied under the empty ceiling");
++        assert!(
++            matches!(err, FunctionCallError::RespondToModel(_)),
++            "denied dispatch for `{tool_name}` must be an unsupported-tool response"
++        );
++    }
++
++    assert_eq!(
++        invocations.load(Ordering::SeqCst),
++        0,
++        "no handler may be invoked by a denied dispatch"
++    );
++
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down qualification thread");
++}
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index f2b5844..363cd88 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -3576,5 +3576,90 @@ async fn native_text_host_qualification_manager_started_registry_rejects_dynamic
+         .expect("shut down qualification thread");
+ }
+ 
++#[tokio::test]
++async fn native_text_host_qualification_manager_started_code_mode_only_registry_is_empty() {
++    let (_temp_dir, _manager, started) = nr_start_qualification_thread(|_| {}).await;
++    let session = Arc::clone(&started.thread.session);
++
++    let mut turn = session.new_default_turn().await;
++    {
++        let turn = Arc::get_mut(&mut turn).expect("fresh turn context is unshared");
++        set_feature(turn, Feature::CodeModeOnly, /*enabled*/ true);
++        update_turn_settings_for_test(turn, |settings| {
++            Arc::make_mut(&mut settings.model_info).tool_mode = None;
++        });
++    }
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build tool router in Code Mode Only under captured empty ceiling");
++
++    assert_eq!(
++        router.tool_mode(),
++        ToolMode::CodeModeOnly,
++        "fixture must actually exercise Code Mode Only"
++    );
++    nr_assert_empty_tool_router(&router);
++    assert!(!router.exposes_tool(&ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME)));
++    assert!(!router.exposes_tool(&ToolName::plain(codex_code_mode::WAIT_TOOL_NAME)));
++
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down qualification thread");
++}
++
++#[tokio::test]
++async fn native_text_host_qualification_manager_started_code_mode_registry_is_empty() {
++    let (_temp_dir, _manager, started) = nr_start_qualification_thread(|_| {}).await;
++    let session = Arc::clone(&started.thread.session);
++
++    let mut turn = session.new_default_turn().await;
++    {
++        let turn = Arc::get_mut(&mut turn).expect("fresh turn context is unshared");
++        turn.code_mode_available = true;
++        set_feature(turn, Feature::CodeMode, /*enabled*/ true);
++        update_turn_settings_for_test(turn, |settings| {
++            Arc::make_mut(&mut settings.model_info).tool_mode = None;
++        });
++    }
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++    let router = super::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.settings.model_info,
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )
++    .expect("build tool router in Code Mode under captured empty ceiling");
++
++    assert_eq!(
++        router.tool_mode(),
++        ToolMode::CodeMode,
++        "fixture must actually exercise Code Mode"
++    );
++    nr_assert_empty_tool_router(&router);
++    assert!(!router.exposes_tool(&ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME)));
++    assert!(!router.exposes_tool(&ToolName::plain(codex_code_mode::WAIT_TOOL_NAME)));
++
++    started
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shut down qualification thread");
++}
++
+ #[path = "spec_plan_strict_third_party_tests.rs"]
+ mod strict_third_party;

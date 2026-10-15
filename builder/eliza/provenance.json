@@ -1,0 +1,97 @@
+{
+  "sourcePin": "28fef47c9d9d3acc7792be0fdaa3070020293cc5",
+  "sourcePinRole": "full upstream app/CLI/UI submodule pin; separate source-checkout installation and first-run verified; companion published packages differ",
+  "authoredLicense": "GPL-3.0-only",
+  "packages": [
+    {
+      "name": "@elizaos/core",
+      "version": "2.0.3-beta.7",
+      "integrity": "sha512-8ZtJcH3NPT/iQrHbm7oxxCzZ0SL9vbf3mOUuICZRobwqqKWkUD6y+I2cIUpKkhjU4/wcO6k2gh7vnm3H40c0yw==",
+      "resolved": "https://registry.npmjs.org/@elizaos/core/-/core-2.0.3-beta.7.tgz",
+      "gitHead": "61094f10458d11055c75b3dd0bae374e3f66bac5",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/elizaOS/eliza.git",
+        "directory": "packages/core"
+      }
+    },
+    {
+      "name": "@elizaos/plugin-sql",
+      "version": "2.0.3-beta.7",
+      "integrity": "sha512-g2X7SwLhdD8YKFDT+UBNyEn3KM/DSuluvYC6wJRxBwDo3niGpnSpWvPX3+5Wy7MsxJIJjWXfXcNsLkAzO7bF9w==",
+      "resolved": "https://registry.npmjs.org/@elizaos/plugin-sql/-/plugin-sql-2.0.3-beta.7.tgz",
+      "gitHead": "61094f10458d11055c75b3dd0bae374e3f66bac5",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/elizaos-plugins/plugin-sql.git"
+      }
+    },
+    {
+      "name": "@elizaos/plugin-agent-orchestrator",
+      "version": "2.0.3-beta.7",
+      "integrity": "sha512-Q/guz+WJoUlCA9LTF/655CWb4sdLoovZ55U6ShUasg6LYsb4ZZr6FEfibt8O4N7p0zAlVkmBVwvsTMVD7l9+YA==",
+      "resolved": "https://registry.npmjs.org/@elizaos/plugin-agent-orchestrator/-/plugin-agent-orchestrator-2.0.3-beta.7.tgz",
+      "gitHead": "61094f10458d11055c75b3dd0bae374e3f66bac5",
+      "license": "MIT",
+      "repository": {
+        "type": "git",
+        "url": "git+https://github.com/elizaos/eliza.git",
+        "directory": "plugins/plugin-agent-orchestrator"
+      }
+    },
+    {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "version": "0.34.0",
+      "integrity": "sha512-rOiZBZXmeGJEUSd5PHMFNoa0NsTSshzrKl02X5A8wx8SpGrmFmpl3c/jrv2+WIPvSe6zxRYUnUXoD/0+545jsg==",
+      "resolved": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.34.0.tgz",
+      "gitHead": "925865216927eb45a5c5877b21dd7373f5b0193a",
+      "license": "Apache-2.0",
+      "repository": {
+        "url": "git+https://github.com/agentclientprotocol/claude-agent-acp.git",
+        "type": "git"
+      }
+    },
+    {
+      "name": "@anthropic-ai/claude-agent-sdk",
+      "version": "0.2.132",
+      "integrity": "sha512-3hCkfbHi6d73QcNqgrjU9zXGdNs3BrwWnxV90p+DDFARtnwbszkkEm4nz9c80af3nzGBRVvKNZPVCqVaBrkO0g==",
+      "resolved": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.2.132.tgz",
+      "gitHead": null,
+      "license": "SEE LICENSE IN README.md",
+      "repository": {
+        "url": "git+https://github.com/anthropics/claude-agent-sdk-typescript.git",
+        "type": "git"
+      }
+    },
+    {
+      "name": "@electric-sql/pglite",
+      "version": "0.4.6",
+      "integrity": "sha512-qmlmfN8UyKCee35qkV0r/MBp+Znl8FjBz7OpoglNvww3GJpw0/DLP0o1ZymvLNmcD5DTLOQdzKPtF8Hd3mdl1w==",
+      "resolved": "https://registry.npmjs.org/@electric-sql/pglite/-/pglite-0.4.6.tgz",
+      "gitHead": null,
+      "license": "Apache-2.0",
+      "repository": {
+        "url": "git+https://github.com/electric-sql/pglite.git",
+        "type": "git",
+        "directory": "packages/pglite"
+      }
+    }
+  ],
+  "runtime": {
+    "testedNode": "v26.10.0",
+    "packageRequirement": ">=24",
+    "upstreamRepositoryPins": {
+      "node": "24.15",
+      "bun": "1.4.2"
+    }
+  },
+  "discrepancies": [
+    "beta.7 canonical task/session stores require flat SQLite-style SQL; project adapter translates upserts, placeholders and SQLite 64-bit INTEGER to real plugin-sql/PGlite SQL",
+    "core owns runtime.adapter; beta.7 stores read legacy runtime.databaseAdapter alias",
+    "core services load lazily; await getServiceLoadPromise",
+    "registry app 1.7.2 was not used; pinned source CLI/API/UI were installed and first-run tested in a separate checkout; root submodule installation and reviewed launcher integration remain pending",
+    "plugin-sqlite is unpublished and unused"
+  ]
+}

@@ -6,11 +6,11 @@
     "baseRef": "head"
   },
   "env": {
-    "ANTHROPIC_BASE_URL": "https://api.a6api.com",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-6.1-sol",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-6-luna",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.1-sol",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku"
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-flash[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-flash[1m]",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash"
   },
   "permissions": {
     "allow": [
