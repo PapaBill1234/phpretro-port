@@ -1,5 +1,9 @@
 # OpenCode 2 migration gaps and acceptance
 
+Current combined local status: [OC2-C01 evidence](opencode-local-candidate.md)
+supersedes historical review-pending worker receipts for the exact reviewed
+offline code. Live acceptance gates remain open; no main integration or CI.
+
 Task: OC2-M01. Updated: 2026-10-15. Baseline `d094160`, OpenCode 2.0.29.
 This is the **current builder migration** checklist. Historical CMS/Eliza
 evidence in `gaps.md` is not authorization to resume those workstreams.

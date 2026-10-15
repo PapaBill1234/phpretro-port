@@ -1,5 +1,10 @@
 # OpenCode 2 bootstrap
 
+Current combined local candidate: [OC2-C01 evidence](opencode-local-candidate.md).
+It records independent reviews and 43 passing local checks, not live readiness
+or main integration. Historical worker review-pending notes below are superseded
+only for the exact code and local scope named there.
+
 Current continuation: [migration plan](opencode-migration-plan.md) and
 [gap/acceptance checklist](opencode-migration-checklist.md). The plan is proposed,
 not architecture-locked; runtime enforcement and live acceptance remain open.
