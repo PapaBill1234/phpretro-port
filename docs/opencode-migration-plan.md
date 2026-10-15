@@ -1,6 +1,8 @@
 # OpenCode 2 builder migration plan — OC2-M01
 
-Status: **proposed, not architecture-locked or independently reviewed**.
+Status: **high-level decomposition independently reviewed; runtime request
+mechanism and live dispatch not approved**. Sol review OC2-M01-R1 approved
+offline admission-core work with the boundaries below.
 Baseline: `d094160`; runtime: official OpenCode **2.0.29**. Evidence checked
 2026-10-15. The executable is already installed; reinstalling it is not a
 migration milestone. Current gaps and acceptance are tracked in
@@ -183,6 +185,11 @@ reconciliation. If the provider cannot guarantee bounds, label it an estimate
 and keep autonomous paid dispatch blocked unless a real provider-side cap is
 verified. No arbitrary cap amount is invented in this plan.
 
+Before any autonomous paid send, require **selected-account quota, schedule
+and guard health, shared worker admission, and verified spend enforcement
+together**. A separate spend-design task is not permission to dispatch first.
+Unknown reconciliation never releases spending capacity optimistically.
+
 Jev remains optional typed judge-only over small already retrieved facts; never
 a permission/admission gate. Handle unavailable/escalate locally. Do not claim
 token savings without matched same-task/model measurements (input, cache,
@@ -195,12 +202,13 @@ Dependencies are gates, not permission to launch all rows concurrently.
 
 | Task | Owner preference / bounded scope | Gate to proceed |
 | --- | --- | --- |
-| OC2-M01 | Sol: this plan, gap/checklist and documentation links only | Offline consistency checks; independent Sol review pending fresh quota. No architecture lock yet. |
+| OC2-M01 | Sol: this plan, gap/checklist and documentation links only | High-level Sol review completed; runtime enforcement mechanism remains unqualified. |
 | OC2-M02 | Luna-high: read-only pinned-contract audit and local fake-provider probe design; Sol reviews blocking/cancellation conclusions | Fresh selected-account quota; exact supported denial/cancel mechanism proven in 2.0.29. No paid DeepSeek request. |
 | OC2-M03 | Luna-high: quota metadata acquisition/validation and private checkpoint tests | Supported source identified; wrong/stale/missing account and reserve tests; native manual login/model/delegation evidence. |
 | OC2-M04 | Luna-high: canonical shared task ledger and atomic admission, no provider dispatch | Concurrent claims across profiles, path overlap, crash/restart/quarantine and failure classification tests. |
+| OC2-M04a | Luna-high: offline SQLite claim/admission core only; no native sessions or dispatch | May proceed independently of M02/M03 runtime qualification after fresh quota authorization; targeted concurrency/path/crash/quarantine tests and independent review. |
 | OC2-M05 | Luna-high: native DeepSeek-only request guard | M02 architecture reviewed; fake transport proves deny/retry/active cutoff; Sol non-interference; fail-closed plugin startup. |
-| OC2-M06 | Luna-high: V2 session/worktree dispatch adapter, receipts and escalation | M03–M05 reviewed; four-worker supervision and restart acceptance; separate spend enforcement decision. |
+| OC2-M06 | Luna-high: V2 session/worktree dispatch adapter, receipts and escalation | M03–M05 reviewed; four-worker supervision and restart acceptance; verified spend enforcement before any autonomous paid send. |
 | OC2-M07 | Luna-high: real-route acceptance evidence and redacted GitHub progress; Sol independent final review | Verified live route, spend protection, all checklist gates and CI. No PHPRetro unpause inferred. |
 
 Luna work starts with M02 once quota permits; don't spend Sol tokens on routine

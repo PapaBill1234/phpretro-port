@@ -18,15 +18,22 @@ checklist is a live acceptance result.
   account/server isolation is still open below.
 - [x] Plan/checklist drafted against immutable 2.0.29 contracts S1–S8 and V2
   docs. This closes only plan creation, not architecture review or migration.
-- [ ] Independent Sol architecture review and architecture lock.
-- [ ] Fresh selected OpenCode account quota evidence. Saved Desktop windows
-  do **not** satisfy this. Unknown blocks worker and reviewer dispatch. Native
+- [x] Independent Sol high-level architecture review OC2-M01-R1 completed.
+  Native-hook mechanism and live dispatch remain unapproved; no runtime lock.
+- [x] Initial manual selected-account quota evidence received: operator reports
+  50% five-hour and 70% weekly at 2026-10-15T19:56:45Z. Used/remaining basis is
+  unspecified; either interpretation clears the 10% reserve (conservative
+  remaining bounds 50% and 30%). Reset times remain unknown. This admits the
+  bounded audit/review, not indefinite dispatch or an automated quota guard.
+  Saved Desktop windows do **not** satisfy selected-account evidence. Native
   UI source S8 links to `https://chatgpt.com/settings/usage` for manual checking;
   the browser must use the same account as the selected OpenCode connection.
 - [ ] Native manual login and real requested Sol model turn, per profile.
   The current coordinator session alone does not qualify the launcher route.
-- [ ] Real Luna 6 high delegation. Catalog lists
-  `openai/gpt-6-luna#high`; request success and allowance remain unqualified.
+- [x] One observed Luna 6 high delegated source audit completed using
+  `openai/gpt-6-luna#high`. This proves that bounded child turn only.
+- [ ] Per-profile launcher/delegation and restart recovery qualified; automated
+  allowance guard and measured savings remain unqualified.
 - [ ] Native DeepSeek credentials, actual Flash model ID and real route.
 - [ ] DeepSeek-only schedule enforcement before every request and at cutoff.
 - [ ] Shared max-four workers and scoped worktrees.
@@ -61,11 +68,13 @@ checklist is a live acceptance result.
    audit/probe design, no auth/key access and no provider inference probes.
    Return source locations for denial and cancellation, bypass inventory and
    smallest fake-provider tests; <600 words, save larger evidence separately.
-   **Queued, not spawned: fresh selected-account quota unavailable.**
-3. Independent Sol architecture review, then M03–M07 dependency order in plan.
-   Do not start runtime implementation from an unreviewed proposed design.
+   **Read-only Luna audit completed**, based on fresh manual quota evidence;
+   contract gap remains blocking. No runtime probe or implementation performed.
+3. Independent Sol review OC2-M01-R1 completed: high-level decomposition approved,
+   but native request enforcement and paid dispatch remain blocked. M04a offline
+   admission core may proceed independently of M02/M03 runtime qualification.
 
-No new worker/reviewer or paid DeepSeek request was dispatched by M01.
+No paid DeepSeek request was dispatched. Luna audit used the native OpenAI route.
 Runtime qualification, spend protection and account allowance remain unknown.
 PHPRetro stays paused; Eliza and custom subscription bridge stay retired.
 
@@ -79,3 +88,37 @@ PHPRetro stays paused; Eliza and custom subscription bridge stay retired.
   This is a proposed-plan checkpoint, not an integration approval.
 - Token/cached-token usage and cost: unavailable in this tool interface;
   unknown, not zero. No measured savings claim.
+
+## OC2-M02 read-only Luna audit evidence
+
+Completed 2026-10-15 using requested `openai/gpt-6-luna#high`. Independent source
+audit, not runtime acceptance; no edits, tests or provider probes by the worker.
+
+- S4 `hooks.ts:21–26`: no typed session-hook rejection contract.
+- S5 `model-request.ts:337–363`: hook precedes send, but request conversion and
+  response wrapping do not establish abort-signal propagation or underlying
+  stream cancellation. A replacement signal or hook exception is not a
+  qualified guard. Session interruption still needs scoped cancellation proof.
+- S6 `retry.ts:86–87`: explicit retry denial is supported; it does not solve
+  initial-send denial or active-stream cutoff.
+- S8 native dialog links the usage page. S1 and the inspected V2 API/CLI docs
+  expose no allowance reader. Session usage S7 remains token/cost accounting.
+- Next: narrow independent Sol architecture review, then local-only probes or
+  upstream-supported design work. DeepSeek autonomous dispatch stays disabled.
+- Probe design: zero denied arrivals for all four request kinds; disconnect
+  during pending headers, streaming and stalled body; retry across cutoff;
+  concurrent Sol/Luna non-interference and bypass tests. **Not executed.**
+- Actual worker token/cached-token usage and cost unavailable: unknown.
+
+## OC2-M01-R1 independent Sol review
+
+High-level design approved, not runtime qualification. Applied corrections:
+combined quota/schedule/guard/admission/spend gate before any autonomous paid
+send; no optimistic release on unknown spend reconciliation; offline M04a may
+proceed without unqualified native contracts. Remaining runtime policy work:
+manual quota observation/verification timestamps, connection attestation,
+freshness/future-time rejection; uncertain exit attribution stays unresolved.
+Classification and deduplicated escalation remain a separate M04b slice.
+Next owned paths for M04a: `scripts/opencode-ledger.py`,
+`tests/ops/test_opencode_ledger.py`, this checklist and migration plan.
+Review performed no tests/probes; actual token usage/cost unknown.
