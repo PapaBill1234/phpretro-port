@@ -311,19 +311,25 @@ available. Typed funding, quota, schedule, infrastructure, unavailable-model,
 elapsed-time, turn-budget, interruption and unresolved outcomes never increment
 acceptance failures. Funding remains a durable paused indication.
 
-Attempt IDs are globally unique and bind immutable payload/receipt data. Exact
-replay returns the original receipt; conflicting replay or a claim/task mismatch
-is rejected transactionally. Two failures with one signature block unchanged
-routine retry; three counted failures durably create one Sol-help intent and
-block routine retry. The intent is data only: no Sol request, provider call,
-claim release, or native dispatch occurs. Success records do not erase earlier
+Attempt IDs are globally unique and bind immutable payload/receipt data.
+Acceptance evidence references are unique run IDs across pass/failure receipts,
+enforced by a SQLite unique index; reuse under another attempt, outcome kind or
+task is rejected atomically. Exact same-attempt replay returns the original
+receipt; conflicting replay or a claim/task mismatch is rejected transactionally.
+Task status is assembled by one SQLite SELECT snapshot, preventing mixed
+pre-escalation counters and post-escalation intents. Two failures with one
+signature block unchanged routine retry; three counted failures durably create
+one Sol-help intent and block routine retry. The intent is data only: no Sol
+request, provider call, claim release, or native dispatch occurs. Success records do not erase earlier
 failures. The caller-attestation boundary means this local ledger does not prove
 that acceptance commands actually ran or that attribution is correct.
 
 - `python3 -m unittest discover -s tests/ops -p 'test_opencode*.py' -v`:
-  **24 passed** on 2026-10-15, including the existing admission/launcher tests,
+  **27 passed** on 2026-10-15, including the existing admission/launcher tests,
   typed positive/negative outcome cases, excluded interruption classes,
-  idempotent/conflicting receipts, cross-task binding, restart durability,
+  idempotent/conflicting receipts, duplicate evidence rejection across kinds
+  and tasks, an atomic concurrent evidence-reuse race, cross-task binding,
+  deterministic status-snapshot interleaving, restart durability,
   funding pause, two-identical stop, three-failure single intent, and six real
   concurrent child processes plus duplicate replay.
 - `git diff --check`: passed.

@@ -179,19 +179,22 @@ does not erase prior failures.
 
 Attempt IDs are immutable and globally unique; exact replays return the original
 receipt, while conflicting payloads and cross-task claim bindings are rejected.
-Status survives process restart. The second identical failure blocks unchanged
-routine retry; the third counted failure persists one Sol-help intent and blocks
+Acceptance evidence references are unique run IDs across pass/failure receipts;
+reuse across attempts, outcome kinds, or tasks is rejected by a transactional
+SQLite unique index. Status survives process restart and is read from one
+consistent SQL snapshot. The second identical failure blocks unchanged routine
+retry; the third counted failure persists one Sol-help intent and blocks
 routine retry. This intent is not dispatch, and recording an outcome never
 releases a claim. Evidence is caller-attested; the ledger cannot prove
 acceptance ran or attribution is true.
 
 - `python3 -m unittest discover -s tests/ops -p 'test_opencode*.py' -v`:
-  **24 passed** on 2026-10-15. Includes typed positive/negative outcomes,
+  **27 passed** on 2026-10-15. Includes typed positive/negative outcomes,
   excluded interruptions, bare-exit/unresolved handling, strict type checks,
   immutable replay/conflict, task binding, two-identical stop, three-failure
-  one-intent durability, funding pause, restart and six concurrent child
-  processes with duplicate replay; existing admission/launcher regression tests
-  also passed.
+  one-intent durability, funding pause, restart, concurrent duplicate-evidence
+  rejection, and a deterministic status-snapshot interleaving; existing
+  admission/launcher regression tests also passed.
 - `git diff --check`: passed.
 - A09 remains open: no real acceptance runner/receipt verifier, native dispatch,
   actual Sol help request, or live qualification. Independent M04b review and CI

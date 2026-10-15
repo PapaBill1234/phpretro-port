@@ -103,6 +103,73 @@ class OutcomeTests(unittest.TestCase):
             ledger.record_outcome(self.state, task_id="task-b", claim_id=self.claim,
                                   attempt_id="wrong-task", kind="unresolved")
 
+    def test_acceptance_evidence_is_unique_across_attempts_kinds_and_tasks(self):
+        self.failure("evidence-first", "signature-a")
+        with self.assertRaisesRegex(ledger.LedgerError, "evidence reference was already used"):
+            ledger.record_outcome(
+                self.state, task_id="task-a", claim_id=self.claim, attempt_id="evidence-second",
+                kind="acceptance_failure", acceptance_ran=True, implementation_attributed=True,
+                evidence_ref="acceptance/evidence-first", failure_signature="signature-b")
+        with self.assertRaisesRegex(ledger.LedgerError, "evidence reference was already used"):
+            ledger.record_outcome(self.state, task_id="task-a", claim_id=self.claim,
+                                  attempt_id="evidence-pass", kind="acceptance_pass",
+                                  acceptance_ran=True, evidence_ref="acceptance/evidence-first")
+        other_tree = self.base / "other-evidence"
+        other_tree.mkdir()
+        other_claim = ledger.claim(self.state, task_id="task-b", profile="secondary",
+                                   branch="build/task-b", worktree=other_tree,
+                                   owned_paths=["src/other.py"])
+        with self.assertRaisesRegex(ledger.LedgerError, "evidence reference was already used"):
+            ledger.record_outcome(
+                self.state, task_id="task-b", claim_id=other_claim, attempt_id="cross-evidence",
+                kind="acceptance_failure", acceptance_ran=True, implementation_attributed=True,
+                evidence_ref="acceptance/evidence-first", failure_signature="signature-c")
+        self.assertEqual(ledger.get_task_status(self.state, "task-a")["acceptance_failures"], 1)
+        self.assertEqual(ledger.get_task_status(self.state, "task-b")["acceptance_failures"], 0)
+
+    def test_concurrent_reuse_of_one_acceptance_evidence_counts_once(self):
+        worker = """
+import importlib.util, sys, time
+from pathlib import Path
+s=importlib.util.spec_from_file_location('l', sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+ready=Path(sys.argv[5]); ready.touch()
+while not ready.parent.joinpath('go').exists(): time.sleep(.005)
+try:
+ m.record_outcome(Path(sys.argv[2]), task_id='task-a', claim_id=sys.argv[3],
+  attempt_id=sys.argv[4], kind='acceptance_failure', acceptance_ran=True,
+  implementation_attributed=True, evidence_ref='acceptance/shared-run',
+  failure_signature='concurrent-root')
+ print('ACCEPTED')
+except m.LedgerError:
+ print('REJECTED')
+"""
+        processes = []
+        try:
+            for i in range(4):
+                ready = self.base / f"evidence-race-{i}.ready"
+                process = subprocess.Popen([sys.executable, "-c", worker, str(SCRIPT), str(self.state),
+                                            self.claim, f"evidence-race-{i}", str(ready)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                processes.append((process, ready))
+            deadline = time.monotonic() + 10
+            while len(list(self.base.glob("evidence-race-*.ready"))) != 4 and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(len(list(self.base.glob("evidence-race-*.ready"))), 4)
+            (self.base / "go").touch()
+            outputs = []
+            for process, _ in processes:
+                stdout, stderr = process.communicate(timeout=20)
+                self.assertEqual(process.returncode, 0, stderr)
+                outputs.append(stdout.strip())
+            self.assertEqual(outputs.count("ACCEPTED"), 1, outputs)
+            self.assertEqual(outputs.count("REJECTED"), 3, outputs)
+        finally:
+            for process, _ in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        self.assertEqual(ledger.get_task_status(self.state, "task-a")["acceptance_failures"], 1)
+
     def test_second_identical_failure_blocks_unchanged_retry_before_escalation(self):
         self.failure("same-1", "stable-root-cause")
         second = self.failure("same-2", "stable-root-cause")
@@ -139,6 +206,43 @@ print(json.dumps(m.get_task_status(Path(sys.argv[2]), 'task-a'), sort_keys=True)
 """, str(SCRIPT), str(self.state)], capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(child.stdout)["acceptance_failures"], 1)
 
+    def test_task_status_uses_one_snapshot_during_concurrent_escalation(self):
+        self.failure("snapshot-1", "snapshot-a")
+        self.failure("snapshot-2", "snapshot-b")
+        original_database = ledger._database
+        reader = original_database(self.state)
+        used_reader = False
+        inserted = False
+
+        def interleaved_database(root):
+            nonlocal used_reader
+            if not used_reader:
+                used_reader = True
+                return reader
+            return original_database(root)
+
+        def commit_third_failure_before_status_select(sql):
+            nonlocal inserted
+            if not inserted and "SELECT 1 FROM outcomes" in sql:
+                inserted = True
+                ledger._database = original_database
+                ledger.record_outcome(
+                    self.state, task_id="task-a", claim_id=self.claim, attempt_id="snapshot-3",
+                    kind="acceptance_failure", acceptance_ran=True,
+                    implementation_attributed=True, evidence_ref="snapshot/three",
+                    failure_signature="snapshot-c")
+
+        ledger._database = interleaved_database
+        reader.set_trace_callback(commit_third_failure_before_status_select)
+        try:
+            status = ledger.get_task_status(self.state, "task-a")
+        finally:
+            ledger._database = original_database
+        self.assertTrue(inserted)
+        self.assertEqual(status["acceptance_failures"], 3)
+        self.assertTrue(status["routine_retry_blocked"])
+        self.assertIsNotNone(status["sol_help_intent"])
+
     def test_concurrent_process_outcomes_and_duplicate_replay_are_atomic(self):
         worker = """
 import importlib.util, sys, time
@@ -148,7 +252,7 @@ ready=Path(sys.argv[5]); ready.touch()
 while not ready.parent.joinpath('go').exists(): time.sleep(.005)
 m.record_outcome(Path(sys.argv[2]), task_id='task-a', claim_id=sys.argv[3], attempt_id=sys.argv[4],
  kind='acceptance_failure', acceptance_ran=True, implementation_attributed=True,
- evidence_ref='acceptance/concurrent', failure_signature='concurrent-root')
+ evidence_ref='acceptance/' + sys.argv[4], failure_signature='concurrent-root')
 """
         processes = []
         try:
@@ -201,7 +305,7 @@ m.record_outcome(Path(sys.argv[2]), task_id='task-a', claim_id=sys.argv[3], atte
         ledger.record_outcome(self.state, task_id="task-a", claim_id=self.claim,
                               attempt_id="concurrent-0", kind="acceptance_failure",
                               acceptance_ran=True, implementation_attributed=True,
-                              evidence_ref="acceptance/concurrent",
+                              evidence_ref="acceptance/concurrent-0",
                               failure_signature="concurrent-root")
         self.assertEqual(ledger.get_task_status(self.state, "task-a"), before)
 

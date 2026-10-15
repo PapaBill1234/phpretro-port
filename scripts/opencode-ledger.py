@@ -117,6 +117,8 @@ def _database(root: Path) -> sqlite3.Connection:
         receipt TEXT NOT NULL
     )""")
     connection.execute("CREATE INDEX IF NOT EXISTS outcomes_task ON outcomes(task_id)")
+    connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS outcomes_acceptance_evidence
+        ON outcomes(evidence_ref) WHERE kind IN ('acceptance_pass','acceptance_failure')""")
     connection.execute("""CREATE TABLE IF NOT EXISTS escalation_intents (
         task_id TEXT PRIMARY KEY,
         claim_id TEXT NOT NULL,
@@ -141,27 +143,26 @@ def _safe_label(value: str, field: str) -> str:
 
 
 def _task_outcome_status(connection: sqlite3.Connection, task_id: str) -> dict:
-    failures, same_signature = connection.execute(
-        """SELECT COALESCE(SUM(signature_count), 0), MAX(signature_count) FROM (
-             SELECT failure_signature, COUNT(*) AS signature_count FROM outcomes
-             WHERE task_id=? AND kind='acceptance_failure' GROUP BY failure_signature
-           )""", (task_id,)).fetchone()
-    if failures is None:
-        failures, same_signature = 0, 0
-    pause = connection.execute(
-        "SELECT 1 FROM outcomes WHERE task_id=? AND kind='funding' LIMIT 1", (task_id,)
-    ).fetchone() is not None
-    intent = connection.execute(
-        "SELECT created_by_attempt, reason FROM escalation_intents WHERE task_id=?", (task_id,)
-    ).fetchone()
+    row = connection.execute("""SELECT c.task_id,
+        (SELECT COUNT(*) FROM outcomes WHERE task_id=c.task_id AND kind='acceptance_failure'),
+        (SELECT COALESCE(MAX(signature_count), 0) FROM (
+            SELECT COUNT(*) AS signature_count FROM outcomes
+            WHERE task_id=c.task_id AND kind='acceptance_failure' GROUP BY failure_signature)),
+        EXISTS(SELECT 1 FROM outcomes WHERE task_id=c.task_id AND kind='funding'),
+        (SELECT created_by_attempt FROM escalation_intents WHERE task_id=c.task_id),
+        (SELECT reason FROM escalation_intents WHERE task_id=c.task_id)
+        FROM claims AS c WHERE c.task_id=?""", (task_id,)).fetchone()
+    if row is None:
+        raise LedgerError("unknown task")
+    _, failures, same_signature, pause, intent_attempt, intent_reason = row
     return {
         "task_id": task_id,
         "acceptance_failures": failures,
-        "identical_failure_count": same_signature or 0,
-        "routine_retry_blocked": failures >= 3 or (same_signature or 0) >= 2,
-        "sol_help_intent": None if intent is None else {
-            "created_by_attempt": intent[0], "reason": intent[1]},
-        "funding_paused": pause,
+        "identical_failure_count": same_signature,
+        "routine_retry_blocked": failures >= 3 or same_signature >= 2,
+        "sol_help_intent": None if intent_attempt is None else {
+            "created_by_attempt": intent_attempt, "reason": intent_reason},
+        "funding_paused": bool(pause),
     }
 
 
@@ -212,12 +213,17 @@ def record_outcome(state_root: Path, *, task_id: str, claim_id: str, attempt_id:
         owner = connection.execute("SELECT task_id FROM claims WHERE claim_id=?", (claim,)).fetchone()
         if owner is None or owner[0] != task:
             raise LedgerError("outcome claim does not belong to task")
-        connection.execute("""INSERT INTO outcomes
-            (attempt_id, task_id, claim_id, kind, acceptance_ran,
-             implementation_attributed, evidence_ref, failure_signature, payload, receipt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
-            (attempt, task, claim, kind, int(acceptance_ran), int(implementation_attributed),
-             evidence, signature, payload))
+        try:
+            connection.execute("""INSERT INTO outcomes
+                (attempt_id, task_id, claim_id, kind, acceptance_ran,
+                 implementation_attributed, evidence_ref, failure_signature, payload, receipt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
+                (attempt, task, claim, kind, int(acceptance_ran), int(implementation_attributed),
+                 evidence, signature, payload))
+        except sqlite3.IntegrityError as error:
+            if kind in ("acceptance_pass", "acceptance_failure") and "outcomes.evidence_ref" in str(error):
+                raise LedgerError("acceptance evidence reference was already used") from None
+            raise
         failure_count = connection.execute(
             "SELECT COUNT(*) FROM outcomes WHERE task_id=? AND kind='acceptance_failure'", (task,)
         ).fetchone()[0]
@@ -245,8 +251,6 @@ def get_task_status(state_root: Path, task_id: str) -> dict:
     root = _canonical_private_root(Path(state_root))
     connection = _database(root)
     try:
-        if connection.execute("SELECT 1 FROM claims WHERE task_id=?", (task,)).fetchone() is None:
-            raise LedgerError("unknown task")
         return _task_outcome_status(connection, task)
     finally:
         connection.close()
