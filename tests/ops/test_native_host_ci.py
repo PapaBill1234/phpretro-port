@@ -668,10 +668,28 @@ Caused by:
         self.assertNotIn("invalid memory reference", rendered)
         self.assertNotIn("/tmp/private", rendered)
 
+    def test_offline_test_excerpt_keeps_only_a_started_test_name_without_result(self):
+        test_name = "thread_manager::tests::native_text_host_qualification_cold_resume_captures_empty_ceiling"
+        text = """\
+running 19 tests
+test %s ...
+error: test failed, to rerun pass `-p codex-core --lib`
+Caused by:
+  process didn't exit successfully: `/tmp/private/test-binary SECRET=value` (signal: 6, SIGABRT: process abort signal)
+""" % test_name
+        excerpt = ci.sanitize_offline_test_excerpt(text)
+        rendered = "\n".join(excerpt["lines"])
+        self.assertIn("test %s ... (started; no result recorded)" % test_name, rendered)
+        self.assertIn("process child signal: 6 (SIGABRT)", rendered)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("/tmp/private", rendered)
+        self.assertNotIn("running 19 tests", rendered)
+
     def test_offline_test_excerpt_drops_process_shaped_fixture_stdout(self):
         text = """\
 failures:
 ---- fixture_test stdout ----
+test inner_fixture::test_name ...
 Caused by:
 process didn't exit successfully: `/private/path` (exit status: 9)
 /tmp/fixture: error while loading shared libraries: libsecret.so: cannot open shared object file: No such file or directory
@@ -685,6 +703,7 @@ Caused by:
         rendered = "\n".join(excerpt["lines"])
         self.assertEqual(rendered.count("Caused by:"), 1)
         self.assertIn("process child exit status: 9", rendered)
+        self.assertNotIn("inner_fixture", rendered)
         self.assertNotIn("libsecret.so", rendered)
         self.assertNotIn("fixture assertion payload", rendered)
         self.assertNotIn("API_KEY", rendered)

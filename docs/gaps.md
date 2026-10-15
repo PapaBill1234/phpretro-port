@@ -279,6 +279,18 @@ and arbitrary test stdout. Fixture tests cover these cases. This improves
 future evidence only; it does not recover run `38727894425`'s log or identify its
 cause. Admission remains false and G05/G06 remain Partial.
 
+Hosted run `38764959443` on `d0daf32` again failed in `offline-tests`. Its
+receipt records only Cargo's generic test failure, `Caused by:`, and normalized
+child signal 6 (`SIGABRT`); the selected-test outcomes are all absent. The
+receipt-only artifact has no raw stage log, so this proves an abort but does not
+identify an assertion, the active test, or a pre-main initialization fault. The
+bounded sanitizer also discarded libtest's partial `test <name> ...` progress
+line, which Rust 1.95 flushes before a serial test runs. It now retains only
+that constrained qualified name, labeled as started with no result; arbitrary
+test stdout and assertion payloads remain excluded. This may identify the last
+started test on a future failure, but it cannot establish the cause of this
+archived abort. Admission remains false and G05/G06 remain Partial.
+
 Companion trusted-origin wiring (G06, 2026-10-14, direct DeepSeek):
 `scripts/eliza-dashboard.py` `build_env` now exports
 `PHP_RETRO_COMPANION_TRUSTED_ORIGINS` into the API child environment only, from
