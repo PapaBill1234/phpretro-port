@@ -145,14 +145,19 @@ caller attestation. No native session/dispatch integration, process killing,
 worktree cleanup, or automatic release is present.
 
 - `python3 -m unittest discover -s tests/ops -p test_opencode_ledger.py -v`:
-  **7 passed** on 2026-10-15. The race test uses eight real child processes and
-  SQLite; exactly four entered and four were denied. A child process exits
-  abruptly after its insert but before commit; SQLite exposes no partial claim.
+  **10 passed** on 2026-10-15. Eight real child processes race on initial DB
+  creation under umask 022, with distinct synthetic branches/worktrees; exactly
+  four entered and four were denied, and the DB is mode 0600. Cross-profile
+  active/quarantined branch/worktree conflicts are covered. An existing 0644
+  DB is rejected without repair. A child process exits after its insert but
+  before commit; SQLite exposes no partial claim.
 - `python3 -m unittest discover -s tests/ops -p test_opencode_builder.py -v`:
   **3 passed** (launcher regression).
 - `git diff --check`: passed.
 - Evidence is LOCAL only. A07 live worker admission, A08 native restart/session
   reconciliation, and A09 failure classification/escalation remain open.
-  Independent Sol review and CI have not run; M04b is a separate task.
+  Sol's review of `1665791` identified branch/worktree isolation and DB
+  initialization mode races; this correction addresses both. Independent
+  re-review and CI have not run; M04b is a separate task.
 - Token/cached-token usage and cost unavailable in this tool interface;
   unknown, not zero.

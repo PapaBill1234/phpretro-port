@@ -31,17 +31,19 @@ class LedgerTests(unittest.TestCase):
 
     def add(self, task="task-1", paths=None, **kwargs):
         return ledger.claim(self.state, task_id=task, profile=kwargs.pop("profile", "primary"),
-                            branch=f"build/{task}", worktree=kwargs.pop("worktree", self.worktree),
+                            branch=kwargs.pop("branch", f"build/{task}"),
+                            worktree=kwargs.pop("worktree", self.worktree),
                             owned_paths=paths or [f"src/{task}.py"], **kwargs)
 
     def rows(self):
         with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
             return db.execute("SELECT task_id, state, owned_paths FROM claims ORDER BY task_id").fetchall()
 
-    def test_real_process_race_admits_exactly_four_and_denies_fifth(self):
+    def test_real_process_initial_contention_under_umask_022_admits_exactly_four(self):
         child_code = """
-import importlib.util, sys, time
+import importlib.util, os, sys, time
 from pathlib import Path
+os.umask(0o022)
 s = importlib.util.spec_from_file_location('ledger', sys.argv[1])
 m = importlib.util.module_from_spec(s)
 s.loader.exec_module(m)
@@ -60,8 +62,10 @@ except m.LedgerError as error:
         try:
             for i in range(8):
                 ready = self.base / f"ready-{i}"
+                worktree = self.base / f"race-worktree-{i}"
+                worktree.mkdir()
                 child = subprocess.Popen([sys.executable, "-c", child_code, str(SCRIPT), str(self.state),
-                                          f"race-{i}", str(ready), str(self.worktree)],
+                                          f"race-{i}", str(ready), str(worktree)],
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 children.append((child, ready))
             # Parent creates the common release marker only after every process is waiting.
@@ -80,6 +84,7 @@ except m.LedgerError as error:
             self.assertEqual(sum(line.startswith("ADMITTED ") for line in outputs), 4, outputs)
             self.assertEqual(sum(line.startswith("DENIED ") for line in outputs), 4, outputs)
             self.assertEqual(sum(state != "released" for _, state, _ in self.rows()), 4)
+            self.assertEqual((self.state / ledger.DATABASE_NAME).stat().st_mode & 0o777, 0o600)
         finally:
             for child, _ in children:
                 if child.poll() is None:
@@ -91,9 +96,31 @@ except m.LedgerError as error:
         with self.assertRaisesRegex(ledger.LedgerError, "duplicate task"):
             self.add("duplicate", ["src/two.py"], profile="secondary")
         with self.assertRaisesRegex(ledger.LedgerError, "overlap"):
-            self.add("child", ["src/one.py/child.py"], profile="secondary")
+            self.add("child", ["src/one.py/child.py"], profile="secondary", worktree=self.other_worktree)
         with self.assertRaisesRegex(ledger.LedgerError, "overlap"):
-            self.add("parent", ["src"], profile="secondary")
+            self.add("parent", ["src"], profile="secondary", worktree=self.other_worktree)
+
+    def test_active_branch_and_worktree_are_exclusive_across_profiles(self):
+        self.add("worktree-owner", ["src/a.py"], profile="primary", branch="branch/a")
+        with self.assertRaisesRegex(ledger.LedgerError, "worktree already claimed"):
+            self.add("same-worktree", ["src/b.py"], profile="secondary", branch="branch/b")
+        with self.assertRaisesRegex(ledger.LedgerError, "branch already claimed"):
+            self.add("same-branch", ["src/c.py"], profile="secondary", branch="branch/a",
+                     worktree=self.other_worktree)
+
+    def test_quarantined_worktree_stays_reserved_but_released_worktree_can_be_reused(self):
+        claim_id = self.add("old-owner", ["src/old.py"], profile="primary", branch="branch/old",
+                            now=10, lease_seconds=1)
+        with self.assertRaisesRegex(ledger.LedgerError, "worktree already claimed"):
+            self.add("new-owner", ["src/new.py"], profile="secondary", branch="branch/new", now=12)
+        self.assertEqual(dict((task, state) for task, state, _ in self.rows())["old-owner"], "quarantined")
+        with self.assertRaisesRegex(ledger.LedgerError, "branch already claimed"):
+            self.add("branch-owner", ["src/branch.py"], profile="secondary", branch="branch/old",
+                     worktree=self.other_worktree, now=12)
+        ledger.release(self.state, claim_id, termination_evidence={
+            "verified_terminated": True, "verifier": "operator", "evidence_ref": "check",
+            "terminated_at": "2026-10-15T20:00:00Z"})
+        self.add("new-owner", ["src/new.py"], profile="secondary", branch="branch/old", now=12)
 
     def test_traversal_absolute_and_symlink_owned_paths_rejected(self):
         for path in ("../escape", "src/../escape", "/tmp/absolute"):
@@ -141,11 +168,16 @@ m.claim(Path(sys.argv[2]), task_id='rollback', profile='p', branch='b',
 
     def test_expired_claim_is_quarantined_and_consumes_slot_until_evidence_release(self):
         expired = self.add("expired", ["src/expired.py"], now=10, lease_seconds=1)
-        self.add("two", ["src/two.py"], now=10, lease_seconds=100)
-        self.add("three", ["src/three.py"], now=10, lease_seconds=100)
-        self.add("four", ["src/four.py"], now=10, lease_seconds=100)
+        worktrees = []
+        for task in ("two", "three", "four", "fifth"):
+            worktree = self.base / f"{task}-checkout"
+            worktree.mkdir()
+            worktrees.append(worktree)
+        self.add("two", ["src/two.py"], now=10, lease_seconds=100, worktree=worktrees[0])
+        self.add("three", ["src/three.py"], now=10, lease_seconds=100, worktree=worktrees[1])
+        self.add("four", ["src/four.py"], now=10, lease_seconds=100, worktree=worktrees[2])
         with self.assertRaisesRegex(ledger.LedgerError, "four-slot"):
-            self.add("fifth", ["src/fifth.py"], now=12)
+            self.add("fifth", ["src/fifth.py"], now=12, worktree=worktrees[3])
         self.assertEqual(dict((task, state) for task, state, _ in self.rows())["expired"], "quarantined")
         with self.assertRaisesRegex(ledger.LedgerError, "cannot be revived"):
             ledger.heartbeat(self.state, expired, now=12)
@@ -154,7 +186,7 @@ m.claim(Path(sys.argv[2]), task_id='rollback', profile='p', branch='b',
         evidence = {"verified_terminated": True, "verifier": "operator", "evidence_ref": "local-check-1",
                     "terminated_at": "2026-10-15T20:00:00Z"}
         ledger.release(self.state, expired, termination_evidence=evidence)
-        self.add("fifth", ["src/fifth.py"], now=12)
+        self.add("fifth", ["src/fifth.py"], now=12, worktree=worktrees[3])
         self.assertEqual(dict((task, state) for task, state, _ in self.rows())["expired"], "released")
 
     def test_database_and_root_are_private_and_symlinked_database_rejected(self):
@@ -174,6 +206,23 @@ m.claim(Path(sys.argv[2]), task_id='rollback', profile='p', branch='b',
             ledger.claim(self.state, task_id="symlink-db", profile="p", branch="b",
                          worktree=self.worktree, owned_paths=["safe"])
         self.assertEqual(target.read_text(), "untouched")
+
+    def test_database_initialization_is_private_under_umask_022_and_never_repairs_existing_file(self):
+        path = self.state / ledger.DATABASE_NAME
+        previous_umask = os.umask(0o022)
+        try:
+            with sqlite3.connect(path):
+                pass
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            with self.assertRaisesRegex(ledger.LedgerError, "private"):
+                ledger._database(self.state)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            path.unlink()
+            connection = ledger._database(self.state)
+            connection.close()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        finally:
+            os.umask(previous_umask)
 
 
 if __name__ == "__main__":

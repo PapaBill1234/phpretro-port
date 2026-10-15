@@ -51,16 +51,36 @@ def _canonical_private_root(root: Path) -> Path:
 def _database(root: Path) -> sqlite3.Connection:
     path = root / DATABASE_NAME
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        info = None
-    if info is not None:
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                             getattr(os, "O_NOFOLLOW", 0), 0o600)
+        created = True
+        before_open = None
+    except FileExistsError:
+        created = False
+        try:
+            before_open = path.lstat()
+        except FileNotFoundError:
+            raise LedgerError("ledger database disappeared during validation") from None
+        if not stat.S_ISREG(before_open.st_mode) or before_open.st_uid != os.getuid():
             raise LedgerError("ledger database must be an owned regular file")
-        if stat.S_IMODE(info.st_mode) & 0o077:
+        if stat.S_IMODE(before_open.st_mode) & 0o077:
             raise LedgerError("ledger database must be private (mode 0600)")
+        descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
+            raise LedgerError("ledger database must be an owned regular file")
+        if stat.S_IMODE(opened.st_mode) & 0o077:
+            raise LedgerError("ledger database must be private (mode 0600)")
+        if before_open is not None and (opened.st_dev, opened.st_ino) != (before_open.st_dev, before_open.st_ino):
+            raise LedgerError("ledger database changed during validation")
+        if created:
+            # The descriptor is the O_EXCL-created file, so tighten only this
+            # new inode; never repair permissions on a pre-existing database.
+            os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
     connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
-    os.chmod(path, 0o600)
     connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_SECONDS * 1000}")
     connection.execute("PRAGMA journal_mode=DELETE")
     connection.execute("""CREATE TABLE IF NOT EXISTS claims (
@@ -155,9 +175,14 @@ def claim(state_root: Path, *, task_id: str, profile: str, branch: str,
         connection.execute("BEGIN IMMEDIATE")
         if connection.execute("SELECT 1 FROM claims WHERE task_id=?", (task_id,)).fetchone():
             raise LedgerError("duplicate task claim")
-        live = connection.execute("SELECT task_id, owned_paths FROM claims WHERE state IN ('active','quarantined')").fetchall()
+        live = connection.execute("SELECT task_id, branch, worktree, owned_paths FROM claims "
+                                  "WHERE state IN ('active','quarantined')").fetchall()
         proposed = paths
-        for other_task, encoded in live:
+        for other_task, other_branch, other_worktree, encoded in live:
+            if branch == other_branch:
+                raise LedgerError(f"branch already claimed by task {other_task}")
+            if str(canonical_worktree) == other_worktree:
+                raise LedgerError(f"worktree already claimed by task {other_task}")
             if _overlap(proposed, json.loads(encoded)):
                 raise LedgerError(f"owned paths overlap existing task {other_task}")
         occupied = connection.execute("SELECT COUNT(*) FROM claims WHERE state IN ('active','quarantined')").fetchone()[0]

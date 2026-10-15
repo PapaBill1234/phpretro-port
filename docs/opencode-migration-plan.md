@@ -253,9 +253,13 @@ claim CLI. Callers must supply the same existing absolute private state root
 (owned by the current user, mode 0700 or stricter) to share a ledger across
 profiles and worktrees. The database is fixed at
 `opencode-ledger.sqlite3`, private (0600), and uses SQLite's 10-second busy
-timeout plus `BEGIN IMMEDIATE` admission transactions. Claims reject duplicate
-task IDs, unsafe path spellings/symlinks, and canonical owned-path parent/child
-overlap; no more than four active or quarantined rows can be admitted.
+timeout plus `BEGIN IMMEDIATE` admission transactions. Initial database creation
+uses exclusive no-follow creation at mode 0600; an existing insecure file is
+rejected, never permission-repaired. Claims reject duplicate task IDs, active
+or quarantined branch/worktree reuse, unsafe path spellings/symlinks, and
+canonical owned-path parent/child overlap; no more than four active or
+quarantined rows can be admitted. Released branch/worktree reservations can be
+reused, while duplicate task IDs remain durable.
 
 Lease expiry is not termination: expired rows become durable `quarantined`
 claims and continue consuming capacity. `heartbeat` will not revive an expired
@@ -269,17 +273,25 @@ operation; heartbeat/release are library APIs for offline callers.
 Targeted local evidence on 2026-10-15:
 
 - `python3 -m unittest discover -s tests/ops -p test_opencode_ledger.py -v`:
-  **7 passed**, including eight competing real processes (exactly four
-  admitted), duplicate and parent/child conflicts, traversal/symlink rejection,
-  shared profile/worktree ledger, child-process crash-after-insert rollback, stale-lease
-  quarantine/capacity retention, evidence-required release, and private-path
-  checks.
+  **10 passed**, including eight competing real processes on unique worktrees
+  and branches with umask 022 (exactly four admitted, initial DB mode 0600),
+  cross-profile active branch/worktree isolation, duplicate and parent/child
+  conflicts, traversal/symlink rejection, shared ledger, child-process
+  crash-after-insert rollback, stale-lease quarantine/capacity retention,
+  evidence-required release, and private-path checks. A deterministic check
+  confirms a pre-existing 0644 DB is rejected unchanged while first creation
+  under umask 022 is private.
 - `python3 -m unittest discover -s tests/ops -p test_opencode_builder.py -v`:
   **3 passed** (existing launcher regression).
 - `git diff --check`: passed.
+- Sol's independent review of commit `1665791` found two medium blockers:
+  active claims did not reserve branch/worktree identity, and SQLite first
+  creation could briefly produce a 0644 DB under umask 022. This correction
+  adds atomic active/quarantined identity checks and secure exclusive creation;
+  regression evidence is above. Independent re-review is pending.
 - This is LOCAL admission-core evidence only. A07 real bounded-worker/live
   admission, A08 native restart/reconciliation, and A09 acceptance
-  classification/escalation remain open; independent Sol diff review and CI
-  have not run. M04b failure classification/escalation is out of scope.
+  classification/escalation remain open; CI has not run. M04b failure
+  classification/escalation is out of scope.
 - Token/cached-token usage and cost unavailable in this tool interface;
   unknown, not zero.
