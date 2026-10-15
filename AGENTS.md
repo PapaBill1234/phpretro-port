@@ -1,6 +1,6 @@
 # Builder contract
 
-Use direct DeepSeek Flash for up to four disjoint implementation workers; native Codex ChatGPT-subscription Sol coordinates/reviews. Never route a Sol ID through DeepSeek. Provider funding failures pause dispatch and do not count toward task failures.
+OpenCode is the native coding coordinator; connect ChatGPT accounts only through OpenCode's native provider flow. DeepSeek Flash is the separate direct API provider. Desired routine dispatch is off-peak and at most four disjoint workers, but the current bootstrap does not enforce those controls. Never route a Sol ID through DeepSeek. Provider funding failures pause dispatch and do not count toward task failures. CMS/theme/game-port work remains paused during migration.
 
 Read `docs/gaps.md` and the assigned task brief. Load only the source contract and skill needed for that task. Application slices are recorded in docs/validation.md; the full CMS/game port remains incomplete.
 
