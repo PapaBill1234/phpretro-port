@@ -50,7 +50,7 @@ class ReadOnlyCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(host, "validate_overlay_source", return_value={"readiness": True}), \
-                    mock.patch.object(host.dash, "require_window", return_value={"allowed": True}), \
+                    mock.patch.object(host, "_operation_stop", return_value=datetime.now(timezone.utc) + timedelta(hours=1)), \
                     mock.patch.object(host.dash, "port_free"), \
                     mock.patch.object(host, "_dropin_ready", return_value=True), \
                     mock.patch("builtins.print"):
@@ -432,7 +432,7 @@ class DeadlinePropagationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(host, "ROOT", root), \
-                    mock.patch.object(host.dash, "require_window", return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                     mock.patch.object(host, "build_overlay"), \
                     mock.patch.object(host.time, "monotonic", side_effect=[0, 2]), \
                     mock.patch("builtins.print") as output:
@@ -468,7 +468,7 @@ class DeadlinePropagationTest(unittest.TestCase):
 
 
 class CapturedDeadlineTest(unittest.TestCase):
-    """The effective caller/canonical cutoff must bound launch validation."""
+    """The effective caller/saved cutoff must bound launch validation."""
 
     def _run_start(self, root, namespace, canonical, saved, window):
         cutoff = root / namespace / "cutoff.json"
@@ -484,7 +484,7 @@ class CapturedDeadlineTest(unittest.TestCase):
             host._remaining(time.monotonic() - 1, "slow source validation")
 
         with host._Namespace(namespace), \
-                mock.patch.object(host.dash, "require_window", return_value={"stop_at": canonical}), \
+                mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat(canonical)), \
                 mock.patch.object(host.dash, "port_free"), \
                 mock.patch.object(host, "_reserve_ports"), \
                 mock.patch.object(host, "validate_overlay_source", side_effect=fake_validate), \
@@ -574,15 +574,39 @@ class PrivateBoundaryTest(unittest.TestCase):
 
 
 class GatedTest(unittest.TestCase):
-    def test_setup_closed_gate_never_creates_overlay(self):
+    def test_acceptance_window_is_provider_free_bounded_and_saved_expiry_still_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            with mock.patch.object(host.dash, "require_window", side_effect=host.DashboardError("closed")):
+                cutoff = host.effective_cutoff(root, 30)
+                remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
+                self.assertGreater(remaining, 0)
+                self.assertLessEqual(remaining, 30)
+            path = host.cutoff_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}) + "\n")
+            before = path.read_bytes()
             with mock.patch.object(host.dash, "require_window", side_effect=host.DashboardError("closed")), \
-                    mock.patch.object(host, "build_overlay") as build:
+                    mock.patch.object(host, "build_overlay") as build, \
+                    mock.patch("builtins.print"):
                 with self.assertRaises(host.DashboardError):
                     host.cmd_setup(root)
             build.assert_not_called()
-            self.assertFalse(host.acceptance_root(root).exists())
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(host.operation_lock_path(root).exists())
+
+    def test_check_refuses_expired_saved_namespace_without_schedule_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = host.cutoff_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}) + "\n")
+            with mock.patch.object(host.dash, "require_window", side_effect=host.DashboardError("closed")), \
+                    mock.patch.object(host, "validate_overlay_source", return_value={"readiness": True}), \
+                    mock.patch.object(host.dash, "port_free"), \
+                    mock.patch.object(host, "_dropin_ready", return_value=True), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(host.cmd_check(root), 1)
 
     def test_gated_commands_require_yes(self):
         self.assertEqual(host.main(["setup"]), 1)
@@ -594,27 +618,18 @@ class GatedTest(unittest.TestCase):
             path = host.cutoff_path(root)
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}))
-            with mock.patch.object(host.dash, "require_window", return_value={"stop_at": "2099-01-01T00:00:00+00:00"}):
-                with self.assertRaises(host.AcceptanceError):
-                    host.acceptance_gate(root)
+            with self.assertRaises(host.AcceptanceError):
+                host.acceptance_gate(root)
 
-    def test_closed_canonical_gate_never_creates_allowed_window(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with mock.patch.object(host.dash, "require_window", side_effect=host.DashboardError("closed")):
-                with self.assertRaises(host.DashboardError):
-                    host.acceptance_gate(root)
-            self.assertFalse(host.cutoff_path(root).exists())
-
-    def test_canonical_cutoff_clamps_and_never_extends_saved_cutoff(self):
+    def test_operation_cutoff_is_saved_once_and_never_extended(self):
         from datetime import datetime, timedelta, timezone
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
             later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-            with mock.patch.object(host.dash, "require_window", return_value={"stop_at": first}):
+            with mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat(first)):
                 self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
-            with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
+            with mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat(later)):
                 self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
 
 
@@ -666,8 +681,8 @@ class ContainmentTest(unittest.TestCase):
             foreign.mkdir()
             (root / ".builder").symlink_to(foreign, target_is_directory=True)
             with host._Namespace(host.RUNS_REL / "run-a"), \
-                    mock.patch.object(host.dash, "require_window",
-                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "_operation_stop",
+                                      return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                     mock.patch("builtins.print"):
                 self.assertNotEqual(host.cmd_check(root), 0)
                 for command in (host.cmd_setup, host.cmd_start, host.cmd_stop, host.cmd_status):
@@ -748,8 +763,8 @@ class CallbackBindingTest(unittest.TestCase):
             # ambient namespace is restored; the bound callbacks still target it
             self.assertEqual(host._current_rel(), host.ACCEPTANCE_REL)
             self.assertEqual(bound_rel, host.RUNS_REL / "bind")
-            with mock.patch.object(host.dash, "require_window",
-                                   return_value={"stop_at": "2099-01-01T00:00:00+00:00"}):
+            with mock.patch.object(host, "_operation_stop",
+                                   return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")):
                 gate(root)
             self.assertTrue((root / host.RUNS_REL / "bind" / "cutoff.json").exists())
             self.assertFalse((root / host.ACCEPTANCE_REL).exists())
@@ -769,21 +784,20 @@ class CutoffTest(unittest.TestCase):
                 self.assertEqual(host.cutoff_path(root).read_bytes(), after_first)
                 self.assertEqual(json.loads(after_first)["stop_at"], first.isoformat())
 
-    def test_canonical_and_caller_clamps_are_memory_only(self):
+    def test_operation_and_caller_clamps_are_memory_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with host._Namespace(host.RUNS_REL / "clamp"):
                 first = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
                 later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": first}):
+                with mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat(first)):
                     self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
                 saved = host.cutoff_path(root).read_bytes()
-                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
+                with mock.patch.object(host, "_operation_stop", return_value=datetime.fromisoformat(later)):
                     self.assertEqual(host.acceptance_gate(root)["stop_at"], first)
                 # a smaller caller window can only tighten, never rewrite the file
-                with mock.patch.object(host.dash, "require_window", return_value={"stop_at": later}):
-                    self.assertLess(host.effective_cutoff(root, 5),
-                                    datetime.now(timezone.utc) + timedelta(seconds=10))
+                self.assertLess(host.effective_cutoff(root, 5),
+                                datetime.now(timezone.utc) + timedelta(seconds=10))
                 self.assertEqual(host.cutoff_path(root).read_bytes(), saved)
 
     def test_serialized_capture_under_admission_is_single_and_immutable(self):
@@ -794,10 +808,11 @@ class CutoffTest(unittest.TestCase):
             root = Path(tmp)
             winner = (
                 "import importlib.util, time\n"
+                "from datetime import datetime\n"
                 "spec = importlib.util.spec_from_file_location('h', %r)\n"
                 "h = importlib.util.module_from_spec(spec)\n"
                 "spec.loader.exec_module(h)\n"
-                "h.dash.require_window = lambda r: {'stop_at': %r}\n"
+                "h._operation_stop = lambda r, w=3600: datetime.fromisoformat(%r)\n"
                 "with h._Namespace(h.RUNS_REL / 'race'):\n"
                 "    adm = h.require_admission(%r)\n"
                 "    adm.__enter__()\n"
@@ -836,8 +851,8 @@ class CutoffTest(unittest.TestCase):
             cutoff = root / host.RUNS_REL / "race" / "cutoff.json"
             saved = cutoff.read_bytes()
             with host._Namespace(host.RUNS_REL / "race"), \
-                    mock.patch.object(host.dash, "require_window",
-                                      return_value={"stop_at": later}):
+                    mock.patch.object(host, "_operation_stop",
+                                      return_value=datetime.fromisoformat(later)):
                 admission = host.require_admission(root)
                 admission.__enter__()
                 try:
@@ -854,9 +869,7 @@ class CutoffTest(unittest.TestCase):
                 private_chain(root, *Path(host.RUNS_REL / "expired").parts)
                 path.write_text(json.dumps({"stop_at": "2000-01-01T00:00:00+00:00"}) + "\n")
                 before = path.read_bytes()
-                with mock.patch.object(host.dash, "require_window",
-                                       return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
-                        mock.patch.object(host, "build_overlay") as build, \
+                with mock.patch.object(host, "build_overlay") as build, \
                         mock.patch("builtins.print"):
                     for command in (host.cmd_setup, host.cmd_start):
                         with self.assertRaises(host.AcceptanceError):
@@ -880,8 +893,8 @@ class ActiveNamespaceTest(unittest.TestCase):
             root = Path(tmp)
             with host._Namespace(host.RUNS_REL / "live"):
                 self._runtime(root, {"apiPid": 4242, "apiStart": "55"})
-                with mock.patch.object(host.dash, "require_window",
-                                       return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                with mock.patch.object(host, "_operation_stop",
+                                       return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                         mock.patch.object(host.dash, "pid_identity", return_value="55"), \
                         mock.patch.object(host.dash, "cmd_start") as dash_start, \
                         mock.patch("builtins.print") as out:
@@ -922,8 +935,8 @@ class AdmissionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with host._Namespace(host.RUNS_REL / "shared"), \
-                    mock.patch.object(host.dash, "require_window",
-                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "_operation_stop",
+                                      return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                     mock.patch.object(host, "build_overlay") as build, \
                     mock.patch("builtins.print"):
                 held = host.require_admission(root)
@@ -978,8 +991,8 @@ class StartOverlapTest(unittest.TestCase):
             with host._Namespace(host.RUNS_REL / "ports"), \
                     mock.patch.object(host, "API_PORT", blocked_port), \
                     mock.patch.object(host, "UI_PORT", free_port), \
-                    mock.patch.object(host.dash, "require_window",
-                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "_operation_stop",
+                                      return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                     mock.patch.object(host.dash, "cmd_start") as dash_start, \
                     mock.patch("builtins.print"):
                 with self.assertRaises(host.AcceptanceError):
@@ -993,10 +1006,11 @@ class StartOverlapTest(unittest.TestCase):
             marker = root / "foreground.ready"
             child = (
                 "import importlib.util, time\n"
+                "from datetime import datetime\n"
                 "spec = importlib.util.spec_from_file_location('h', %r)\n"
                 "h = importlib.util.module_from_spec(spec)\n"
                 "spec.loader.exec_module(h)\n"
-                "h.dash.require_window = lambda r: {'stop_at': '2099-01-01T00:00:00+00:00'}\n"
+                "h._operation_stop = lambda r, w=3600: datetime.fromisoformat('2099-01-01T00:00:00+00:00')\n"
                 "h._reserve_ports = lambda: None\n"
                 "def foreground(root, source, profile):\n"
                 "    open(%r, 'w').write('ready')\n"
@@ -1015,8 +1029,8 @@ class StartOverlapTest(unittest.TestCase):
             self.assertTrue(marker.exists())
             # a different namespace cannot start while admission is held
             with host._Namespace(host.RUNS_REL / "run-y"), \
-                    mock.patch.object(host.dash, "require_window",
-                                      return_value={"stop_at": "2099-01-01T00:00:00+00:00"}), \
+                    mock.patch.object(host, "_operation_stop",
+                                      return_value=datetime.fromisoformat("2099-01-01T00:00:00+00:00")), \
                     mock.patch.object(host.dash, "cmd_start") as dash_start, \
                     mock.patch("builtins.print"):
                 self.assertEqual(host.cmd_start(root), 1)

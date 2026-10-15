@@ -387,7 +387,7 @@ def acceptance_profile(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
     Every callback is bound to the namespace selected when the profile was
     built, so a later namespace restore cannot move a running launch.  When
     ``captured_stop`` is given (always from ``start``), it threads the effective
-    caller/canonical cutoff through validation and the gate.
+    caller/saved cutoff through validation and the gate.
     """
     ns = _current_rel()
     state = state_dir(root)
@@ -499,25 +499,26 @@ def read_cutoff(root):
     return stop
 
 
-def _canonical_stop(root):
-    canonical = dash.require_window(root)
-    stop = datetime.fromisoformat(str(canonical["stop_at"]))
-    if stop.tzinfo is None:
-        raise AcceptanceError("canonical cutoff is not timezone-aware")
-    return stop
+def _operation_stop(root):
+    """Return the local maximum cutoff for a provider-free invocation.
+
+    Acceptance is provider-free, so its operation window is local and finite;
+    the general dashboard keeps its separate provider-backed schedule gate.
+    """
+    return datetime.now(timezone.utc) + timedelta(seconds=DEFAULT_WINDOW_S)
 
 
 def effective_cutoff(root, window_s=DEFAULT_WINDOW_S):
     """Effective stop time, computed in memory only.
 
-    A stricter canonical or caller window can only bring the deadline forward;
-    the saved cutoff is never rewritten or extended.
+    The finite caller window and saved cutoff can only bring the deadline
+    forward; the saved cutoff is never rewritten or extended.
     """
-    limit = _canonical_stop(root)
+    if window_s <= 0:
+        raise AcceptanceError("operation window must be positive")
+    stop = min(_operation_stop(root), datetime.now(timezone.utc) + timedelta(seconds=window_s))
     saved = read_cutoff(root)
-    if saved is not None:
-        limit = min(limit, saved)
-    return min(limit, datetime.now(timezone.utc) + timedelta(seconds=window_s))
+    return min(stop, saved) if saved is not None else stop
 
 
 def preflight_expired(root, window_s=DEFAULT_WINDOW_S):
@@ -543,16 +544,16 @@ def acceptance_gate(root, window_s=DEFAULT_WINDOW_S, captured_stop=None):
     """Gate the run, capturing the effective cutoff once.
 
     Without ``captured_stop`` this captures and returns the effective stop
-    (caller window vs canonical vs saved), creating ``cutoff.json`` once.  With
+    (caller window vs saved), creating ``cutoff.json`` once. With
     ``captured_stop`` (the gate callback invoked by the delegated supervisor) it
-    may only tighten against the current canonical and the saved file — it never
+    may only tighten against the current operation window and the saved file — it never
     extends the captured deadline and never rewrites the file.
     """
     root = Path(root)
     if captured_stop is None:
         stop_at = effective_cutoff(root, window_s)  # capture, memory-only clamp
     else:
-        stop_at = min(captured_stop, _canonical_stop(root))
+        stop_at = min(captured_stop, effective_cutoff(root, window_s))
         saved = read_cutoff(root)
         if saved is not None:
             stop_at = min(stop_at, saved)
@@ -1213,7 +1214,8 @@ def cmd_check(root, _argv=None):
         _reject_namespace_symlinks(root)
         validate_overlay_source(root)
         overlay_ready = True
-        dash.require_window(root)
+        if preflight_expired(root):
+            raise AcceptanceError("acceptance cutoff reached; no launch")
         for port in (API_PORT, UI_PORT):
             dash.port_free(port, API_HOST)
         lock = assert_private_path(root, acceptance_root(root) / "dashboard.lock")
@@ -1309,7 +1311,7 @@ def cmd_start(root, _argv=None):
                               "reason": "namespace active"}))
             return 1
         _reserve_ports()  # both ports checked under admission
-        # Capture the effective caller/canonical cutoff once, under admission,
+        # Capture the effective caller/saved cutoff once, under admission,
         # and thread it through validation so slow work cannot overrun it.
         captured = acceptance_gate(root, window_s)
         captured_stop = datetime.fromisoformat(captured["stop_at"])

@@ -55,17 +55,19 @@ setup cannot race a start of the same run. Both loopback ports are checked under
 admission, and a run whose namespace already records a live child refuses
 overlap. An expired run is refused by a **read-only** preflight before any lock
 or state write, then revalidated under admission: `cutoff.json` is created
-**once**, exclusively, under admission and is never rewritten; stricter canonical
-or caller limits are computed in memory only, and `check` never captures a
-cutoff.
+**once**, exclusively, under admission and is never rewritten; stricter caller
+limits are computed in memory only, and `check` never captures a cutoff. This
+host uses a provider-free local window capped at one hour (or a smaller
+`--deadline`) because its acceptance profile has autonomy disabled and has no
+provider credentials. The general dashboard retains its separate
+provider-backed schedule gate.
 
-`start` captures the effective cutoff (caller window vs current canonical vs
-saved) **once** under admission and threads that exact stop through the source
-validator, `launch_deadline`, `launch_problems` and every profile callback. Slow
-source validation is therefore bounded by the shorter of the caller deadline and
-the canonical window even when a longer cutoff was already saved — the saved file
-is never rewritten and the delegated supervisor's gate callback can only tighten
-against the current canonical, never extend the captured deadline.
+`start` captures the effective cutoff (caller window vs saved) **once** under
+admission and threads that exact stop through the source validator,
+`launch_deadline`, `launch_problems` and every profile callback. Slow source
+validation is bounded by the caller deadline even when a longer cutoff was
+already saved. The saved file is never rewritten, and the delegated
+supervisor's gate callback can only tighten the captured deadline.
 
 ## Private copy and provenance
 
