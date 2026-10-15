@@ -24,8 +24,9 @@ Guarantees:
   * the owned build group is stopped (nonzero) if available RAM falls below the
     project floor or becomes unreadable, checked before launch and sampled at a
     fixed bounded interval while the child runs;
-  * every expensive stage is gated by the canonical off-peak coding window and
-    runs in its own supervised process group bounded by the shared cutoff;
+  * source/toolchain bootstrap remains behind the canonical off-peak gate;
+    ordinary builds use one bounded caller deadline and run in their own
+    supervised process group;
   * a successful build is build provenance only.  It does NOT qualify the model
     or toolset, does not run the host, a model, a turn or any service.
 """
@@ -92,6 +93,9 @@ LOG_LIMIT_BYTES = 4 * 1024 * 1024
 PROBE_TIMEOUT_SECONDS = 30  # bounded read-only git probes outside a gated stage
 STOP_MARGIN_SECONDS = 5  # reserve room for cleanup before the immutable cutoff
 CLEANUP_GRACE_SECONDS = 3  # TERM-to-KILL window, never allowed past the cutoff
+DEFAULT_OPERATION_LIMIT_SECONDS = 3600
+MAX_OPERATION_LIMIT_SECONDS = 7200
+MIN_OPERATION_LIMIT_SECONDS = STOP_MARGIN_SECONDS + 1
 MANIFEST_MAX_BYTES = 8 * 1024 * 1024  # bounded official manifest / sidecar download
 ARCHIVE_MAX_DOWNLOAD_BYTES = 2 * 1024 ** 3  # bounded toolchain archive download
 ARCHIVE_MAX_MEMBERS = 200000
@@ -235,7 +239,7 @@ def enforce_gate(now=None):
 
 
 def gate_cutoff():
-    """The immutable off-peak cutoff every expensive stage shares."""
+    """The canonical off-peak cutoff for the gated source/toolchain commands."""
     decision = enforce_gate()
     deadline = decision.get("stop_at")
     if not deadline:
@@ -243,25 +247,39 @@ def gate_cutoff():
     return deadline
 
 
+def operation_deadline(caller_limit_seconds=DEFAULT_OPERATION_LIMIT_SECONDS, now=None):
+    """Capture a bounded provider-free operation deadline without consulting the gate."""
+    if (isinstance(caller_limit_seconds, bool) or
+            not isinstance(caller_limit_seconds, int) or
+            not (MIN_OPERATION_LIMIT_SECONDS <= caller_limit_seconds <=
+                 MAX_OPERATION_LIMIT_SECONDS)):
+        raise SetupError("caller limit must be %d..%d seconds" % (
+            MIN_OPERATION_LIMIT_SECONDS, MAX_OPERATION_LIMIT_SECONDS), code=75)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(now, dt.datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise SetupError("operation deadline requires a timezone-aware clock", code=75)
+    return (now + dt.timedelta(seconds=caller_limit_seconds)).astimezone(dt.timezone.utc).isoformat()
+
+
 def parse_cutoff(deadline):
     """Epoch seconds for a strict, timezone-aware, finite cutoff; else refuse.
 
     Every expensive stage (network read or subprocess) must be bounded by a
-    cutoff that is present, well formed, timezone-aware and finite.  A missing,
+    deadline that is present, well formed, timezone-aware and finite. A missing,
     naive, malformed or non-finite value is refused *before* any subprocess or
-    network read starts, so work can never run unbounded or past the window.
+    network read starts, so work can never run unbounded or past its deadline.
     """
     if not isinstance(deadline, str) or not deadline.strip():
-        raise SetupError("missing off-peak cutoff; refusing to start work", code=75)
+        raise SetupError("missing operation deadline; refusing to start work", code=75)
     try:
         parsed = dt.datetime.fromisoformat(deadline)
     except (TypeError, ValueError):
-        raise SetupError("malformed off-peak cutoff; refusing to start work", code=75)
+        raise SetupError("malformed operation deadline; refusing to start work", code=75)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise SetupError("naive off-peak cutoff; refusing to start work", code=75)
+        raise SetupError("naive operation deadline; refusing to start work", code=75)
     epoch = parsed.timestamp()
     if not math.isfinite(epoch):
-        raise SetupError("non-finite off-peak cutoff; refusing to start work", code=75)
+        raise SetupError("non-finite operation deadline; refusing to start work", code=75)
     return epoch
 
 
@@ -269,7 +287,7 @@ def require_future_cutoff(deadline, margin=1):
     """Return the cutoff epoch only if it is still ahead of ``margin`` seconds."""
     epoch = parse_cutoff(deadline)
     if epoch - time.time() <= margin:
-        raise SetupError("off-peak cutoff expired; refusing to start work", code=75)
+        raise SetupError("operation deadline expired; refusing to start work", code=75)
     return epoch
 
 
@@ -282,7 +300,7 @@ def time_budget(deadline, cap):
     """Fresh seconds left before the immutable cutoff, capped, expired refuses."""
     seconds = parse_cutoff(deadline) - time.time()
     if seconds <= 1:
-        raise SetupError("off-peak deadline reached; refusing to start work", code=75)
+        raise SetupError("operation deadline reached; refusing to start work", code=75)
     return max(1.0, min(seconds, cap))
 
 
@@ -331,7 +349,7 @@ def _within(target, base):
 
 def _deadline_ok(deadline, action):
     if deadline is not None and past_deadline(deadline):
-        raise SetupError("off-peak deadline reached %s; refusing" % action, code=75)
+        raise SetupError("operation deadline reached %s; refusing" % action, code=75)
 
 
 def validate_archive_members(archive, dest, deadline=None):
@@ -737,7 +755,7 @@ def absolute_work_deadline(deadline, operation):
     started = time.monotonic()
 
     def expired(signum, frame):
-        raise SetupError("off-peak %s deadline reached" % operation, code=75)
+        raise SetupError("operation deadline reached during %s" % operation, code=75)
 
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL,
@@ -794,10 +812,10 @@ def fetch(url, dest, deadline=None, cap=300, max_bytes=None):
             _checked_url(response.geturl())  # final URL after any transport step
             while True:
                 if past_deadline(deadline):
-                    raise SetupError("off-peak deadline reached during download: %s" % url, code=75)
+                    raise SetupError("operation deadline reached during download: %s" % url, code=75)
                 chunk = response.read(1024 * 1024)
                 if past_deadline(deadline):
-                    raise SetupError("off-peak deadline reached during download", code=75)
+                    raise SetupError("operation deadline reached during download", code=75)
                 if not chunk:
                     break
                 total += len(chunk)
@@ -812,7 +830,7 @@ def fetch(url, dest, deadline=None, cap=300, max_bytes=None):
         raise SetupError("download failed: %s (%s)" % (url, error), code=1)
     if past_deadline(deadline):
         tmp.unlink(missing_ok=True)
-        raise SetupError("off-peak deadline reached before download publication", code=75)
+        raise SetupError("operation deadline reached before download publication", code=75)
     os.replace(tmp, dest)
     return dest
 
@@ -857,7 +875,7 @@ def _ensure_archive(url, dest, sha256=None, deadline=None, root=None, max_bytes=
         dest.unlink()  # unverified / tampered cache is never accepted
     parse_cutoff(deadline)  # refuse invalid/missing/expired cutoff before the network
     if past_deadline(deadline):
-        raise SetupError("off-peak deadline reached before download: %s" % url, code=75)
+        raise SetupError("operation deadline reached before download: %s" % url, code=75)
     fetch(url, dest, deadline=deadline, max_bytes=max_bytes)
     if sha256 and not verify_sha256(dest, sha256):
         raise SetupError("download failed SHA256 verification: %s" % url, code=1)
@@ -1116,7 +1134,7 @@ def ensure_toolchain(root, deadline):
         root, RUST_MANIFEST_URL, cache_dir(root) / ("channel-rust-%s.toml" % RUST_VERSION), deadline)
     url, expected = parse_channel_manifest(manifest.read_text())
     if past_deadline(deadline):
-        raise SetupError("off-peak deadline reached before toolchain install; refusing", code=75)
+        raise SetupError("operation deadline reached before toolchain install; refusing", code=75)
     archive = _ensure_archive(url, cache_dir(root) / Path(urllib.parse.urlparse(url).path).name,
                               sha256=expected, deadline=deadline, root=root,
                               max_bytes=ARCHIVE_MAX_DOWNLOAD_BYTES)
@@ -1509,13 +1527,13 @@ def record_build_attempt(root, deadline, outcome, code):
     return True
 
 
-def command_build(root):
+def command_build(root, caller_limit_seconds=DEFAULT_OPERATION_LIMIT_SECONDS):
     require_platform()
     with setup_lock(root):
-        outcome = {"stage": "gate"}
+        outcome = {"stage": "deadline"}
         deadline = None
         try:
-            deadline = gate_cutoff()
+            deadline = operation_deadline(caller_limit_seconds)
             outcome["stage"] = "toolchain"
             cargo = ensure_toolchain(root, deadline=deadline)
             assert_private(root, cargo_home(root), "cargo home")
@@ -1575,11 +1593,21 @@ def command_build(root):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=["status", "source", "toolchain", "build"])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "source", "toolchain"):
+        commands.add_parser(name)
+    build_parser = commands.add_parser("build")
+    build_parser.add_argument("--caller-limit-seconds", type=int,
+                              default=DEFAULT_OPERATION_LIMIT_SECONDS,
+                              choices=range(MIN_OPERATION_LIMIT_SECONDS,
+                                            MAX_OPERATION_LIMIT_SECONDS + 1),
+                              help="build operation budget (default: %(default)s)")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        if args.command == "build":
+            return command_build(ROOT, args.caller_limit_seconds)
         return {"status": command_status, "source": command_source,
-                "toolchain": command_toolchain, "build": command_build}[args.command](ROOT)
+                "toolchain": command_toolchain}[args.command](ROOT)
     except SetupError as error:
         print("native-host: %s" % error, file=sys.stderr)
         return error.code

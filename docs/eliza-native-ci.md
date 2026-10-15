@@ -7,10 +7,11 @@ evidence.
 
 ## Status
 
-**Authored and unrun.** No Rust build, service, inference or network call was
-made while authoring this task. The heavy job is deliberately refused until the
-reviewed stop-receipt fix is present in the accepted source (it now is) and
-independently accepted and integrated. The runtime guard remains false and main
+**No qualification result is claimed.** Hosted run `38717087713` on `a54f491`
+was refused at the wrapper's former off-peak check before compilation or tests;
+its receipt records no child status. This revision removes that provider-free
+scheduling dependency and retains the caller deadline, resource floors,
+supervised cleanup and receipt checks. The runtime guard remains false and main
 is unchanged.
 
 ## Files
@@ -48,11 +49,14 @@ is unchanged.
    filtered environment. Every token, provider key and `GITHUB_*` value is
    dropped; merely computing a filtered dict would not isolate a helper.
 3. **Mechanical prerequisite.** The accepted `native-host.py` must expose
-   `record_build_attempt` and a `run_supervised` that accepts `outcome`. Absence
-   is a refusal *before* any heavy setup; no gate, preflight or build runs.
-4. **One immutable deadline.** A single deadline =
-   `min(canonical off-peak cutoff, caller limit, default 3600s)` is captured once
-   and passed to every stage. Any gate override is restored in `finally`.
+   `operation_deadline`, `record_build_attempt` and a `run_supervised` that
+   accepts `outcome`. Absence is a refusal *before* any heavy setup; no
+   preflight or build runs.
+4. **One immutable provider-free deadline.** A single deadline is captured from
+   the caller limit (default 3600 seconds, accepted range 6–7200) and passed to
+   every stage. The qualification wrapper does not consult the DeepSeek off-peak
+   schedule or replace the gate function. Its stage/resource bounds, parent-loss
+   cleanup and native-admission guard remain in force.
 5. **Resource preflight.** The accepted 3 GiB RAM / 12 GiB disk floors are
    checked before heavy work; an unknown reading fails closed. No broad disk
    cleanup is performed.

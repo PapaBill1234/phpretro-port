@@ -48,6 +48,15 @@ The G06 `proc <X> dead` terminate-group assertion repair (`2ac672d`) is **test-o
 
 The native provider now captures one deadline before metadata and caps its subprocesses and account/thread/turn RPCs by the remaining budget. Five seconds are reserved from the gate for normal cleanup; a short caller timeout remains usable. Forty-three generator tests pass, including capped metadata arguments and no subprocess launch after expiry. Hard-parent cleanup and the complete native tool-registry proof remain unqualified, so generation stays blocked.
 
+**2026-10-15 provider-free build scheduling:** the native `build` command and
+hosted qualification now capture one bounded caller deadline, independent of
+the DeepSeek off-peak schedule. The standalone `source`/`toolchain` preparation
+commands retain their existing gate. RAM/disk preflight, source/patch/lock
+provenance, supervised process-group cleanup and `native_admission=false` are
+unchanged. Hosted run `38717087713` on `a54f491` was refused by the old wrapper
+gate before compilation or tests; this change has not yet had a hosted run.
+Compiled qualification remains unverified and G05 stays Partial.
+
 ## Entry update format
 
 For each completed slice append: task/issue ID; exact changed behavior; source/reference revision; checks run and results; commit/PR; remaining limitation; status (`missing`, `partial`, `verified`, `blocked-external`). A passing mock or a code-text assertion cannot close an integration gap. Store verbose test artifacts privately or in a sanitized evidence index rather than pasting transcripts here.

@@ -87,6 +87,9 @@ class FakeHost:
         self._prep_log_text = prep_log_text
         self._gate_calls = 0
         self._gate_cutoff_calls = 0
+        self._operation_deadline_calls = 0
+        self._caller_limit_seconds = None
+        self._gate_closed = False
 
         self.ROOT = self.tmp / "root"
         self.ROOT.mkdir(parents=True, exist_ok=True)
@@ -112,8 +115,15 @@ class FakeHost:
         return self._provenance
 
     # --- attributes the wrapper uses ---
+    def operation_deadline(self, caller_limit_seconds):
+        self._operation_deadline_calls += 1
+        self._caller_limit_seconds = caller_limit_seconds
+        return future_iso(caller_limit_seconds)
+
     def gate_cutoff(self):
         self._gate_cutoff_calls += 1
+        if self._gate_closed:
+            raise FakeSetupError("off-peak gate closed; refusing")
         return future_iso(7200)
 
     def private_root(self, root):
@@ -319,39 +329,29 @@ class EnvFilteringTests(unittest.TestCase):
 
 
 class DeadlineTests(unittest.TestCase):
-    def test_deadline_is_min_of_canonical_and_caller(self):
-        now = dt.datetime.now(dt.timezone.utc)
-        canonical = (now + dt.timedelta(seconds=1800)).isoformat()
-        deadline = ci.capture_deadline(canonical, 3600, now=now)
-        epoch = ci.parse_iso_epoch(deadline)
-        self.assertAlmostEqual(epoch, now.timestamp() + 1800, delta=2)
+    def test_operation_deadline_is_bounded_by_caller_limit(self):
+        now = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.timezone.utc)
+        deadline = real_host.operation_deadline(120, now=now)
+        self.assertEqual(real_host.parse_cutoff(deadline), now.timestamp() + 120)
 
-    def test_caller_limit_wins_when_shorter(self):
-        now = dt.datetime.now(dt.timezone.utc)
-        canonical = (now + dt.timedelta(seconds=9000)).isoformat()
-        deadline = ci.capture_deadline(canonical, 3600, now=now)
-        self.assertAlmostEqual(ci.parse_iso_epoch(deadline), now.timestamp() + 3600, delta=2)
+    def test_operation_deadline_rejects_out_of_range_and_naive_clock(self):
+        now = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.timezone.utc)
+        for seconds in (0, 5, 7201, True, "120"):
+            with self.subTest(seconds=seconds), self.assertRaises(real_host.SetupError):
+                real_host.operation_deadline(seconds, now=now)
+        with self.assertRaises(real_host.SetupError):
+            real_host.operation_deadline(120, now=now.replace(tzinfo=None))
 
-    def test_expired_deadline_refused(self):
-        now = dt.datetime.now(dt.timezone.utc)
-        canonical = (now + dt.timedelta(seconds=10)).isoformat()
-        with self.assertRaises(ci.Refusal):
-            ci.capture_deadline(canonical, 1, now=now)
-
-    def test_naive_deadline_refused(self):
-        with self.assertRaises(ci.Refusal):
-            ci.capture_deadline("2026-10-14T00:00:00", 3600)
-
-    def test_scoped_gate_cutoff_restores_on_exception(self):
+    def test_scoped_operation_deadline_restores_on_exception(self):
         class H:
-            def gate_cutoff(self):
+            def operation_deadline(self, _seconds=3600):
                 return "original"
         host = H()
         with self.assertRaises(RuntimeError):
-            with ci.scoped_gate_cutoff(host, "forced"):
-                self.assertEqual(host.gate_cutoff(), "forced")
+            with ci.scoped_operation_deadline(host, "forced"):
+                self.assertEqual(host.operation_deadline(10), "forced")
                 raise RuntimeError("boom")
-        self.assertEqual(host.gate_cutoff(), "original")
+        self.assertEqual(host.operation_deadline(), "original")
 
 
 class PrerequisiteTests(unittest.TestCase):
@@ -366,6 +366,16 @@ class PrerequisiteTests(unittest.TestCase):
     def test_fake_host_with_api_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(ci.check_prerequisite(FakeHost(tmp)), [])
+
+    def test_missing_operation_deadline_refuses_before_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = FakeHost(tmp)
+            host.operation_deadline = None
+            qualified, receipt, reason = ci.run_qualification(host)
+            self.assertFalse(qualified)
+            self.assertIn("operation_deadline", reason)
+            self.assertEqual(receipt["failure"]["stage"], "prerequisite")
+            self.assertEqual(host.calls, [])
 
     def test_refusal_when_prerequisite_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -748,7 +758,8 @@ class ArtifactAllowlistTests(unittest.TestCase):
 
 
 class OrchestrationFixtureTests(unittest.TestCase):
-    def _run(self, host, tmp, patch_dir, prod_manifest, test_manifest, lock_digest):
+    def _run(self, host, tmp, patch_dir, prod_manifest, test_manifest, lock_digest,
+             caller_limit_seconds=ci.CALLER_LIMIT_SECONDS):
         host.LOCK_BUILD_SHA256 = lock_digest
         with patch.object(ci, "PATCH_DIR", patch_dir), \
              patch.object(ci, "PRODUCTION_PATCH", prod_manifest), \
@@ -758,9 +769,9 @@ class OrchestrationFixtureTests(unittest.TestCase):
                 entry["file"]: {rel: _content_for(rel, entry["file"])
                                 for rel in entry["targets"]}
                 for entry in test_manifest}
-            return ci.run_qualification(host)
+            return ci.run_qualification(host, caller_limit_seconds=caller_limit_seconds)
 
-    def test_qualified_run_uses_one_deadline_and_records_results(self):
+    def test_qualified_run_uses_one_caller_deadline_even_when_peak_gate_is_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
             # Non-empty build/prepare logs must never surface on a qualified run.
@@ -770,6 +781,7 @@ class OrchestrationFixtureTests(unittest.TestCase):
             # Production target already present; test patches rewrite targets.
             host._build = build
             host._test_output = passing_output(ci.EXPECTED_TESTS)
+            host._gate_closed = True
             qualified, receipt, reason = self._run(host, tmp, patch_dir, prod, test_manifest,
                                                    lock_digest)
             self.assertTrue(qualified, reason)
@@ -780,6 +792,9 @@ class OrchestrationFixtureTests(unittest.TestCase):
             stages = [c for c in host.calls if c[0] == "run_supervised"]
             self.assertEqual([s[1] for s in stages], ["supervise", "prepare-tests", "offline-tests"])
             self.assertEqual(len({s[2] for s in stages}), 1)
+            self.assertEqual(host._operation_deadline_calls, 1)
+            self.assertEqual(host._caller_limit_seconds, ci.CALLER_LIMIT_SECONDS)
+            self.assertEqual(host._gate_cutoff_calls, 0)
             self.assertTrue(all(s[3] == host.RAM_MIN_AVAILABLE_BYTES for s in stages))
             # Patches applied strictly in the reviewed order, four of them.
             self.assertEqual(host.applied, [e["file"] for e in test_manifest])
@@ -861,13 +876,24 @@ class OrchestrationFixtureTests(unittest.TestCase):
             self.assertFalse(qualified)
             self.assertIn("unexpected", reason)
 
-    def test_gate_cutoff_restored_after_run(self):
+    def test_qualified_run_forwards_short_caller_limit_to_all_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
             patch_dir, prod, test_manifest, build, lock_digest = make_synthetic_patches(tmp)
-            host = FakeHost(tmp, build_code=1, patch_dir=patch_dir)
+            host = FakeHost(tmp, patch_dir=patch_dir)
             host._build = build
-            self._run(host, tmp, patch_dir, prod, test_manifest, lock_digest)
-            self.assertEqual(host._gate_cutoff_calls, 1)  # restored, not re-queried
+            host._test_output = passing_output(ci.EXPECTED_TESTS)
+            started = dt.datetime.now(dt.timezone.utc).timestamp()
+            qualified, _receipt, reason = self._run(
+                host, tmp, patch_dir, prod, test_manifest, lock_digest,
+                caller_limit_seconds=60)
+            self.assertTrue(qualified, reason)
+            self.assertEqual(host._operation_deadline_calls, 1)
+            self.assertEqual(host._caller_limit_seconds, 60)
+            deadlines = [call[2] for call in host.calls if call[0] == "run_supervised"]
+            self.assertEqual(len(set(deadlines)), 1)
+            self.assertLessEqual(ci.dt.datetime.fromisoformat(deadlines[0]).timestamp(),
+                                 started + 62)
+            self.assertEqual(host._gate_cutoff_calls, 0)
 
     def test_prepare_tests_failure_records_truthful_non_compile_scope(self):
         with tempfile.TemporaryDirectory() as tmp:

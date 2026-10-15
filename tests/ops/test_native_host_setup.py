@@ -315,6 +315,23 @@ class ArchivesAndPaths(unittest.TestCase):
 
 
 class StrictCutoff(unittest.TestCase):
+    def test_operation_deadline_is_caller_bounded_and_timezone_aware(self):
+        now = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.timezone.utc)
+        deadline = host.operation_deadline(90, now=now)
+        self.assertEqual(host.parse_cutoff(deadline), now.timestamp() + 90)
+        for invalid in (0, host.STOP_MARGIN_SECONDS, host.MAX_OPERATION_LIMIT_SECONDS + 1,
+                        True, "90"):
+            with self.subTest(invalid=invalid), self.assertRaises(host.SetupError):
+                host.operation_deadline(invalid, now=now)
+        with self.assertRaises(host.SetupError):
+            host.operation_deadline(90, now=now.replace(tzinfo=None))
+
+    def test_deepseek_offpeak_gate_still_refuses_closed_window(self):
+        with patch.object(host, "gate_decision",
+                          return_value={"allowed": False, "reason": "peak_or_buffer"}):
+            with self.assertRaisesRegex(host.SetupError, "off-peak gate closed"):
+                host.enforce_gate()
+
     def test_invalid_cutoffs_refused(self):
         for bad in (None, "", "not-a-time", "2026-01-01T00:00:00",            # naive / malformed
                     expired_deadline(), 42, "  "):
@@ -872,6 +889,11 @@ checksum = "unchanged"
 
 
 class BuildContract(unittest.TestCase):
+    def test_cli_forwards_build_caller_limit(self):
+        with patch.object(host, "command_build", return_value=0) as command:
+            self.assertEqual(host.main(["build", "--caller-limit-seconds", "75"]), 0)
+        command.assert_called_once_with(host.ROOT, 75)
+
     def test_build_uses_nested_cargo_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -896,13 +918,14 @@ class BuildContract(unittest.TestCase):
             compiler.chmod(0o700)
             patch_path = root / "reviewed.patch"
             patch_path.write_text("controlled patch")
-            deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)).isoformat()
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", wraps=host.operation_deadline) as deadline_capture, \
+                    patch.object(host, "gate_cutoff", side_effect=AssertionError("build consulted DeepSeek gate")), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
                     patch.object(host, "LOCK_BUILD_SHA256", hashlib.sha256(b"fixture lock").hexdigest()):
-                self.assertEqual(host.command_build(root), 0)
+                self.assertEqual(host.command_build(root, caller_limit_seconds=120), 0)
+                deadline_capture.assert_called_once_with(120)
                 # A successful build writes real provenance, never a failure receipt.
                 self.assertFalse((host.logs_dir(root) / host.BUILD_ATTEMPT_NAME).exists())
                 # The real subprocess proves the actual argv and profile env it
@@ -923,7 +946,7 @@ class BuildContract(unittest.TestCase):
                                  host.build_profile_contract())
                 compiler.write_text(compiler.read_text() + 'Path("Cargo.lock").write_bytes(b"tampered")\n')
                 with self.assertRaisesRegex(host.SetupError, "lockfile changed"):
-                    host.command_build(root)
+                    host.command_build(root, caller_limit_seconds=120)
                 self.assertEqual(host.load_provenance(root), recorded)
             self.assertEqual((host.target_dir(root) / "release" / "codex").read_bytes(),
                              b"controlled-build-result")
@@ -1001,7 +1024,7 @@ class BuildContract(unittest.TestCase):
                     yield 1  # then drops below the floor
 
             seq = readings()
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1037,7 +1060,7 @@ class BuildContract(unittest.TestCase):
             patch_path = root / "reviewed.patch"
             patch_path.write_text("controlled patch")
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1072,7 +1095,7 @@ class BuildContract(unittest.TestCase):
             root = Path(directory)
             build, compiler, patch_path = self._build_fixture(root, "unused")
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1094,7 +1117,7 @@ class BuildContract(unittest.TestCase):
             build, compiler, patch_path = self._build_fixture(
                 root, '#!' + sys.executable + '\npass\n')
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1112,7 +1135,7 @@ class BuildContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", side_effect=host.SetupError("no toolchain")):
                 with self.assertRaises(host.SetupError):
                     host.command_build(root)
@@ -1129,7 +1152,7 @@ class BuildContract(unittest.TestCase):
             root = Path(directory)
             build, compiler, patch_path = self._build_fixture(root, "unused")
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1152,7 +1175,7 @@ class BuildContract(unittest.TestCase):
             build, compiler, patch_path = self._build_fixture(root, "unused")
             (host.logs_dir(root) / "build.log").mkdir(parents=True)  # a dir cannot be opened
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=compiler), \
                     patch.object(host, "prepare_build", return_value=(build, patch_path, "a" * 64)), \
                     patch.object(host, "preflight_resources", return_value={"fixture": True}), \
@@ -1170,7 +1193,7 @@ class BuildContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             deadline = future_deadline(30)
-            with patch.object(host, "gate_cutoff", return_value=deadline), \
+            with patch.object(host, "operation_deadline", return_value=deadline), \
                     patch.object(host, "ensure_toolchain", return_value=root / "cargo"), \
                     patch.object(host, "prepare_build", side_effect=OSError("io-secret")):
                 with self.assertRaises(OSError):

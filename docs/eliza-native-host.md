@@ -52,6 +52,7 @@ python3 scripts/native-host.py status
 python3 scripts/native-host.py source
 python3 scripts/native-host.py toolchain
 python3 scripts/native-host.py build
+python3 scripts/native-host.py build --caller-limit-seconds 900
 ```
 
 - **status** is read-only and truthful. It reports the source pin versus the
@@ -78,6 +79,9 @@ python3 scripts/native-host.py build
   The Cargo cache/target are private and the environment is built from scratch
   (no inherited provider or cloud credential, no account or OAuth copy), with
   the fixed low-memory release profile described below.
+  Builds run under a caller-bounded operation deadline, independent of the
+  DeepSeek off-peak schedule; the default is 3600 seconds and the accepted range
+  is 6–7200 seconds.
 
 ## Reviewed public patch (read-only dependency)
 
@@ -103,17 +107,17 @@ Downloads follow no redirect and use no ambient proxy, the final URL/scheme is
 re-checked, manifest/sidecar and archive downloads are byte-bounded while
 reading, and both manifest and archive bytes/hashes are recorded.
 
-## Bounds, gate and cleanup
+## Bounds, scheduling and cleanup
 
-All expensive stages (`source`, `toolchain`, `build`) require the canonical
-off-peak gate and share one captured cutoff; work is refused while peak or
-without a verified cutoff. Every costly path parses the cutoff strictly and
-refuses a **missing, naive, malformed, non-finite or expired** value *before*
-any subprocess or network read, so no workload can run unbounded or past the
-window. The cutoff is immutable: each stage recomputes its own remaining budget
-from the same value and never extends it. Read-only `status` needs no cutoff and
-still reports truthfully without dispatch (its git probes use a fixed bounded
-probe timeout, never a naive `None` cap on a costly step).
+The `source` and `toolchain` preparation commands remain behind the canonical
+off-peak gate. The ordinary `build` command does not consult that DeepSeek
+schedule: it captures one timezone-aware deadline from its caller limit (default
+3600 seconds, accepted range 6–7200), then passes that same deadline through
+toolchain/source preparation and the build. Every costly path validates the
+deadline before subprocess or network work and recomputes remaining time from
+that immutable value; it cannot extend the operation. Read-only `status` needs
+no deadline and still reports truthfully without dispatch (its git probes use a
+fixed bounded probe timeout, never a naive `None` cap on a costly step).
 
 Subprocesses run in their own supervised session. The cancellation handlers are
 installed **before** the child is launched, so a startup signal cannot orphan it;
@@ -133,11 +137,13 @@ the original captured cutoff and restores an enclosing alarm's handler and
 remaining time without extending it. An interrupted extraction cleans private
 temporary files before any installer runs or toolchain provenance is recorded.
 
-The gate comes from `scripts/coding-window.py`, which this worker does not commit
-or edit (it is owned by the integration branch and fails closed if absent). Every
-delete or install asserts its target stays inside `.builder/native-host` and
-crosses no symlinked ancestor. One `fcntl` advisory lock guards each step. If the
-budget stops mid-run, the worktree checkpoints at the precise stage (`source`,
+The preparation-command gate comes from `scripts/coding-window.py`, which this
+worker does not commit or edit (it is owned by the integration branch and fails
+closed if absent). The build keeps all containment, provenance, resource, and
+supervised process-group checks independently of that schedule. Every delete or
+install asserts its target stays inside `.builder/native-host` and crosses no
+symlinked ancestor. One `fcntl` advisory lock guards each step. If the budget
+stops mid-run, the worktree checkpoints at the precise stage (`source`,
 `toolchain` or `build`).
 
 ## Acceptance status
@@ -258,8 +264,8 @@ re-raised unchanged and its text is never copied. Callers that pass no `outcome`
 are unchanged.
 
 `build` persists a bounded, sanitized receipt of the last **failed** attempt at
-`.builder/native-host/logs/build-last-attempt.json`: captured cutoff, failing
-stage (`gate`/`toolchain`/`prepare`/`preflight`/`supervise`/`postcheck`), exit,
+`.builder/native-host/logs/build-last-attempt.json`: captured deadline, failing
+stage (`deadline`/`toolchain`/`prepare`/`preflight`/`supervise`/`postcheck`), exit,
 compiler-child status, compiler cleanup state, stop reason, the measured/floor
 RAM values and the current fixed profile. The compiler-child fields are scoped:
 only the `supervise` (compile) stage reports them, and any other stage reports

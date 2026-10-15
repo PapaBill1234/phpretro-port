@@ -2,12 +2,10 @@
 """Bounded push-only CI wrapper for the Eliza native text-host qualification.
 
 This wrapper turns the source-only startup/registry/adversarial test patches into
-a single gated CI job.  It does **not** re-implement any native-host logic: it
+a bounded hosted job. It does **not** re-implement any native-host logic: it
 loads the accepted, reviewed `scripts/native-host.py` and drives its public
-functions under one captured deadline.  At authoring time the heavy job is
-**not launched**: the stop-receipt prerequisite is a separate, accepted-but-not-
-yet-integrated fix, so the wrapper refuses before any heavy setup until the
-reviewed `record_build_attempt` API is present in the accepted source.
+functions under one captured caller deadline. Qualification remains unverified
+until the hosted compile and exact test-result checks succeed.
 
 Contract enforced here
 ----------------------
@@ -26,8 +24,9 @@ Contract enforced here
   `compiler_cleanup` / `stop_reason` and measured RAM), never a fabricated child
   cleanup, and an `OSError` still yields a truthful failure artifact with no
   exception text.
-* One deadline = min(canonical off-peak cutoff, caller limit) is captured once
-  and passed to every stage.  Any gate override is restored in `finally`.
+* One provider-free operation deadline is captured once from the caller limit
+  and passed to every stage. The wrapper does not consult the DeepSeek coding
+  window; subprocess, resource and cleanup bounds still apply.
 * Production build first (unchanged source, locked repair, accepted profile),
   then **only** the four reviewed public test patches in order
   (qualification-tests, qualification-registry, qualification-adversarial,
@@ -80,7 +79,8 @@ HOST_PATH = HERE / "native-host.py"
 PATCH_DIR = ROOT / "builder" / "eliza" / "native-host"
 
 CALLER_LIMIT_SECONDS = 3600  # CI caller budget; job timeout is 90 minutes
-MIN_FUTURE_MARGIN = 5  # seconds of slack required on the captured deadline
+MIN_CALLER_LIMIT_SECONDS = 6  # five-second cleanup margin plus one second to start
+MAX_CALLER_LIMIT_SECONDS = 7200
 ARTIFACT_DIR = ROOT / ".builder" / "native-host-ci" / "artifact"
 RECEIPT_NAME = "qualification-receipt.json"
 COMPILER_SCOPE = "supervise"  # the accepted scope where the compiler child runs
@@ -293,33 +293,11 @@ class child_environment:
         return False
 
 
-def parse_iso_epoch(value):
-    """Strict, timezone-aware, finite ISO cutoff epoch; else refuse."""
-    if not isinstance(value, str) or not value.strip():
-        raise Refusal("missing canonical cutoff; refusing")
-    try:
-        parsed = dt.datetime.fromisoformat(value)
-    except ValueError:
-        raise Refusal("malformed canonical cutoff; refusing")
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise Refusal("naive canonical cutoff; refusing")
-    return parsed.timestamp()
-
-
-def capture_deadline(canonical, caller_limit_seconds=CALLER_LIMIT_SECONDS, now=None):
-    """The single immutable deadline: min(canonical cutoff, now + caller limit)."""
-    now = now or dt.datetime.now(dt.timezone.utc)
-    canonical_epoch = parse_iso_epoch(canonical)
-    caller_epoch = now.timestamp() + caller_limit_seconds
-    deadline = min(canonical_epoch, caller_epoch)
-    if deadline - now.timestamp() <= MIN_FUTURE_MARGIN:
-        raise Refusal("captured deadline is not in the future; refusing", code=75)
-    return dt.datetime.fromtimestamp(deadline, dt.timezone.utc).isoformat()
-
-
 def check_prerequisite(host):
-    """Mechanical, read-only check that the accepted stop-receipt API exists."""
+    """Check the accepted bounded-operation and stop-receipt APIs."""
     missing = []
+    if not callable(getattr(host, "operation_deadline", None)):
+        missing.append("operation_deadline")
     if not callable(getattr(host, "record_build_attempt", None)):
         missing.append("record_build_attempt")
     run_supervised = getattr(host, "run_supervised", None)
@@ -333,6 +311,25 @@ def check_prerequisite(host):
         if "outcome" not in params:
             missing.append("run_supervised(outcome=...)")
     return missing
+
+
+class scoped_operation_deadline:
+    """Keep nested accepted-host calls on the one captured operation deadline."""
+
+    def __init__(self, host, deadline):
+        self.host = host
+        self.deadline = deadline
+        self.original = None
+
+    def __enter__(self):
+        self.original = self.host.operation_deadline
+        self.host.operation_deadline = lambda *_args, **_kwargs: self.deadline
+        return self.deadline
+
+    def __exit__(self, *exc):
+        if self.original is not None:
+            self.host.operation_deadline = self.original
+        return False
 
 
 def test_patch_targets(patch_text):
@@ -621,26 +618,6 @@ def build_receipt(identity, deadline, timing, resources, inputs, test_stage,
     }
 
 
-# --- gate override that is always restored ----------------------------------
-class scoped_gate_cutoff:
-    """Force one captured deadline onto the host gate, restoring it in finally."""
-
-    def __init__(self, host, deadline):
-        self.host = host
-        self.deadline = deadline
-        self.original = None
-
-    def __enter__(self):
-        self.original = self.host.gate_cutoff
-        self.host.gate_cutoff = lambda: self.deadline
-        return self.deadline
-
-    def __exit__(self, *exc):
-        if self.original is not None:
-            self.host.gate_cutoff = self.original
-        return False
-
-
 # --- artifact publication (fresh, atomic, allowlisted) ----------------------
 ARTIFACT_ALLOWED = frozenset({RECEIPT_NAME, "LICENSE", "NOTICE"})
 
@@ -838,7 +815,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
     identity = capture_github_identity(environ)
     started = dt.datetime.now(dt.timezone.utc)
     deadline = None
-    wrapper_stage = "gate"
+    wrapper_stage = "deadline"
     outcome = {"stage": wrapper_stage}
     # The supervised stage currently running; its log is the only source for the
     # bounded diagnostic excerpt in the failure receipt.
@@ -854,8 +831,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
         return False, receipt, refusal
 
     try:
-        canonical = host.gate_cutoff()
-        deadline = capture_deadline(canonical, caller_limit_seconds)
+        deadline = host.operation_deadline(caller_limit_seconds)
         private_root = host.private_root(host.ROOT)
         home = host.home_dir(host.ROOT)
         log_dir = host.logs_dir(host.ROOT)
@@ -868,7 +844,7 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
         # ``_cargo_version``, ``ensure_source``, ``prepare_build``, ...) all see the
         # allowlist with a private HOME and no inherited credentials.
         with child_environment(environ, home):
-            with scoped_gate_cutoff(host, deadline):
+            with scoped_operation_deadline(host, deadline):
                 wrapper_stage = "preflight"
                 stage_log = _enter_stage(outcome, wrapper_stage)
                 # A fresh checkout has no private build root yet, and the disk/
@@ -996,7 +972,9 @@ def run_qualification(host, caller_limit_seconds=CALLER_LIMIT_SECONDS, environ=N
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--caller-limit-seconds", type=int, default=CALLER_LIMIT_SECONDS,
-                        choices=range(1, 7201), metavar="[1-7200]")
+                        choices=range(MIN_CALLER_LIMIT_SECONDS,
+                                      MAX_CALLER_LIMIT_SECONDS + 1),
+                        metavar="[6-7200]")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
         host = _load_host()
