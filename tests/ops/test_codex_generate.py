@@ -26,19 +26,6 @@ def _load(name, relative):
 generate = _load("codex_generate", "scripts/codex-generate.py")
 
 
-def _iso(epoch):
-    dt = generate.window_policy.dt
-    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).isoformat()
-
-
-def _window(stop_at=None, seconds=3600):
-    """Deterministic allowed gate: a cutoff derived from a caller-chosen offset,
-    never from the real off-peak schedule."""
-    if stop_at is None:
-        stop_at = _iso(generate.window_policy.dt.datetime.now(
-            generate.window_policy.dt.timezone.utc).timestamp() + seconds)
-    return {"allowed": True, "timezone": "UTC", "reason": "off_peak_buffered", "stop_at": stop_at}
-
 FAKE = r'''
 import json,sys,time,subprocess
 scenario,record=sys.argv[1:]
@@ -135,19 +122,11 @@ class GenerateTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def run_generate(self, scenario="completed", request=None, timeout=2, qualify=None,
-                     window=None, gate=None):
+    def run_generate(self, scenario="completed", request=None, timeout=2, qualify=None):
         events = []
         args = generate.parser().parse_args(["--state-dir", str(self.state), "--timeout", str(timeout)])
         command = [sys.executable, str(self.fake), scenario, str(self.record)]
-        if gate is None:
-            chosen = window if window is not None else _window()
-
-            def gate():
-                return chosen
-        with patch.object(generate.window_policy, "require_allowed", gate), patch.object(
-            sys, "stdin", _Stdin(json.dumps(request or self.request()).encode())
-        ):
+        with patch.object(sys, "stdin", _Stdin(json.dumps(request or self.request()).encode())):
             result = generate.execute(args, command=command, emit=events.append, qualify=qualify)
         return result, events
 
@@ -255,54 +234,24 @@ class GenerateTests(unittest.TestCase):
             self.assertEqual(events[-1]["type"], "error")
             self.assertNotIn("turn/start", self.methods())
 
-    def test_off_peak_pause_blocks_generation(self):
-        def blocked():
-            raise ValueError("off-peak closed")
-        _, events = self.run_generate(gate=blocked)
-        self.assertEqual(events[-1]["code"], "off_peak_paused")
-        self.assertFalse(self.record.exists())
+    def test_provider_free_subscription_generation_has_no_schedule_dependency(self):
+        self.assertFalse(hasattr(generate, "window_policy"))
+        result, events = self.run_generate()
+        self.assertTrue(result["ok"])
+        self.assertEqual(events[-1]["type"], "final")
 
     def test_deadline_interrupts_and_cleans_the_group(self):
         _, events = self.run_generate("timeout", timeout=0.3)
         self.assertEqual(events[-1]["code"], "timeout")
         self.assertIn("turn/interrupt", self.methods())
 
-    def test_capture_work_deadline_rejects_missing_invalid_expired_and_reserved(self):
-        now = 1000.0
-        for bad in (None, {}, {"stop_at": None}, {"stop_at": ""}, {"stop_at": "not-a-time"},
-                    {"stop_at": "2030-01-01T00:00:00"},  # naive timestamp (no timezone)
-                    {"stop_at": _iso(now - 1)}, {"stop_at": _iso(now + 4)}):
-            with self.subTest(bad=bad):
+    def test_capture_work_deadline_is_caller_bounded_and_finite(self):
+        self.assertAlmostEqual(generate.capture_work_deadline(30, now_monotonic=1000), 1030)
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout):
                 with self.assertRaises(generate.bridge.BridgeError) as caught:
-                    generate.capture_work_deadline(bad, 30, now_monotonic=now, now_utc=now)
-                self.assertEqual(caught.exception.code, "off_peak_paused")
-        self.assertAlmostEqual(
-            generate.capture_work_deadline({"stop_at": _iso(now + 3600)}, 30, now_monotonic=now, now_utc=now),
-            now + 30,
-        )
-
-    def test_capture_work_deadline_uses_earlier_of_caller_timeout_and_gate(self):
-        now = 500.0
-        # A far gate: the short caller timeout binds and the reserve is never taken from it.
-        self.assertAlmostEqual(
-            generate.capture_work_deadline({"stop_at": _iso(now + 3600)}, 0.3, now_monotonic=now, now_utc=now),
-            now + 0.3,
-        )
-        # A near gate: only the GATE budget loses the five-second cleanup reserve.
-        self.assertAlmostEqual(
-            generate.capture_work_deadline({"stop_at": _iso(now + 6)}, 300, now_monotonic=now, now_utc=now),
-            now + 1.0,
-        )
-
-    def test_missing_or_expired_cutoff_blocks_before_app_server(self):
-        for window in ({"allowed": True}, {"allowed": True, "stop_at": _iso(
-                generate.window_policy.dt.datetime.now(generate.window_policy.dt.timezone.utc).timestamp() - 1)}):
-            with self.subTest(window=window):
-                self.record.unlink(missing_ok=True)
-                result, events = self.run_generate(window=window)
-                self.assertFalse(result["ok"])
-                self.assertEqual(events[-1]["code"], "off_peak_paused")
-                self.assertFalse(self.record.exists())
+                    generate.capture_work_deadline(timeout, now_monotonic=1000)
+                self.assertEqual(caught.exception.code, "arguments")
 
     def test_metadata_exhausting_budget_blocks_before_rpc(self):
         self.record.unlink(missing_ok=True)
@@ -317,30 +266,17 @@ class GenerateTests(unittest.TestCase):
         self.assertEqual(events[-1]["code"], "timeout")
         self.assertFalse(self.record.exists())  # the app-server never started
 
-    def test_window_is_captured_once_and_cannot_be_extended(self):
-        calls = []
-        windows = [_window(seconds=3600), _window(seconds=99999)]
-
-        def gate():
-            calls.append(1)
-            return windows[min(len(calls) - 1, 1)]
-
-        result, events = self.run_generate(gate=gate)
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(calls), 1)  # no later window can extend the deadline
-
-    def test_short_caller_timeout_still_completes_with_gate_only_reserve(self):
+    def test_short_caller_timeout_still_completes(self):
         result, events = self.run_generate(timeout=0.5)
         self.assertTrue(result["ok"])
         self.assertEqual(events[-1]["type"], "final")
 
-    def test_gate_cutoff_binds_rpc_deadline_not_caller_timeout(self):
-        now = generate.window_policy.dt.datetime.now(generate.window_policy.dt.timezone.utc).timestamp()
+    def test_caller_timeout_binds_rpc_and_interrupts(self):
         start = time.monotonic()
-        _, events = self.run_generate("timeout", timeout=30, window={"allowed": True, "stop_at": _iso(now + 8)})
+        _, events = self.run_generate("timeout", timeout=0.5)
         elapsed = time.monotonic() - start
         self.assertEqual(events[-1]["code"], "timeout")
-        self.assertLess(elapsed, 6)  # bounded by gate - reserve (~3s), not the 30s caller timeout
+        self.assertLess(elapsed, 4)
         self.assertIn("turn/interrupt", self.methods())
 
     def test_account_stall_times_out_before_thread(self):
@@ -507,7 +443,6 @@ class GenerateTests(unittest.TestCase):
                 patch.object(generate, "generation_codex_command", return_value=list(native)), \
                 patch.object(generate.bridge, "resolve_codex_binary", return_value="host-codex"), \
                 patch.object(generate.bridge, "RpcClient", _Recorder), \
-                patch.object(generate.window_policy, "require_allowed", lambda: _window()), \
                 patch.object(sys, "stdin", _Stdin(json.dumps(self.request()).encode())):
             result = generate.execute(args, command=None, emit=lambda _e: None,
                                       qualify=lambda: {"qualified": True, "schema_supported": False})

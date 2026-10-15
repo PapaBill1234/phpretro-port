@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import shutil
@@ -175,7 +176,7 @@ def time_budget(deadline, cap):
     except (TypeError, ValueError):
         return cap
     if seconds <= 1:
-        raise SetupError("off-peak deadline reached; refusing to start work", code=75)
+        raise SetupError("operation deadline reached; refusing to start work", code=75)
     return max(1.0, min(seconds, cap))
 
 
@@ -420,7 +421,7 @@ def absolute_download_deadline(deadline):
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
     started = time.monotonic()
     def expired(signum, frame):
-        raise SetupError("off-peak download deadline reached", code=75)
+        raise SetupError("download operation deadline reached", code=75)
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL,
                      min(remaining, previous_timer[0]) if previous_timer[0] else remaining)
@@ -449,10 +450,10 @@ def fetch(url, dest, deadline=None, cap=300):
                 open(tmp, "wb") as out:
             while True:
                 if past_deadline(deadline):
-                    raise SetupError("off-peak deadline reached during download: %s" % url, code=75)
+                    raise SetupError("operation deadline reached during download: %s" % url, code=75)
                 chunk = response.read(1024 * 1024)
                 if past_deadline(deadline):
-                    raise SetupError("off-peak deadline reached during download", code=75)
+                    raise SetupError("operation deadline reached during download", code=75)
                 if not chunk:
                     break
                 out.write(chunk)
@@ -464,7 +465,7 @@ def fetch(url, dest, deadline=None, cap=300):
         raise SetupError("download failed: %s (%s)" % (url, error), code=1)
     if past_deadline(deadline):
         tmp.unlink(missing_ok=True)
-        raise SetupError("off-peak deadline reached before download publication", code=75)
+        raise SetupError("operation deadline reached before download publication", code=75)
     os.replace(tmp, dest)
     return dest
 
@@ -479,7 +480,7 @@ def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, deadline=Non
         else:
             return dest
     if past_deadline(deadline):
-        raise SetupError("off-peak deadline reached before download: %s" % url, code=75)
+        raise SetupError("operation deadline reached before download: %s" % url, code=75)
     fetch(url, dest, deadline=deadline)
     if sri and not verify_sri(dest, sri):
         raise SetupError("download failed SRI verification: %s" % url, code=1)
@@ -488,7 +489,7 @@ def _ensure_archive(url, dest, sha256=None, sri=None, shasums=None, deadline=Non
     if shasums:
         shasums_file = dest.with_name(dest.name + ".SHASUMS256.txt")
         if past_deadline(deadline):
-            raise SetupError("off-peak deadline reached before SHASUMS fetch: %s" % url, code=75)
+            raise SetupError("operation deadline reached before SHASUMS fetch: %s" % url, code=75)
         text = fetch(shasums, shasums_file, deadline=deadline).read_text()
         expected = parse_shasums(text, dest.name)
         if not expected or not verify_sha256(dest, expected):
@@ -773,16 +774,32 @@ def command_check(root):
     return 0 if result["readiness"] else 1
 
 
-def command_setup(root, node_path=None, bun_path=None):
+SETUP_TIMEOUT_DEFAULT = 3600.0
+SETUP_TIMEOUT_MAX = 7200.0
+
+
+def valid_setup_timeout(timeout):
+    return (not isinstance(timeout, bool) and isinstance(timeout, (int, float))
+            and math.isfinite(timeout) and 0 < timeout <= SETUP_TIMEOUT_MAX)
+
+
+def setup_deadline(timeout, now=None):
+    """Capture one fixed UTC cutoff from the caller's bounded setup timeout."""
+    if not valid_setup_timeout(timeout):
+        raise SetupError("setup timeout must be between 1 and 7200 seconds", code=2)
+    captured = dt.datetime.now(dt.timezone.utc) if now is None else now
+    return (captured + dt.timedelta(seconds=timeout)).isoformat()
+
+
+def command_setup(root, node_path=None, bun_path=None, timeout=SETUP_TIMEOUT_DEFAULT):
     require_platform()
     assert_anchor(root, "setup")
     private_root(root).mkdir(parents=True, exist_ok=True)
     phases = {}
     with setup_lock(root):
-        # One fresh gate check yields the immutable cutoff for every later phase.
-        deadline = enforce_gate()["stop_at"]
-        if not deadline:
-            raise SetupError("off-peak gate has no verified cutoff; refusing setup", code=75)
+        # Source/runtime preparation is provider-free. Capture one bounded caller
+        # cutoff and pass it unchanged through every phase; no later phase extends it.
+        deadline = setup_deadline(timeout)
         ensure_node(root, provided=node_path, deadline=deadline)
         ensure_bun(root, provided=bun_path, deadline=deadline)
         phases["runtimes"] = {"node": str(node_bin(root)), "bun": str(bun_bin(root))}
@@ -832,17 +849,25 @@ def command_cli(root, argv):
 
 def main(argv=None, root=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["check", "setup", "cli"])
-    parser.add_argument("--node-path", help="operator-provided Node binary (validated)")
-    parser.add_argument("--bun-path", help="operator-provided Bun binary (validated)")
-    parser.add_argument("rest", nargs=argparse.REMAINDER)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("check", help="inspect pinned source/runtime readiness")
+    setup_parser = commands.add_parser("setup", help="prepare pinned source and private runtimes")
+    setup_parser.add_argument("--node-path", help="operator-provided Node binary (validated)")
+    setup_parser.add_argument("--bun-path", help="operator-provided Bun binary (validated)")
+    setup_parser.add_argument("--timeout", type=float, default=SETUP_TIMEOUT_DEFAULT,
+                              help="caller-bounded setup deadline in seconds (1-7200)")
+    cli_parser = commands.add_parser("cli", help="run the pinned upstream CLI")
+    cli_parser.add_argument("rest", nargs=argparse.REMAINDER)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     root = ROOT if root is None else Path(root)
     try:
         if args.command == "check":
             return command_check(root)
         if args.command == "setup":
-            return command_setup(root, node_path=args.node_path, bun_path=args.bun_path)
+            if not valid_setup_timeout(args.timeout):
+                raise SetupError("setup timeout must be between 1 and 7200 seconds", code=2)
+            return command_setup(root, node_path=args.node_path, bun_path=args.bun_path,
+                                 timeout=args.timeout)
         extra = args.rest[1:] if args.rest[:1] == ["--"] else args.rest
         return command_cli(root, extra)
     except SetupError as error:

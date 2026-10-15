@@ -46,7 +46,14 @@ The installed raw ELF `codex-cli 0.162.0` matches the official release from sour
 
 The G06 `proc <X> dead` terminate-group assertion repair (`2ac672d`) is **test-only** and does not close G06.
 
-The native provider now captures one deadline before metadata and caps its subprocesses and account/thread/turn RPCs by the remaining budget. Five seconds are reserved from the gate for normal cleanup; a short caller timeout remains usable. Forty-three generator tests pass, including capped metadata arguments and no subprocess launch after expiry. Hard-parent cleanup and the complete native tool-registry proof remain unqualified, so generation stays blocked.
+The native provider captures one caller deadline before metadata and caps its subprocesses and account/thread/turn RPCs by the remaining budget. Hard-parent cleanup and the complete native tool-registry proof remain unqualified, so native generation stays blocked.
+
+**2026-10-15 provider scheduling boundary:** fixed-provider Codex subscription
+generation and pinned Eliza source/runtime setup are provider-free with respect
+to DeepSeek and use bounded caller deadlines. Direct DeepSeek calls retain their
+off-peak gate. The full Eliza CLI remains gated because configured behavior may
+dispatch inference; the dashboard and acceptance host retain their existing
+DeepSeek controls. Focused mock tests do not establish hosted/browser acceptance.
 
 **2026-10-15 provider-free build scheduling:** the native `build` command and
 hosted qualification now capture one bounded caller deadline, independent of

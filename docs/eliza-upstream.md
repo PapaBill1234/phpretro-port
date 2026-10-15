@@ -38,7 +38,7 @@ runtimes or ancestor directories:
 
 ```sh
 python3 scripts/eliza-upstream.py check
-python3 scripts/eliza-upstream.py setup
+python3 scripts/eliza-upstream.py setup --timeout 3600
 python3 scripts/eliza-upstream.py cli -- --help
 python3 scripts/eliza-upstream.py cli start
 ```
@@ -50,8 +50,10 @@ python3 scripts/eliza-upstream.py cli start
   when its bytes match the recorded digest, so an unverified binary is never
   executed. Readiness is `true` only when all of pin, runtimes and dependencies
   are verified.
-- **setup** is explicit and refuses to run while the off-peak gate is closed. It
-  verifies the platform is linux-x64, downloads and verifies the pinned Node
+- **setup** is explicit provider-free source/runtime preparation. It is not
+  scheduled by the DeepSeek off-peak gate and is bounded by one caller timeout
+  (`--timeout`, default 3600 seconds, maximum 7200). It verifies the platform
+  is linux-x64, downloads and verifies the pinned Node
   archive (SHA256 against the official `SHASUMS256.txt`), verifies the Bun
   tarball against both its registry SRI and pinned SHA256, extracts both with
   bounded member/path/symlink checks, clones the exact pin if the checkout is
@@ -65,11 +67,14 @@ python3 scripts/eliza-upstream.py cli start
   confirmed equal to the exact derived canonical binary (`runtimes/node/…/bin/node`
   or `runtimes/bun/package/bin/bun`). A manifest that names any other path is
   rejected rather than hashed-and-returned, and a hash mismatch re-installs or
-  fails closed. Every phase — clone, checkout, each HTTP read and each
-  `--version` probe — receives the original off-peak cutoff and a freshly
-  recomputed remaining budget; the cutoff is captured once and never extended by
-  a later phase, and work is refused once it has elapsed.
-- **cli** runs the actual pinned Bun entry point
+  fails closed. Every phase — clone, checkout, each HTTP read, each
+  `--version` probe, and supervised install/build — receives the same captured
+  caller cutoff and a freshly recomputed remaining budget; later phases cannot
+  extend it. The timeout includes cleanup for supervised-child termination.
+- **cli** remains off-peak gated because its configured behavior may dispatch a
+  provider request. Its gate cutoff is captured once and each source check and
+  supervised process uses that same cutoff. It runs the actual pinned Bun entry
+  point
   `bun --no-install --conditions=eliza-source packages/app/src/entry.ts <argv>`
   with a clean private environment (`ELIZA_STATE_DIR` under `.builder/upstream`,
   local embeddings/voice/fused warmup disabled, loopback API bind). It requires a
@@ -86,11 +91,11 @@ and crosses no symlinked ancestor, beginning at `ROOT/.builder` itself: a
 symlinked `.builder` or `.builder/upstream` is rejected before any write or
 delete, so a planted ancestor symlink cannot delete or write outside the private
 tree. Long-running steps run in their own process group and are TERM/KILL bounded
-with orphan cleanup on failure, cancellation or the off-peak cutoff; a helper that
+with orphan cleanup on failure, cancellation or the captured cutoff; a helper that
 dies by signal is reported as a failure (`128+signum`), never success. Setup holds
 one `fcntl` advisory lock with no PID file and no stale-PID unlink.
 
-The off-peak decision is imported from the canonical `scripts/coding-window.py`.
+The `cli` off-peak decision is imported from the canonical `scripts/coding-window.py`.
 That file is intentionally **not** committed or edited here — it is owned by the
 integration branch (Root `cd69db8`), so this worker's checkout carries it only as
 an untracked dependency until integration provides it. If it is absent the script

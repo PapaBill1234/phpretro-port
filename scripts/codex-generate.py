@@ -16,8 +16,8 @@ Safety posture (isolation is enforced before a turn, not by rejecting events
 after execution):
   * selected ``CODEX_HOME`` + an env allowlist (no API/OAuth credential copy);
   * exact installed Codex version, model and provider verified before a turn;
-  * fresh off-peak window and fresh subscription quota each call (unknown quota
-    or any exhausted window blocks);
+  * fresh subscription quota each call (unknown quota or any exhausted window
+    blocks), with one caller-bounded operation deadline;
   * a UNIQUE new stateless thread per generation (never resumed), with
     host-fixed instructions and an empty host-derived workspace; when the
     installed EXPERIMENTAL schema is offline-confirmed to define them, it also
@@ -54,11 +54,6 @@ _bridge_spec = importlib.util.spec_from_file_location(
 )
 bridge = importlib.util.module_from_spec(_bridge_spec)
 _bridge_spec.loader.exec_module(bridge)
-_window_spec = importlib.util.spec_from_file_location(
-    "coding_window", ROOT / "scripts/coding-window.py"
-)
-window_policy = importlib.util.module_from_spec(_window_spec)
-_window_spec.loader.exec_module(window_policy)
 
 SCHEMA = "phpretro.codex.generate.v1"
 MODEL = bridge.MODEL  # exact model id, fixed host-side
@@ -134,12 +129,8 @@ SCHEMA_FILE_MAX_BYTES = 8 * 1024 * 1024
 SCHEMA_OUTPUT_SUBDIR = "schema"
 SCHEMA_THREAD_FILE = ("v2", "ThreadStartParams.json")
 THREAD_SCHEMA_TITLE = "ThreadStartParams"
-# Cleanup reserve (seconds) taken ONLY from the off-peak GATE budget, never from
-# the caller's short ``--timeout``. The gate stop_at is the canonical cutoff;
-# the work deadline is the earlier of ``caller timeout`` and ``gate - reserve``.
-CLEANUP_RESERVE = 5.0
 # One monotonic work deadline for the WHOLE call (metadata probes, app-server and
-# the turn). Set once in ``execute`` from the captured cutoff; every bounded
+# the turn). Set once in ``execute`` from the caller timeout; every bounded
 # subprocess and RPC operation is capped by what remains. The default (None)
 # preserves the plain helper signatures: a direct call is uncapped as before.
 _DEADLINE = contextvars.ContextVar("codex_generate_work_deadline", default=None)
@@ -170,48 +161,12 @@ def _check_budget(stage):
         raise bridge.BridgeError("timeout", "Work deadline reached before " + stage + ".")
 
 
-def capture_work_deadline(window, timeout, now_monotonic=None, now_utc=None):
-    """Map the canonical gate cutoff to ONE monotonic work deadline, or refuse.
-
-    The off-peak ``stop_at`` is captured once (caller passes the value returned by
-    ``window_policy.require_allowed``) and rejected when missing, unparseable or
-    already expired. The UTC cutoff is converted to a monotonic deadline using the
-    SAME pair of clocks, so wall-clock drift after capture cannot extend it. The
-    work deadline is the EARLIER of ``start + timeout`` and ``gate cutoff minus
-    CLEANUP_RESERVE``; the reserve is subtracted only from the gate budget, so a
-    short caller ``--timeout`` is never shortened into the reserve.
-    """
-    stop_at = window.get("stop_at") if isinstance(window, dict) else None
-    if not isinstance(stop_at, str) or not stop_at:
-        raise bridge.BridgeError(
-            "off_peak_paused", "Off-peak window has no verified cutoff; refusing to dispatch."
-        )
-    try:
-        parsed = window_policy.dt.datetime.fromisoformat(stop_at)
-    except (TypeError, ValueError):
-        raise bridge.BridgeError(
-            "off_peak_paused", "Off-peak window cutoff is invalid; refusing to dispatch."
-        ) from None
-    # The canonical cutoff is always UTC aware; a naive timestamp has no defined
-    # offset and must not be converted to an epoch (it could silently shift the
-    # window), so it is rejected rather than assumed to be UTC.
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise bridge.BridgeError(
-            "off_peak_paused", "Off-peak window cutoff is not timezone-aware; refusing to dispatch."
-        )
-    cutoff = parsed.timestamp()
-    start_mono = time.monotonic() if now_monotonic is None else now_monotonic
-    start_utc = time.time() if now_utc is None else now_utc
-    if not math.isfinite(cutoff) or cutoff <= start_utc:
-        raise bridge.BridgeError(
-            "off_peak_paused", "Off-peak window cutoff has expired; refusing to dispatch."
-        )
-    gate_deadline = start_mono + (cutoff - start_utc) - CLEANUP_RESERVE
-    if gate_deadline <= start_mono:
-        raise bridge.BridgeError(
-            "off_peak_paused", "Off-peak window is within its cleanup reserve; refusing to dispatch."
-        )
-    return min(start_mono + timeout, gate_deadline)
+def capture_work_deadline(timeout, now_monotonic=None):
+    """Capture one immutable monotonic deadline from the caller's timeout."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise bridge.BridgeError("arguments", "Caller timeout must be positive and finite.")
+    start = time.monotonic() if now_monotonic is None else now_monotonic
+    return start + timeout
 # Exact declared shape each isolation field must have in the installed
 # experimental schema. A field is trusted only when its declared ``type`` (and,
 # for the array fields, its item ``$ref``) matches EXACTLY; anything else is an
@@ -887,26 +842,17 @@ def execute(args, command=None, emit=None, qualify=None):
         try:
             raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
             request = parse_request(raw)
-            # Fresh off-peak window: capture the CANONICAL cutoff exactly once and
-            # map it to a monotonic work deadline BEFORE any offline metadata
-            # subprocess runs. A missing/invalid/expired cutoff refuses to dispatch.
-            try:
-                window = window_policy.require_allowed()
-            except ValueError:
-                raise bridge.BridgeError(
-                    "off_peak_paused",
-                    "Generation is paused outside the verified off-peak window.",
-                ) from None
-            work_deadline = capture_work_deadline(window, args.timeout)
+            # This fixed Codex subscription provider does not use DeepSeek. Capture
+            # the caller's bounded operation deadline before offline metadata.
+            work_deadline = capture_work_deadline(args.timeout)
         except ValueError:
-            emit({"type": "error", "code": "off_peak_paused", "message": "Off-peak window is invalid."})
-            return {"schema": SCHEMA, "ok": False, "error_code": "off_peak_paused"}
+            emit({"type": "error", "code": "arguments", "message": "Caller timeout is invalid."})
+            return {"schema": SCHEMA, "ok": False, "error_code": "arguments"}
         except bridge.BridgeError as error:
             emit({"type": "error", "code": error.code, "message": str(error)})
             return {"schema": SCHEMA, "ok": False, "error_code": error.code}
         # ONE deadline for the whole call. Every probe and RPC operation is capped
-        # by what remains; it is never recomputed, so metadata/account/thread work
-        # can never extend the window.
+        # by what remains; it is never recomputed, so earlier stages cannot extend it.
         token = _DEADLINE.set(work_deadline)
         client = None
         success = False

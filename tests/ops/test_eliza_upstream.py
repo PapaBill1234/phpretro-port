@@ -221,6 +221,53 @@ class BuildCommands(unittest.TestCase):
             selected = upstream.select_registration_packages(plugins)
             self.assertEqual([name for name, _ in selected], sorted(names))
 
+    def test_setup_is_provider_free_and_uses_one_caller_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deadlines = []
+            original = upstream.gate_decision
+            try:
+                upstream.gate_decision = lambda now=None: {"allowed": False}
+                with patch.object(upstream, "require_platform"), \
+                     patch.object(upstream, "ensure_node", side_effect=lambda *a, **k: deadlines.append(k["deadline"])), \
+                     patch.object(upstream, "ensure_bun", side_effect=lambda *a, **k: deadlines.append(k["deadline"])), \
+                     patch.object(upstream, "ensure_source", side_effect=lambda *a, **k: (deadlines.append(k["deadline"]) or root)), \
+                     patch.object(upstream, "run_supervised", side_effect=lambda *a, **k: (deadlines.append(k["stop_at"]) or 0)), \
+                     patch.object(upstream, "select_registration_packages", return_value=[]):
+                    self.assertEqual(upstream.command_setup(root, timeout=120), 0)
+            finally:
+                upstream.gate_decision = original
+            self.assertEqual(len(deadlines), 5)
+            self.assertEqual(len(set(deadlines)), 1)
+            self.assertGreater(dt.datetime.fromisoformat(deadlines[0]), dt.datetime.now(dt.timezone.utc))
+
+    def test_setup_deadline_is_bounded_and_captured_once(self):
+        now = dt.datetime(2026, 10, 15, tzinfo=dt.timezone.utc)
+        self.assertEqual(upstream.setup_deadline(120, now=now),
+                         "2026-10-15T00:02:00+00:00")
+        for timeout in (True, False, 0, -1, 7201, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout), self.assertRaises(upstream.SetupError):
+                upstream.setup_deadline(timeout, now=now)
+
+    def test_setup_cli_forwards_timeout_after_command_without_running_setup(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(upstream, "command_setup", return_value=0) as setup:
+            root = Path(directory)
+            code = upstream.main(
+                ["setup", "--timeout", "23.5", "--node-path", "/trusted/node",
+                 "--bun-path", "/trusted/bun"], root=root)
+        self.assertEqual(code, 0)
+        setup.assert_called_once_with(root, node_path="/trusted/node",
+                                      bun_path="/trusted/bun", timeout=23.5)
+
+    def test_setup_cli_rejects_invalid_timeout_before_setup(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(upstream, "command_setup") as setup, \
+             patch("sys.stderr", new_callable=io.StringIO):
+            code = upstream.main(["setup", "--timeout", "nan"], root=Path(directory))
+        self.assertEqual(code, 2)
+        setup.assert_not_called()
+
 
 class RuntimeValidation(unittest.TestCase):
     def test_provided_runtime_version_checked(self):
