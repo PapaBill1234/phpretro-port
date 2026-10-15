@@ -18,6 +18,28 @@ supervisor. The dashboard default profile reads the live module constants, so
 existing direct-DeepSeek dashboard behaviour is unchanged. There is no
 arbitrary CLI path/root flag: the profile is constructed only in reviewed code.
 
+## Generated view prerequisite
+
+After the pinned upstream runtimes/dependencies are installed, build the local
+companion view before acceptance setup. The generated bundle is ignored by Git;
+a clean checkout does not contain it. From the project root:
+
+```bash
+project_root="$PWD"
+(cd builder/eliza/upstream-plugin &&
+  "$project_root/.builder/upstream/runtimes/node-v24.15.0-linux-x64/bin/node" \
+  "$project_root/builder/eliza/upstream/node_modules/vite/bin/vite.js" \
+  build --config vite.config.mjs)
+```
+
+This creates `builder/eliza/upstream-plugin/dist/views/bundle.js`. Setup checks
+this prerequisite before copying the source overlay; it does not install or
+build dependencies. Missing or unsafe assets refuse setup with a build hint.
+Setup records the canonical asset digest and copies the file into the physical
+drop-in. Start checks both copies against that digest. A namespace created before
+asset provenance was recorded must be replaced with a fresh `--run-id`; setup
+refuses it without rewriting its provenance or credentials.
+
 ## Commands
 
 ```

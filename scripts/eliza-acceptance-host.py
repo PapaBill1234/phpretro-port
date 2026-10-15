@@ -93,6 +93,7 @@ DROPINS = {
     "@phpretro/plugin-project-companion": {
         "canonical": Path("builder") / "eliza" / "upstream-plugin",
         "entry": Path("src") / "index.js",
+        "assets": (Path("dist/views/bundle.js"),),
     },
     "@phpretro/eliza-native-model": {
         "canonical": Path("builder") / "eliza" / "native-model",
@@ -915,6 +916,7 @@ def build_overlay(root, deadline=None):
     root = Path(root)
     _verify_canonical_source(root, deadline)
     source = canonical_source(root)
+    dropin_provenance(root, deadline)  # generated assets are explicit setup prerequisites
     overlay = assert_private_path(root, overlay_dir(root))
     if overlay.exists():
         if not _overlay_provenance_matches(root):
@@ -1115,6 +1117,8 @@ def install_dropins(root, deadline=None):
     """Create REAL drop-in package dirs (never symlinks) under the fresh state."""
     _remaining(deadline, "drop-in installation")
     root = Path(root)
+    if _overlay_data(root).get("dropins") != dropin_provenance(root, deadline):
+        raise AcceptanceError("drop-in provenance mismatch; use a fresh --run-id")
     custom = assert_private_path(root, plugins_custom_dir(root))
     custom.mkdir(parents=True, exist_ok=True)
     os.chmod(custom, 0o700)
@@ -1136,6 +1140,16 @@ def install_dropins(root, deadline=None):
         }, indent=2) + "\n")
         url = canonical_entry(root, package).resolve().as_uri()
         (target / "index.mjs").write_text(_DROPIN_INDEX % (url, url))
+        for rel in spec.get("assets", ()):
+            _remaining(deadline, "drop-in asset installation")
+            original = assert_fixed_path(root, root / spec["canonical"] / rel, spec["canonical"])
+            if original.is_symlink() or not original.is_file():
+                raise AcceptanceError("canonical drop-in asset missing or unsafe; build the view first (docs/eliza-acceptance-host.md): %s" % package)
+            destination = assert_private_path(root, target / rel)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            assert_private_path(root, destination)
+            shutil.copyfile(original, destination)
+            os.chmod(destination, 0o600)
         created.append(str(target))
     return created
 
@@ -1148,7 +1162,15 @@ def dropin_provenance(root, deadline=None):
         entry = canonical_entry(root, package)
         if not entry.is_file():
             raise AcceptanceError("canonical drop-in entry missing: %s" % package)
-        data[package] = {"canonical": str(entry), "entry_sha256": sha256_file(entry, deadline)}
+        assets = {}
+        for rel in DROPINS[package].get("assets", ()):
+            original = assert_fixed_path(root, root / DROPINS[package]["canonical"] / rel,
+                                         DROPINS[package]["canonical"])
+            if original.is_symlink() or not original.is_file():
+                raise AcceptanceError("canonical drop-in asset missing or unsafe; build the view first (docs/eliza-acceptance-host.md): %s" % package)
+            assets[str(rel)] = sha256_file(original, deadline)
+        data[package] = {"canonical": str(entry), "entry_sha256": sha256_file(entry, deadline),
+                         "assets": assets}
     return data
 
 
@@ -1175,6 +1197,18 @@ def _dropin_ready(root, deadline=None):
         recorded = prov.get(package, {}).get("entry_sha256")
         if recorded != sha256_file(canonical_entry(root, package), deadline):
             return False
+        assets = prov.get(package, {}).get("assets")
+        expected = DROPINS[package].get("assets", ())
+        if not isinstance(assets, dict) or set(assets) != {str(rel) for rel in expected}:
+            return False
+        for rel in expected:
+            original = assert_fixed_path(root, root / DROPINS[package]["canonical"] / rel,
+                                         DROPINS[package]["canonical"])
+            installed = assert_private_path(root, target / rel)
+            if original.is_symlink() or not original.is_file() or not installed.is_file():
+                return False
+            if assets[str(rel)] != sha256_file(original, deadline) or assets[str(rel)] != sha256_file(installed, deadline):
+                return False
     return True
 
 

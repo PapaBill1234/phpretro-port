@@ -333,3 +333,23 @@ run, the manifest returned 200 in 0.08s, the HTML document 200 (26,336 bytes) in
 0.19s, and the Vite client 200 in 0.08s. This establishes request responsiveness;
 real browser mounting, authenticated views and room persistence still require
 full-host acceptance. Private traces remain under `.builder/evidence/`.
+
+## G06 physical drop-in browser assets — 2026-10-15
+
+Real browser pairing and launcher rendering now pass after the source-scan fix.
+A guest machine session receives 403 for the owner-only companion route and
+bundle, and the companion is absent from that guest's view catalog. Owner
+pairing persists across browser reloads. Actual DynamicViewLoader navigation
+then exposed a separate packaging defect: the installation-scoped companion
+bundle returned 404 because the physical drop-in contained only a JavaScript
+wrapper, not its declared `dist/views/bundle.js` asset.
+
+The acceptance installer now copies that fixed browser asset into the physical
+drop-in, without moving the canonical module or changing its relative imports.
+Setup provenance records the asset hash; readiness checks both canonical and
+installed bytes and refuses missing, modified or linked installed assets.
+Legacy namespaces without asset provenance refuse setup before installation and
+require a fresh run id; their saved provenance and credentials are preserved.
+127 acceptance/dashboard checks pass (two canonical-source checks skipped in the
+isolated worker checkout). Real browser mounting of the copied bundle remains
+pending; this change alone does not close G06 or enable native generation.

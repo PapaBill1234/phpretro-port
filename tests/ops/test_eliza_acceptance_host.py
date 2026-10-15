@@ -141,6 +141,10 @@ class OverlayTest(unittest.TestCase):
             entry = root / spec["canonical"] / spec["entry"]
             entry.parent.mkdir(parents=True, exist_ok=True)
             entry.write_text("export const canonical = true;\n")
+            for rel in spec.get("assets", ()):
+                asset = root / spec["canonical"] / rel
+                asset.parent.mkdir(parents=True, exist_ok=True)
+                asset.write_text("export const view = true;\n")
         _git(source, "init")
         _git(source, "config", "user.email", "t@example.com")
         _git(source, "config", "user.name", "t")
@@ -407,6 +411,44 @@ class DropInTest(unittest.TestCase):
                 self.assertTrue(str(target).startswith(str(host.state_dir(root))))
             self.assertTrue(host._dropin_ready(root))
 
+
+    def test_legacy_asset_provenance_refuses_before_installation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            OverlayTest()._build(tmp)
+            root = Path(tmp)
+            path = host.provenance_path(root)
+            data = json.loads(path.read_text())
+            for entry in data["dropins"].values():
+                entry.pop("assets", None)
+            path.write_text(json.dumps(data))
+            before = path.read_bytes()
+            with self.assertRaisesRegex(host.AcceptanceError, "fresh --run-id"):
+                host.install_dropins(root)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(host.plugins_custom_dir(root).exists())
+
+    def test_view_asset_is_copied_and_both_copies_are_byte_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            OverlayTest()._build(tmp)
+            root = Path(tmp)
+            host.install_dropins(root)
+            package = "@phpretro/plugin-project-companion"
+            rel = host.DROPINS[package]["assets"][0]
+            canonical = root / host.DROPINS[package]["canonical"] / rel
+            installed = host.dropin_dir(root, package) / rel
+            original = canonical.read_bytes()
+            self.assertEqual(installed.read_bytes(), original)
+            self.assertNotEqual(installed.stat().st_ino, canonical.stat().st_ino)
+            for member in (installed, canonical):
+                member.write_bytes(b"tampered")
+                self.assertFalse(host._dropin_ready(root))
+                member.write_bytes(original)
+                self.assertTrue(host._dropin_ready(root))
+            installed.unlink()
+            self.assertFalse(host._dropin_ready(root))
+            installed.symlink_to(canonical)
+            with self.assertRaises(host.AcceptanceError):
+                host._dropin_ready(root)
 
     def test_dropin_tampering_and_missing_provenance_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
