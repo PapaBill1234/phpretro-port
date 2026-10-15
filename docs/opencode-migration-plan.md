@@ -206,7 +206,7 @@ Dependencies are gates, not permission to launch all rows concurrently.
 | OC2-M02 | Luna-high: read-only pinned-contract audit and local fake-provider probe design; Sol reviews blocking/cancellation conclusions | Fresh selected-account quota; exact supported denial/cancel mechanism proven in 2.0.29. No paid DeepSeek request. |
 | OC2-M03 | Luna-high: quota metadata acquisition/validation and private checkpoint tests | Supported source identified; wrong/stale/missing account and reserve tests; native manual login/model/delegation evidence. |
 | OC2-M04 | Luna-high: canonical shared task ledger and atomic admission, no provider dispatch | Concurrent claims across profiles, path overlap, crash/restart/quarantine and failure classification tests. |
-| OC2-M04a | Luna-high: offline SQLite claim/admission core only; no native sessions or dispatch | May proceed independently of M02/M03 runtime qualification after fresh quota authorization; targeted concurrency/path/crash/quarantine tests and independent review. |
+| OC2-M04a | Luna-high: offline SQLite claim/admission core only; no native sessions or dispatch | Local implementation/tests recorded below; independent review pending. This does not qualify A07–A09 or live admission. |
 | OC2-M05 | Luna-high: native DeepSeek-only request guard | M02 architecture reviewed; fake transport proves deny/retry/active cutoff; Sol non-interference; fail-closed plugin startup. |
 | OC2-M06 | Luna-high: V2 session/worktree dispatch adapter, receipts and escalation | M03–M05 reviewed; four-worker supervision and restart acceptance; verified spend enforcement before any autonomous paid send. |
 | OC2-M07 | Luna-high: real-route acceptance evidence and redacted GitHub progress; Sol independent final review | Verified live route, spend protection, all checklist gates and CI. No PHPRetro unpause inferred. |
@@ -245,3 +245,41 @@ decision; no CMS feature is marked complete by this work.
 [providers]: https://opencode.ai/v2/docs/providers
 [api]: https://opencode.ai/v2/docs/api
 [client]: https://opencode.ai/v2/docs/build/client
+
+## OC2-M04a offline admission-core evidence
+
+`scripts/opencode-ledger.py` is an importable stdlib SQLite core with a small
+claim CLI. Callers must supply the same existing absolute private state root
+(owned by the current user, mode 0700 or stricter) to share a ledger across
+profiles and worktrees. The database is fixed at
+`opencode-ledger.sqlite3`, private (0600), and uses SQLite's 10-second busy
+timeout plus `BEGIN IMMEDIATE` admission transactions. Claims reject duplicate
+task IDs, unsafe path spellings/symlinks, and canonical owned-path parent/child
+overlap; no more than four active or quarantined rows can be admitted.
+
+Lease expiry is not termination: expired rows become durable `quarantined`
+claims and continue consuming capacity. `heartbeat` will not revive an expired
+claim. `release` requires a structured, explicit termination-evidence record,
+but the offline API cannot prove that an OpenCode session or process ended; the
+caller attests this evidence. This is a trust boundary, not native-session
+reconciliation. No process killing, worktree cleanup, dispatch, session
+integration, or automatic release is implemented. `claim` is the only CLI
+operation; heartbeat/release are library APIs for offline callers.
+
+Targeted local evidence on 2026-10-15:
+
+- `python3 -m unittest discover -s tests/ops -p test_opencode_ledger.py -v`:
+  **7 passed**, including eight competing real processes (exactly four
+  admitted), duplicate and parent/child conflicts, traversal/symlink rejection,
+  shared profile/worktree ledger, child-process crash-after-insert rollback, stale-lease
+  quarantine/capacity retention, evidence-required release, and private-path
+  checks.
+- `python3 -m unittest discover -s tests/ops -p test_opencode_builder.py -v`:
+  **3 passed** (existing launcher regression).
+- `git diff --check`: passed.
+- This is LOCAL admission-core evidence only. A07 real bounded-worker/live
+  admission, A08 native restart/reconciliation, and A09 acceptance
+  classification/escalation remain open; independent Sol diff review and CI
+  have not run. M04b failure classification/escalation is out of scope.
+- Token/cached-token usage and cost unavailable in this tool interface;
+  unknown, not zero.

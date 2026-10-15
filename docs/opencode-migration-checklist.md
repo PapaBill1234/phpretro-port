@@ -32,11 +32,16 @@ checklist is a live acceptance result.
   The current coordinator session alone does not qualify the launcher route.
 - [x] One observed Luna 6 high delegated source audit completed using
   `openai/gpt-6-luna#high`. This proves that bounded child turn only.
+- [x] OC2-M04a offline SQLite claim/admission core implemented and locally
+  tested. This does **not** qualify live four-worker admission, native recovery,
+  or acceptance-failure escalation; see evidence below.
 - [ ] Per-profile launcher/delegation and restart recovery qualified; automated
   allowance guard and measured savings remain unqualified.
 - [ ] Native DeepSeek credentials, actual Flash model ID and real route.
 - [ ] DeepSeek-only schedule enforcement before every request and at cutoff.
-- [ ] Shared max-four workers and scoped worktrees.
+- [ ] Shared max-four workers qualified with real bounded workers and scoped
+  worktrees. OC2-M04a has local-only four-slot/path-conflict evidence; A07 stays
+  open until native dispatch qualification.
 - [ ] Durable task receipts/recovery and three-acceptance-failure escalation.
 - [ ] Selected-account reserve checkpoint and manual profile-switch recovery.
 - [ ] Real configured spend enforcement. No cap is currently verified.
@@ -73,6 +78,9 @@ checklist is a live acceptance result.
 3. Independent Sol review OC2-M01-R1 completed: high-level decomposition approved,
    but native request enforcement and paid dispatch remain blocked. M04a offline
    admission core may proceed independently of M02/M03 runtime qualification.
+4. OC2-M04a offline core is implemented on its task branch; no provider calls,
+   native session access, dispatch adapter or process control was used. A07–A09
+   and independent review/integration remain open.
 
 No paid DeepSeek request was dispatched. Luna audit used the native OpenAI route.
 Runtime qualification, spend protection and account allowance remain unknown.
@@ -122,3 +130,29 @@ Classification and deduplicated escalation remain a separate M04b slice.
 Next owned paths for M04a: `scripts/opencode-ledger.py`,
 `tests/ops/test_opencode_ledger.py`, this checklist and migration plan.
 Review performed no tests/probes; actual token usage/cost unknown.
+
+## OC2-M04a local admission-core evidence
+
+Implemented with the bounded paths above. The ledger requires an explicit
+existing absolute private state root, shared by callers across profile and
+worktree locations. SQLite `BEGIN IMMEDIATE` serializes claims; four active or
+quarantined claims consume the total capacity. Duplicate task IDs, traversal,
+symlink aliases and overlapping canonical owned paths (including parent/child)
+are rejected. Expired leases are durably quarantined and never free capacity.
+Release requires explicit structured termination evidence, but this offline
+core cannot verify that native OpenCode actually terminated; this is only a
+caller attestation. No native session/dispatch integration, process killing,
+worktree cleanup, or automatic release is present.
+
+- `python3 -m unittest discover -s tests/ops -p test_opencode_ledger.py -v`:
+  **7 passed** on 2026-10-15. The race test uses eight real child processes and
+  SQLite; exactly four entered and four were denied. A child process exits
+  abruptly after its insert but before commit; SQLite exposes no partial claim.
+- `python3 -m unittest discover -s tests/ops -p test_opencode_builder.py -v`:
+  **3 passed** (launcher regression).
+- `git diff --check`: passed.
+- Evidence is LOCAL only. A07 live worker admission, A08 native restart/session
+  reconciliation, and A09 failure classification/escalation remain open.
+  Independent Sol review and CI have not run; M04b is a separate task.
+- Token/cached-token usage and cost unavailable in this tool interface;
+  unknown, not zero.
