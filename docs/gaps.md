@@ -64,6 +64,13 @@ unchanged. Hosted run `38717087713` on `a54f491` was refused by the old wrapper
 gate before compilation or tests; this change has not yet had a hosted run.
 Compiled qualification remains unverified and G05 stays Partial.
 
+**2026-10-15 direct worker preflight:** Eliza's `deepseek-acp.py` now checks the
+canonical coding window before querying DeepSeek balance. The later supervised
+`deepseek-slots.py` gate still owns worker launch cutoff and four-worker
+admission. Offline behavior tests prove a closed window prevents funding and
+adapter launch, and an open window preserves both in order. This does not prove
+live worker acceptance or enforce a spend ceiling; G05/G06 remain Partial.
+
 ## Entry update format
 
 For each completed slice append: task/issue ID; exact changed behavior; source/reference revision; checks run and results; commit/PR; remaining limitation; status (`missing`, `partial`, `verified`, `blocked-external`). A passing mock or a code-text assertion cannot close an integration gap. Store verbose test artifacts privately or in a sanitized evidence index rather than pasting transcripts here.

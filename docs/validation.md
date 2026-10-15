@@ -235,3 +235,15 @@ questions, one of which was fixed in `5e0e863`); this is not a Sol checkpoint.
 Source-only: live same-UI-Origin acceptance, browser mounting, USER/gateway
 boundaries and the native provider guard remain unqualified; **G06 stays
 Partial**.
+
+## G05/G06 direct DeepSeek ACP gate order — 2026-10-15
+
+`deepseek-acp.py` calls the canonical `coding-window.py` policy before the
+positive-balance preflight. Its launched `deepseek-slots.py` supervisor remains
+in place for cutoff cleanup and four-worker admission. `python3 -m unittest
+tests.ops.test_deepseek_acp -v`: 2 tests passed. The closed-window behavior test
+proves funding, adapter lookup and exec are not reached; the open-window test
+proves the gate precedes funding and preserves the supervised launch argv. All
+provider, adapter and exec collaborators were mocked: no provider request or
+worker ran. Funding/interruption classification is unchanged; live dispatch and
+spend-ceiling enforcement remain open, so G05/G06 stay Partial.

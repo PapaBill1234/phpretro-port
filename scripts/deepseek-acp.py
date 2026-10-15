@@ -8,6 +8,9 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+_window_spec = importlib.util.spec_from_file_location("coding_window", ROOT / "scripts/coding-window.py")
+window_policy = importlib.util.module_from_spec(_window_spec)
+_window_spec.loader.exec_module(window_policy)
 
 
 def main():
@@ -15,6 +18,10 @@ def main():
     spec = importlib.util.spec_from_file_location("claude_builder", ROOT / "scripts/claude-builder.py")
     provider = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(provider)
+    # Check the canonical DeepSeek schedule before even the non-inference balance
+    # request. The supervised slots wrapper below retains the launch cutoff and
+    # four-worker admission check.
+    window_policy.require_allowed()
     models = json.loads((ROOT / "config/models.json").read_text())
     settings = ROOT / ".builder/provider-settings/settings.json"
     if not settings.is_file() or settings.is_symlink() or settings.stat().st_uid != os.getuid() or settings.stat().st_mode & 0o077:
