@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import sqlite3
 import stat
 import sys
@@ -17,6 +18,11 @@ MAX_ACTIVE = 4
 DEFAULT_LEASE_SECONDS = 300
 BUSY_TIMEOUT_SECONDS = 10
 DATABASE_NAME = "opencode-ledger.sqlite3"
+OUTCOME_KINDS = frozenset({
+    "acceptance_pass", "acceptance_failure", "funding", "quota", "schedule",
+    "infrastructure", "model_unavailable", "elapsed_time", "turn_budget",
+    "interrupted", "unresolved",
+})
 
 
 class LedgerError(ValueError):
@@ -95,7 +101,155 @@ def _database(root: Path) -> sqlite3.Connection:
         expires_at REAL NOT NULL,
         termination_evidence TEXT
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS outcomes (
+        attempt_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        claim_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN (
+            'acceptance_pass','acceptance_failure','funding','quota','schedule',
+            'infrastructure','model_unavailable','elapsed_time','turn_budget',
+            'interrupted','unresolved')),
+        acceptance_ran INTEGER NOT NULL CHECK(acceptance_ran IN (0,1)),
+        implementation_attributed INTEGER NOT NULL CHECK(implementation_attributed IN (0,1)),
+        evidence_ref TEXT NOT NULL,
+        failure_signature TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        receipt TEXT NOT NULL
+    )""")
+    connection.execute("CREATE INDEX IF NOT EXISTS outcomes_task ON outcomes(task_id)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS escalation_intents (
+        task_id TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL,
+        created_by_attempt TEXT NOT NULL,
+        reason TEXT NOT NULL
+    )""")
     return connection
+
+
+def _bounded_text(value: object, field: str, maximum: int, *, optional: bool = False) -> str:
+    if value is None and optional:
+        return ""
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise LedgerError(f"{field} must be a non-empty string of at most {maximum} characters")
+    return value.strip()
+
+
+def _safe_label(value: str, field: str) -> str:
+    if value and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value) is None:
+        raise LedgerError(f"{field} must be a bounded opaque reference, not free-form text")
+    return value
+
+
+def _task_outcome_status(connection: sqlite3.Connection, task_id: str) -> dict:
+    failures, same_signature = connection.execute(
+        """SELECT COALESCE(SUM(signature_count), 0), MAX(signature_count) FROM (
+             SELECT failure_signature, COUNT(*) AS signature_count FROM outcomes
+             WHERE task_id=? AND kind='acceptance_failure' GROUP BY failure_signature
+           )""", (task_id,)).fetchone()
+    if failures is None:
+        failures, same_signature = 0, 0
+    pause = connection.execute(
+        "SELECT 1 FROM outcomes WHERE task_id=? AND kind='funding' LIMIT 1", (task_id,)
+    ).fetchone() is not None
+    intent = connection.execute(
+        "SELECT created_by_attempt, reason FROM escalation_intents WHERE task_id=?", (task_id,)
+    ).fetchone()
+    return {
+        "task_id": task_id,
+        "acceptance_failures": failures,
+        "identical_failure_count": same_signature or 0,
+        "routine_retry_blocked": failures >= 3 or (same_signature or 0) >= 2,
+        "sol_help_intent": None if intent is None else {
+            "created_by_attempt": intent[0], "reason": intent[1]},
+        "funding_paused": pause,
+    }
+
+
+def record_outcome(state_root: Path, *, task_id: str, claim_id: str, attempt_id: str,
+                   kind: str, acceptance_ran: bool = False,
+                   implementation_attributed: bool = False,
+                   evidence_ref: str | None = None,
+                   failure_signature: str | None = None) -> dict:
+    """Persist a caller-attested task result; this never dispatches or releases a claim."""
+    task = _bounded_text(task_id, "task ID", 128)
+    claim = _bounded_text(claim_id, "claim ID", 64)
+    attempt = _bounded_text(attempt_id, "attempt ID", 128)
+    if not isinstance(kind, str) or kind not in OUTCOME_KINDS:
+        raise LedgerError("outcome kind is not an allowed typed value")
+    if type(acceptance_ran) is not bool or type(implementation_attributed) is not bool:
+        raise LedgerError("acceptance evidence flags must be booleans")
+    evidence = _bounded_text(evidence_ref, "evidence reference", 256, optional=True)
+    signature = _bounded_text(failure_signature, "failure signature", 256, optional=True)
+    _safe_label(evidence, "evidence reference")
+    _safe_label(signature, "failure signature")
+    if kind == "acceptance_failure":
+        if acceptance_ran is not True or implementation_attributed is not True or not evidence or not signature:
+            raise LedgerError("counted acceptance failure requires caller-attested run, implementation attribution, evidence and signature")
+    elif kind == "acceptance_pass":
+        if acceptance_ran is not True or not evidence:
+            raise LedgerError("acceptance pass requires caller-attested acceptance run and evidence")
+        if implementation_attributed or signature:
+            raise LedgerError("acceptance pass cannot carry failure attribution")
+    elif acceptance_ran or implementation_attributed or evidence or signature:
+        raise LedgerError("non-acceptance outcomes cannot carry acceptance-failure evidence")
+
+    root = _canonical_private_root(Path(state_root))
+    connection = _database(root)
+    payload = json.dumps({
+        "task_id": task, "claim_id": claim, "attempt_id": attempt, "kind": kind,
+        "acceptance_ran": acceptance_ran, "implementation_attributed": implementation_attributed,
+        "evidence_ref": evidence, "failure_signature": signature,
+    }, sort_keys=True, separators=(",", ":"))
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute("SELECT payload, receipt FROM outcomes WHERE attempt_id=?", (attempt,)).fetchone()
+        if existing is not None:
+            if existing[0] != payload:
+                raise LedgerError("attempt ID already exists with conflicting outcome")
+            receipt = json.loads(existing[1])
+            connection.commit()
+            return receipt
+        owner = connection.execute("SELECT task_id FROM claims WHERE claim_id=?", (claim,)).fetchone()
+        if owner is None or owner[0] != task:
+            raise LedgerError("outcome claim does not belong to task")
+        connection.execute("""INSERT INTO outcomes
+            (attempt_id, task_id, claim_id, kind, acceptance_ran,
+             implementation_attributed, evidence_ref, failure_signature, payload, receipt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
+            (attempt, task, claim, kind, int(acceptance_ran), int(implementation_attributed),
+             evidence, signature, payload))
+        failure_count = connection.execute(
+            "SELECT COUNT(*) FROM outcomes WHERE task_id=? AND kind='acceptance_failure'", (task,)
+        ).fetchone()[0]
+        if failure_count >= 3:
+            connection.execute("""INSERT OR IGNORE INTO escalation_intents
+                (task_id, claim_id, created_by_attempt, reason) VALUES (?, ?, ?, ?)""",
+                (task, claim, attempt, "three caller-attested implementation acceptance failures"))
+        receipt = _task_outcome_status(connection, task)
+        receipt.update({"attempt_id": attempt, "kind": kind, "recorded": True})
+        connection.execute("UPDATE outcomes SET receipt=? WHERE attempt_id=?",
+                           (json.dumps(receipt, sort_keys=True, separators=(",", ":")), attempt))
+        connection.commit()
+        return receipt
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_task_status(state_root: Path, task_id: str) -> dict:
+    """Return durable local outcome counters and escalation/pause indicators."""
+    task = _bounded_text(task_id, "task ID", 128)
+    root = _canonical_private_root(Path(state_root))
+    connection = _database(root)
+    try:
+        if connection.execute("SELECT 1 FROM claims WHERE task_id=?", (task,)).fetchone() is None:
+            raise LedgerError("unknown task")
+        return _task_outcome_status(connection, task)
+    finally:
+        connection.close()
 
 
 def _canonical_worktree(worktree: Path) -> Path:

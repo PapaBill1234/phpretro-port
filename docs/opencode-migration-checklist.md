@@ -35,6 +35,9 @@ checklist is a live acceptance result.
 - [x] OC2-M04a offline SQLite claim/admission core implemented and locally
   tested. This does **not** qualify live four-worker admission, native recovery,
   or acceptance-failure escalation; see evidence below.
+- [x] OC2-M04b offline typed outcome ledger and idempotent escalation-intent
+  recording implemented and locally tested. This does **not** qualify A09 live
+  acceptance evidence or dispatch; see evidence below.
 - [ ] Per-profile launcher/delegation and restart recovery qualified; automated
   allowance guard and measured savings remain unqualified.
 - [ ] Native DeepSeek credentials, actual Flash model ID and real route.
@@ -157,7 +160,39 @@ worktree cleanup, or automatic release is present.
 - Evidence is LOCAL only. A07 live worker admission, A08 native restart/session
   reconciliation, and A09 failure classification/escalation remain open.
   Sol's review of `1665791` identified branch/worktree isolation and DB
-  initialization mode races; this correction addresses both. Independent
-  re-review and CI have not run; M04b is a separate task.
+  initialization mode races; this correction addresses both. Commit `3699b01`
+  was independently Sol-reviewed per the assigned M04b handoff; review evidence
+  is recorded in parent checklist commit `899e639`. M04b is separately
+  implemented below; its independent review and CI have not run.
 - Token/cached-token usage and cost unavailable in this tool interface;
   unknown, not zero.
+
+## OC2-M04b local outcome-core evidence
+
+The ledger records bounded typed outcomes against a durable task claim. Counted
+acceptance failures require caller-attested acceptance execution and
+implementation attribution, plus opaque evidence/signature labels. Unknown or
+bare-exit outcomes stay unresolved. Funding is a durable paused indicator;
+quota, schedule, infrastructure, model unavailability, elapsed time, turn
+budget and interruption outcomes never count as acceptance failures. Success
+does not erase prior failures.
+
+Attempt IDs are immutable and globally unique; exact replays return the original
+receipt, while conflicting payloads and cross-task claim bindings are rejected.
+Status survives process restart. The second identical failure blocks unchanged
+routine retry; the third counted failure persists one Sol-help intent and blocks
+routine retry. This intent is not dispatch, and recording an outcome never
+releases a claim. Evidence is caller-attested; the ledger cannot prove
+acceptance ran or attribution is true.
+
+- `python3 -m unittest discover -s tests/ops -p 'test_opencode*.py' -v`:
+  **24 passed** on 2026-10-15. Includes typed positive/negative outcomes,
+  excluded interruptions, bare-exit/unresolved handling, strict type checks,
+  immutable replay/conflict, task binding, two-identical stop, three-failure
+  one-intent durability, funding pause, restart and six concurrent child
+  processes with duplicate replay; existing admission/launcher regression tests
+  also passed.
+- `git diff --check`: passed.
+- A09 remains open: no real acceptance runner/receipt verifier, native dispatch,
+  actual Sol help request, or live qualification. Independent M04b review and CI
+  have not run. Usage and cost unavailable; unknown, not zero.

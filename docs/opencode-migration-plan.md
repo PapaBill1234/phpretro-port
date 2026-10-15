@@ -206,7 +206,8 @@ Dependencies are gates, not permission to launch all rows concurrently.
 | OC2-M02 | Luna-high: read-only pinned-contract audit and local fake-provider probe design; Sol reviews blocking/cancellation conclusions | Fresh selected-account quota; exact supported denial/cancel mechanism proven in 2.0.29. No paid DeepSeek request. |
 | OC2-M03 | Luna-high: quota metadata acquisition/validation and private checkpoint tests | Supported source identified; wrong/stale/missing account and reserve tests; native manual login/model/delegation evidence. |
 | OC2-M04 | Luna-high: canonical shared task ledger and atomic admission, no provider dispatch | Concurrent claims across profiles, path overlap, crash/restart/quarantine and failure classification tests. |
-| OC2-M04a | Luna-high: offline SQLite claim/admission core only; no native sessions or dispatch | Local implementation/tests recorded below; independent review pending. This does not qualify A07–A09 or live admission. |
+| OC2-M04a | Luna-high: offline SQLite claim/admission core only; no native sessions or dispatch | Local implementation/tests recorded below; corrected commit independently Sol-reviewed. This does not qualify A07–A09 or live admission. |
+| OC2-M04b | Luna-high: offline typed task outcomes and idempotent Sol-help intent only; no dispatch | Local tests recorded below; caller-attested evidence, A09 live/native qualification and independent review remain open. |
 | OC2-M05 | Luna-high: native DeepSeek-only request guard | M02 architecture reviewed; fake transport proves deny/retry/active cutoff; Sol non-interference; fail-closed plugin startup. |
 | OC2-M06 | Luna-high: V2 session/worktree dispatch adapter, receipts and escalation | M03–M05 reviewed; four-worker supervision and restart acceptance; verified spend enforcement before any autonomous paid send. |
 | OC2-M07 | Luna-high: real-route acceptance evidence and redacted GitHub progress; Sol independent final review | Verified live route, spend protection, all checklist gates and CI. No PHPRetro unpause inferred. |
@@ -288,10 +289,44 @@ Targeted local evidence on 2026-10-15:
   active claims did not reserve branch/worktree identity, and SQLite first
   creation could briefly produce a 0644 DB under umask 022. This correction
   adds atomic active/quarantined identity checks and secure exclusive creation;
-  regression evidence is above. Independent re-review is pending.
+  regression evidence is above. Corrected commit `3699b01` was independently
+  Sol-reviewed per assigned handoff evidence in parent checklist `899e639`.
 - This is LOCAL admission-core evidence only. A07 real bounded-worker/live
-  admission, A08 native restart/reconciliation, and A09 acceptance
-  classification/escalation remain open; CI has not run. M04b failure
-  classification/escalation is out of scope.
+  admission, A08 native restart/reconciliation, and A09 live/native qualification
+  remain open; CI has not run. OC2-M04b implements offline outcome recording
+  separately; it does not qualify live acceptance classification/escalation.
 - Token/cached-token usage and cost unavailable in this tool interface;
   unknown, not zero.
+
+## OC2-M04b offline outcome evidence
+
+`scripts/opencode-ledger.py` adds `record_outcome` and `get_task_status` to the
+existing private SQLite ledger. Outcomes bind to an existing durable claim and
+task. Counted implementation failures require caller-attested acceptance-run
+and implementation-attribution booleans, an evidence reference, and a stable
+failure signature. Evidence references/signatures accept only bounded opaque
+labels (not free-form logs or prompts). A bare exit result is not enough;
+callers must record `unresolved` unless the declared acceptance evidence is
+available. Typed funding, quota, schedule, infrastructure, unavailable-model,
+elapsed-time, turn-budget, interruption and unresolved outcomes never increment
+acceptance failures. Funding remains a durable paused indication.
+
+Attempt IDs are globally unique and bind immutable payload/receipt data. Exact
+replay returns the original receipt; conflicting replay or a claim/task mismatch
+is rejected transactionally. Two failures with one signature block unchanged
+routine retry; three counted failures durably create one Sol-help intent and
+block routine retry. The intent is data only: no Sol request, provider call,
+claim release, or native dispatch occurs. Success records do not erase earlier
+failures. The caller-attestation boundary means this local ledger does not prove
+that acceptance commands actually ran or that attribution is correct.
+
+- `python3 -m unittest discover -s tests/ops -p 'test_opencode*.py' -v`:
+  **24 passed** on 2026-10-15, including the existing admission/launcher tests,
+  typed positive/negative outcome cases, excluded interruption classes,
+  idempotent/conflicting receipts, cross-task binding, restart durability,
+  funding pause, two-identical stop, three-failure single intent, and six real
+  concurrent child processes plus duplicate replay.
+- `git diff --check`: passed.
+- Local offline evidence only; A09 live/native qualification, independent
+  review, CI, and any dispatch integration remain open. Token/cached-token usage
+  and cost unavailable in this interface; unknown, not zero.
