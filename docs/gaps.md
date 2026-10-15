@@ -74,6 +74,8 @@ New findings become a gap before their corresponding work is declared done. Reop
 
 The continuation runner's operational test now treats only ENOENT/ESRCH while reading a grandchild's `/proc/<pid>/stat` as a gone process. Permission/I/O failures and malformed stat content still fail the test; live process states remain rejected. The real leader/grandchild launch and production `terminate_group` remain unchanged. Zombie state or disappearance establishes that the grandchild is not running, not that it was reaped. This test-only repair does not close G06; automated integration and pricing enforcement remain open. Evidence/check results are in [validation](validation.md).
 
+The dashboard's corresponding real-process-group test accepts `X` in addition to `Z` and `gone`, matching Linux's documented dead state for `/proc/<pid>/stat`; this only corrects the test's terminal-state observation.
+
 ## G02/G04/G09 implementation checkpoint — 2026-10-11
 
 Existing Polaris identities are read through column-scoped grants, with exact epoch/bcrypt/ban semantics. CMS staff enrollment is independent of game rank; fixed-lifetime Redis sessions observe live password/version and staff credential revisions. TOTP replay is enforced durably in MariaDB. Housekeeping updates site/theme/languages using locked authorization, revision conflicts and atomic audit. React implements login/logout, staff settings and conflict/error handling with memory-only CSRF.

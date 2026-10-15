@@ -25,6 +25,7 @@ DIRECT_ROUTE = {"serviceRouting": {"llmText": {"backend": "openai", "transport":
 REPO_PIN = "a" * 40
 BUN_VERSION = "1.4.2"
 NODE_VERSION = "v24.15.0"
+TERMINAL_PROC_STATES = ("X", "Z", "gone")
 
 # Regression fixture for the generated DeepSeek chat-compat module. Run under
 # the available Bun/Node runtimes when present; it never hits the network.
@@ -592,10 +593,10 @@ class DashboardTests(unittest.TestCase):
             dash.terminate_group(proc, 0.05)
             self.assertIsNotNone(proc.poll())
             for _ in range(100):
-                if proc_state(grandchild) in ("Z", "gone"):
+                if proc_state(grandchild) in TERMINAL_PROC_STATES:
                     break
                 time.sleep(0.02)
-            self.assertIn(proc_state(grandchild), ("Z", "gone"))
+            self.assertIn(proc_state(grandchild), TERMINAL_PROC_STATES)
         finally:
             if proc.poll() is None:
                 dash.terminate_group(proc, 0.05)

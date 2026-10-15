@@ -2,6 +2,8 @@
 
 The cleanup regression check uses the real leader/grandchild launch and unchanged production `terminate_group`. Test-local `/proc/<pid>/stat` observation maps only `FileNotFoundError`/`ProcessLookupError` to `gone`; other I/O/permission errors and malformed contents propagate, and non-zombie live states remain rejected. Accepted `Z`/`gone` means not running; it does not prove the grandchild was reaped. Focused, complete ops-suite and predetermined repeated real-cleanup test results are recorded in the worker handoff after execution. This does not enable the game or resolve full-port/budget limits.
 
+The dashboard's real process-group regression check also accepts `X` as terminal: Linux `/proc/<pid>/stat` defines `X` as dead ([proc_pid_stat(5)](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)). The accepted observations are exactly `X`, `Z`, and `gone`; live states, malformed stat data and read errors remain failures. Production termination and PID identity checks are unchanged.
+
 ## G05 resource-fit contract — 2026-10-14
 
 Independent architecture and final native Sol source reviews accepted worker
