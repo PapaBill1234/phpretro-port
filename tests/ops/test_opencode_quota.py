@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "opencode-quota.py"
@@ -108,6 +110,16 @@ class QuotaEvidenceTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertEqual(reason, self.validate(item)["reason"])
 
+    def test_freshness_boundary_and_independent_observation_age(self):
+        exact_boundary = self.evidence(
+            observed_at=(self.now - timedelta(seconds=300)).isoformat(),
+            verified_at=(self.now - timedelta(seconds=300)).isoformat())
+        self.assertEqual("allow", self.validate(exact_boundary)["decision"])
+        old_observation = self.evidence(
+            observed_at=(self.now - timedelta(seconds=301)).isoformat(),
+            verified_at=(self.now - timedelta(seconds=1)).isoformat())
+        self.assertEqual("stale_evidence", self.validate(old_observation)["reason"])
+
     def test_invalid_numeric_values_and_boolean_are_rejected(self):
         for value in (True, float("nan"), float("inf"), -1, 101, "50"):
             with self.subTest(value=value):
@@ -115,6 +127,35 @@ class QuotaEvidenceTests(unittest.TestCase):
                     {"id": "q", "percentage": value, "basis": "remaining"}]))
                 self.assertEqual("blocked", result["decision"])
                 self.assertEqual("invalid_percentage", result["reason"])
+
+    def test_invalid_duration_and_duplicate_window_ids_block(self):
+        for duration in (True, 0, -5, 2.5):
+            with self.subTest(duration=duration):
+                result = self.validate(self.evidence([
+                    {"id": "q", "percentage": 50, "basis": "remaining",
+                     "duration_minutes": duration}]))
+                self.assertEqual("invalid_window_duration", result["reason"])
+        duplicate = self.evidence([
+            {"id": "same", "percentage": 50, "basis": "remaining"},
+            {"id": "same", "percentage": 60, "basis": "remaining"},
+        ])
+        self.assertEqual("invalid_window_id", self.validate(duplicate)["reason"])
+
+    def test_both_profiles_and_bindings_are_checked_against_callers_expectation(self):
+        for profile, binding in (("primary", "opaque-primary-1"),
+                                 ("secondary", "opaque-secondary-1")):
+            with self.subTest(profile=profile):
+                item = self.evidence(profile=profile, connection_binding=binding)
+                result = quota.validate_evidence(item, expected_profile=profile,
+                                                 expected_binding=binding, now=self.now)
+                self.assertEqual("allow", result["decision"])
+        item = self.evidence(profile="secondary", connection_binding="opaque-secondary-1")
+        self.assertEqual("profile_mismatch", quota.validate_evidence(
+            item, expected_profile="primary", expected_binding="opaque-secondary-1",
+            now=self.now)["reason"])
+        self.assertEqual("binding_mismatch", quota.validate_evidence(
+            item, expected_profile="secondary", expected_binding="wrong-binding",
+            now=self.now)["reason"])
 
     def test_reset_passing_does_not_allow_stale_evidence_or_auto_resume(self):
         item = self.evidence([
@@ -154,12 +195,79 @@ class QuotaEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink_path_component"):
                 quota.write_checkpoint(link, item, decision, expected_profile="primary",
                                        expected_binding="opaque-primary-1", now=self.now)
+            traversal = actual / ".." / "actual"
+            with self.assertRaisesRegex(ValueError, "checkpoint_root_must_be_canonical"):
+                quota.write_checkpoint(traversal, item, decision,
+                                       expected_profile="primary",
+                                       expected_binding="opaque-primary-1", now=self.now)
+            noncanonical = str(actual.parent) + "//actual"
+            with self.assertRaisesRegex(ValueError, "checkpoint_root_must_be_canonical"):
+                quota.write_checkpoint(noncanonical, item, decision,
+                                       expected_profile="primary",
+                                       expected_binding="opaque-primary-1", now=self.now)
             unsafe = actual / "opencode-quota-handoff.json"
             unsafe.write_text("not-private")
             os.chmod(unsafe, 0o644)
             with self.assertRaisesRegex(ValueError, "unsafe_checkpoint_target"):
                 quota.write_checkpoint(actual, item, decision, expected_profile="primary",
                                        expected_binding="opaque-primary-1", now=self.now)
+
+    def test_foreign_owned_root_and_target_fail_without_mutating_private_state(self):
+        item = self.evidence()
+        decision = self.validate(item)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as temp:
+            root = Path(temp)
+            os.chmod(root, 0o700)
+            target = root / "opencode-quota-handoff.json"
+            target.write_text("preexisting owned state")
+            os.chmod(target, 0o600)
+            initial_entries = sorted(p.name for p in root.iterdir())
+            original_lstat = Path.lstat
+
+            def foreign_root_lstat(path):
+                info = original_lstat(path)
+                if path == root:
+                    return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1)
+                return info
+
+            with patch.object(Path, "lstat", foreign_root_lstat):
+                with self.assertRaisesRegex(ValueError, "checkpoint_root_not_owned"):
+                    quota.write_checkpoint(root, item, decision, expected_profile="primary",
+                                           expected_binding="opaque-primary-1", now=self.now)
+            self.assertEqual("preexisting owned state", target.read_text())
+            self.assertEqual(initial_entries, sorted(p.name for p in root.iterdir()))
+
+            def foreign_target_lstat(path):
+                info = original_lstat(path)
+                if path == target:
+                    return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1)
+                return info
+
+            with patch.object(Path, "lstat", foreign_target_lstat):
+                with self.assertRaisesRegex(ValueError, "checkpoint_target_not_owned"):
+                    quota.write_checkpoint(root, item, decision, expected_profile="primary",
+                                           expected_binding="opaque-primary-1", now=self.now)
+            self.assertEqual("preexisting owned state", target.read_text())
+            self.assertEqual(initial_entries, sorted(p.name for p in root.iterdir()))
+
+    def test_symlink_checkpoint_target_is_not_replaced(self):
+        item = self.evidence()
+        decision = self.validate(item)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as temp:
+            root = Path(temp) / "root"
+            root.mkdir(mode=0o700)
+            os.chmod(root, 0o700)
+            target = root / "opencode-quota-handoff.json"
+            outside = Path(temp) / "outside.json"
+            outside.write_text("unrelated")
+            target.symlink_to(outside)
+            initial_entries = sorted(p.name for p in root.iterdir())
+            with self.assertRaisesRegex(ValueError, "unsafe_checkpoint_target"):
+                quota.write_checkpoint(root, item, decision, expected_profile="primary",
+                                       expected_binding="opaque-primary-1", now=self.now)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual("unrelated", outside.read_text())
+            self.assertEqual(initial_entries, sorted(p.name for p in root.iterdir()))
 
     def test_checkpoint_requires_fresh_matching_validated_decision(self):
         item = self.evidence()

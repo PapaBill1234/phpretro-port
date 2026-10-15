@@ -9,7 +9,8 @@ dispatch. The operator must explicitly attest that the browser account matches
 the selected OpenCode connection and that all applicable reported windows are
 included. A caller-supplied opaque binding must match the selected profile's
 expected binding. This is an operator trust boundary, not programmatic identity
-verification.
+verification; opaque metadata is not semantically scanned for secrets, so the
+operator must ensure bindings contain no credentials or personal data.
 
 ## Evidence schema v1
 
@@ -45,15 +46,20 @@ dispatch.
 
 ## Private checkpoint
 
-`write_checkpoint` requires an already-existing absolute root whose components
-are not symlinks and whose final directory is mode 0700. It writes only a
-validated, whitelisted JSON handoff, using a mode-0600 exclusive temporary file,
-fsync and atomic replacement. It rejects unsafe pre-existing targets. Tests
-use synthetic temporary directories only. Never put credentials, account names,
-transcripts, arbitrary operator notes or task contents in the record. A saved
-checkpoint is not resumable authority: resume requires a new manual observation
-and verification, including after an apparent reset. No connection/account
-switch, reset credit use, automatic reconciliation, or auto-resume occurs.
+`write_checkpoint` requires an already-existing absolute root with canonical
+path spelling (no parent traversal or redundant separators), no symlink
+components, current-user ownership and mode 0700. It writes only whitelisted
+operator-supplied metadata, using a mode-0600 exclusive temporary file, fsync
+and atomic replacement. Existing targets must be current-user-owned private
+regular files; unsafe targets are rejected without replacement. These checks
+are not an OS sandbox and do not promise protection against a malicious
+same-user process racing path changes. Tests use synthetic temporary
+directories only. Never put credentials, account names, transcripts, arbitrary
+operator notes or task contents in the record; schema whitelisting cannot detect
+sensitive text misused as an opaque binding. A saved checkpoint is not
+resumable authority: resume requires a new manual observation and verification,
+including after an apparent reset. No connection/account switch, reset credit
+use, automatic reconciliation, or auto-resume occurs.
 
 This closes only an offline evidence-validation slice; it is not live quota
 measurement, an autonomous guard, proof of spend safety, nor closure of A10.

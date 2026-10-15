@@ -146,9 +146,11 @@ def validate_evidence(
         return {"decision": "blocked", "dispatch_allowed": False, "reason": reason}
 
 
-def _check_private_root(root: Path) -> None:
+def _check_private_root(root: Path, raw_path: str | None = None) -> None:
     if not root.is_absolute():
         raise ValueError("checkpoint_root_must_be_absolute")
+    if ".." in root.parts or (raw_path is not None and raw_path != str(root)):
+        raise ValueError("checkpoint_root_must_be_canonical")
     current = Path(root.anchor)
     for part in root.parts[1:]:
         current = current / part
@@ -158,14 +160,19 @@ def _check_private_root(root: Path) -> None:
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError("checkpoint_root_must_be_private_directory")
+    if info.st_uid != os.getuid():
+        raise ValueError("checkpoint_root_not_owned")
 
 
 def write_checkpoint(root: str | os.PathLike[str], evidence: Any, decision: dict[str, Any],
                      *, expected_profile: str, expected_binding: str,
                      now: datetime, filename: str = "opencode-quota-handoff.json") -> Path:
-    """Atomically write validated, secret-free evidence beneath an existing private root."""
+    """Atomically write whitelisted operator-supplied metadata beneath a private root."""
     root_path = Path(root)
-    _check_private_root(root_path)
+    raw_root = os.fspath(root)
+    if not isinstance(raw_root, str):
+        raise ValueError("checkpoint_root_must_be_canonical")
+    _check_private_root(root_path, raw_root)
     if (Path(filename).name != filename or filename in {".", ".."}
             or not filename.endswith(".json")):
         raise ValueError("invalid_checkpoint_filename")
@@ -181,6 +188,8 @@ def write_checkpoint(root: str | os.PathLike[str], evidence: Any, decision: dict
     if existing is not None and (
             not stat.S_ISREG(existing.st_mode) or stat.S_IMODE(existing.st_mode) & 0o077):
         raise ValueError("unsafe_checkpoint_target")
+    if existing is not None and existing.st_uid != os.getuid():
+        raise ValueError("checkpoint_target_not_owned")
     payload = {
         "schema_version": 1,
         "decision": result["decision"],
