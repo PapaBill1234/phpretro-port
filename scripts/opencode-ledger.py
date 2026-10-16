@@ -162,13 +162,46 @@ def _opaque_id(value: object, field: str, maximum: int = 128) -> str:
 
 
 def _finite_clock(value: object | None) -> float:
-    try:
-        stamp = time.time() if value is None else float(value)
-    except (TypeError, ValueError, OverflowError):
-        raise LedgerError("clock must be finite and non-negative") from None
+    if value is None:
+        stamp = time.time()
+    elif type(value) in (int, float):
+        stamp = float(value)
+    else:
+        raise LedgerError("clock must be an int or float (not bool), finite and non-negative")
     if not math.isfinite(stamp) or stamp < 0:
         raise LedgerError("clock must be finite and non-negative")
     return stamp
+
+
+def _read_database(root: Path) -> sqlite3.Connection | None:
+    """Open an existing private ledger read-only; never initialize or migrate."""
+    path = root / DATABASE_NAME
+    try:
+        before_open = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before_open.st_mode) or before_open.st_uid != os.getuid():
+        raise LedgerError("ledger database must be an owned regular file")
+    if stat.S_IMODE(before_open.st_mode) & 0o077:
+        raise LedgerError("ledger database must be private (mode 0600)")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise LedgerError("ledger database changed during validation") from None
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid()
+                or (opened.st_dev, opened.st_ino) != (before_open.st_dev, before_open.st_ino)):
+            raise LedgerError("ledger database changed during validation")
+    finally:
+        os.close(descriptor)
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True,
+                                     timeout=BUSY_TIMEOUT_SECONDS)
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+    except sqlite3.Error:
+        raise LedgerError("ledger database could not be opened read-only") from None
 
 
 def bind_session(state_root: Path, *, task_id: str, claim_id: str,
@@ -201,7 +234,7 @@ def bind_session(state_root: Path, *, task_id: str, claim_id: str,
                 connection.commit()
                 return receipt
             raise LedgerError("conflicting session binding already exists")
-        owner = connection.execute("SELECT task_id, profile, state, expires_at FROM claims WHERE claim_id=?",
+        owner = connection.execute("SELECT task_id, profile, state, expires_at, heartbeat_at FROM claims WHERE claim_id=?",
                                    (claim,)).fetchone()
         if owner is None or owner[0] != task:
             raise LedgerError("binding claim does not belong to task")
@@ -209,6 +242,8 @@ def bind_session(state_root: Path, *, task_id: str, claim_id: str,
             raise LedgerError("binding profile does not match claim")
         if owner[2] != "active" or owner[3] <= stamp:
             raise LedgerError("binding requires an active unexpired claim")
+        if stamp < owner[4]:
+            raise LedgerError("binding clock predates claim heartbeat")
         receipt = {"task_id": task, "claim_id": claim, "session_id": session,
                    "project_id": project, "profile": selected_profile,
                    "server_scope": scope, "created_at": stamp}
@@ -232,15 +267,26 @@ def bind_session(state_root: Path, *, task_id: str, claim_id: str,
 
 
 def get_session_binding(state_root: Path, *, task_id: str, claim_id: str) -> dict | None:
-    """Read one raw durable binding through the explicitly private API."""
+    """Read one existing binding, or return None for any explicitly unknown row/schema.
+
+    This is a genuinely read-only access path: it neither creates the ledger nor
+    migrates a legacy schema. Raw identifiers are exposed only to this private API.
+    """
     task = _opaque_id(task_id, "task ID")
     claim = _opaque_id(claim_id, "claim ID", 64)
     root = _canonical_private_root(Path(state_root))
-    connection = _database(root)
+    connection = _read_database(root)
+    if connection is None:
+        return None
     try:
-        row = connection.execute("""SELECT task_id, claim_id, session_id, project_id,
-            profile, server_scope, created_at FROM session_bindings
-            WHERE task_id=? AND claim_id=?""", (task, claim)).fetchone()
+        try:
+            row = connection.execute("""SELECT task_id, claim_id, session_id, project_id,
+                profile, server_scope, created_at FROM session_bindings
+                WHERE task_id=? AND claim_id=?""", (task, claim)).fetchone()
+        except sqlite3.Error as error:
+            if isinstance(error, sqlite3.OperationalError) and "no such table" in str(error).lower():
+                return None
+            raise LedgerError("binding ledger read failed") from None
         if row is None:
             return None
         return dict(zip(("task_id", "claim_id", "session_id", "project_id",

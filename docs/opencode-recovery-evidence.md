@@ -79,8 +79,18 @@ not prove termination, safe prompt replay, or live recovery qualification.
 
 The APIs perform no auth, quota, plugin, provider, server, or native API calls.
 They do not launch/stop sessions or issue prompts. The raw read API is private
-ledger access and the CLI intentionally provides no raw binding output. Tests
-cover additive migration with existing claim/outcome rows, persistence, replay,
-reject paths, cross-profile session collisions, different-scope semantics,
-concurrent insertion, and rollback. No dispatch or native binding verification
-is claimed.
+ledger access and the CLI intentionally provides no raw binding output. It
+opens only an existing private database in SQLite read-only/query-only mode;
+an absent database or legacy database without the bindings table returns
+`None` (unknown) without initializing or migrating anything. Unsafe database
+files produce a bounded `LedgerError`. Schema migration is performed only on
+the write path. New bindings require an exact int/float non-negative finite
+clock not earlier than the claim heartbeat; booleans and numeric strings are
+rejected. An identical existing binding is historical receipt retrieval, not a
+new admission: it returns the original receipt even if the claim has since
+expired, and does not alter timestamps or claim state. Tests cover read-only
+filesystem/DB preservation, legacy unknown then write-path migration, clock
+validation/order, additive migration with existing claim/outcome rows,
+persistence, replay, reject paths, cross-profile session collisions,
+different-scope semantics, concurrent insertion, and rollback. No dispatch or
+native binding verification is claimed.

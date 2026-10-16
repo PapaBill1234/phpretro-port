@@ -259,3 +259,13 @@ The full focused OpenCode suite passed (63 tests), as did
 `python3 scripts/repo-check.py` and `git diff --check`. These local checks do
 not qualify dispatch, native binding verification, or live recovery. Token
 usage/cost unavailable; unknown, not zero.
+
+### OC2-M06-R2 review correction
+
+The private binding reader now uses an existing-file read-only/query-only
+connection, does not initialize or migrate, and reports absent database/schema
+as unknown. The write path alone migrates. Clocks reject booleans and numeric
+strings, and new binding times cannot predate claim heartbeat. Identical replay
+is historical receipt retrieval even after expiry; it does not renew admission.
+Read-only filesystem-preservation, empty-root, legacy-schema, and clock-order
+regressions are covered in the updated focused suite.

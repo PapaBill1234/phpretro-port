@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -42,8 +44,15 @@ class BindingTests(unittest.TestCase):
     def test_durable_exact_binding_replay_and_private_read(self):
         claim = self.add()
         receipt = self.bind("task-a", claim, now=11)
-        self.assertEqual(self.bind("task-a", claim, now=99), receipt)
+        # A replay returns the historical receipt; it is not new admission and
+        # does not revalidate a lease that has since expired.
+        self.assertEqual(self.bind("task-a", claim, now=111), receipt)
+        path = self.state / ledger.DATABASE_NAME
+        digest_before = hashlib.sha256(path.read_bytes()).digest()
+        entries_before = sorted(item.name for item in self.state.iterdir())
         self.assertEqual(ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim), receipt)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), digest_before)
+        self.assertEqual(sorted(item.name for item in self.state.iterdir()), entries_before)
         with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
             self.assertEqual(db.execute("SELECT created_at FROM session_bindings").fetchone()[0], 11)
         self.assertEqual(ledger.get_session_binding(self.state, task_id="missing", claim_id=claim), None)
@@ -94,7 +103,7 @@ class BindingTests(unittest.TestCase):
                            ("profile", "bad profile")):
             with self.subTest(key=key), self.assertRaises(ledger.LedgerError):
                 ledger.bind_session(self.state, **(base | {key: value}), now=11)
-        for clock in (float("nan"), float("inf"), -1, "nope"):
+        for clock in (float("nan"), float("inf"), -1, "nope", True, False, "11"):
             with self.subTest(clock=clock), self.assertRaises(ledger.LedgerError):
                 ledger.bind_session(self.state, **base, now=clock)
 
@@ -107,15 +116,38 @@ class BindingTests(unittest.TestCase):
             before = db.execute("SELECT * FROM claims").fetchall()
             outcomes = db.execute("SELECT * FROM outcomes").fetchall()
             db.execute("DROP TABLE session_bindings")  # emulate pre-binding ledger
-        with sqlite3.connect(path) as db:
-            db.execute("CREATE TABLE claims_backup AS SELECT * FROM claims")
-            db.execute("CREATE TABLE outcomes_backup AS SELECT * FROM outcomes")
-        ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim)
+        digest_before = hashlib.sha256(path.read_bytes()).digest()
+        entries_before = sorted(item.name for item in self.state.iterdir())
+        self.assertIsNone(ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim))
+        self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), digest_before)
+        self.assertEqual(sorted(item.name for item in self.state.iterdir()), entries_before)
+        # The write path owns migration; the reader above must leave the legacy DB intact.
+        self.assertEqual(self.bind("task-a", claim, now=11)["task_id"], "task-a")
         with sqlite3.connect(path) as db:
             self.assertEqual(db.execute("SELECT * FROM claims").fetchall(), before)
             self.assertEqual(db.execute("SELECT * FROM outcomes").fetchall(), outcomes)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM session_bindings").fetchone()[0], 0)
-        self.assertEqual(self.bind("task-a", claim, now=11)["task_id"], "task-a")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM session_bindings").fetchone()[0], 1)
+
+    def test_read_of_empty_root_is_unknown_and_creates_nothing(self):
+        before = sorted(item.name for item in self.state.iterdir())
+        self.assertIsNone(ledger.get_session_binding(self.state, task_id="task", claim_id="claim"))
+        self.assertEqual(sorted(item.name for item in self.state.iterdir()), before)
+        self.assertFalse((self.state / ledger.DATABASE_NAME).exists())
+
+    def test_read_rejects_unsafe_database_file(self):
+        claim = self.add()
+        path = self.state / ledger.DATABASE_NAME
+        os.chmod(path, 0o644)
+        with self.assertRaisesRegex(ledger.LedgerError, "private"):
+            ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim)
+        os.chmod(path, 0o600)
+
+    def test_binding_clock_cannot_predate_claim_creation(self):
+        claim = self.add(now=20, lease=100)
+        with self.assertRaisesRegex(ledger.LedgerError, "predates"):
+            self.bind("task-a", claim, now=19)
+        self.assertIsNone(ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim))
+        self.assertEqual(self.bind("task-a", claim, now=21)["created_at"], 21)
 
     def test_concurrent_same_session_binding_has_one_winner(self):
         a = self.add("task-a")
