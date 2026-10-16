@@ -269,3 +269,25 @@ strings, and new binding times cannot predate claim heartbeat. Identical replay
 is historical receipt retrieval even after expiry; it does not renew admission.
 Read-only filesystem-preservation, empty-root, legacy-schema, and clock-order
 regressions are covered in the updated focused suite.
+
+## OC2-M06-A09a local execution receipts
+
+Added a standalone local acceptance-command runner and private, one-shot run
+receipts. It checks the exact active/unexpired task claim and canonical
+worktree using a read-only ledger snapshot, then reserves a unique run ID and
+fsynced intent before launching one coordinator-supplied argv array without a
+shell. Existing or interrupted run IDs cannot replay. Private bounded logs and
+receipt hashes can be verified after process restart. Exit zero means only
+`command_completed_zero`; nonzero is `unclassified_nonzero`; timeout,
+interruption, output limit, capture and infrastructure outcomes stay unresolved.
+The runner does not mutate outcomes or claims, and does not supply independent
+implementation-failure attribution. It cannot prove that arbitrary coordinator
+argv is safe, prevent concurrent claim release, or guarantee cleanup of
+detached descendants. See [local execution receipt evidence](opencode-acceptance-evidence.md).
+
+This is a local execution/evidence slice only, not A09 live/native qualification,
+dispatch, a worker-admission reservation, feature acceptance, or a counted
+implementation failure. Native discovery/auth, independent attribution, native
+dispatch and live acceptance remain open. Focused/full-suite results are to be
+recorded after implementation checks; token usage/cost unavailable, unknown,
+not zero.
