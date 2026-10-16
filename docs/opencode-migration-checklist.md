@@ -234,3 +234,13 @@ generation time. Native session identity remains caller-attested; no real
 native binding or termination proof is claimed. The full OpenCode suite passed
 (54 tests), as did `python3 scripts/repo-check.py` and `git diff --check`; this
 remains local evidence, not live qualification.
+
+### OC2-M06-R1-F2 Sol review correction
+
+Snapshot timestamps follow `observed_at <= generated_at <= now`, with both
+evidence timestamps subject to the freshness bound. Git status explicitly
+disables local fsmonitor execution and submodule recursion/inspection in
+addition to the optional-lock and inherited-environment safeguards. System and
+global Git config are disabled; local config is bounded by explicit command-line
+overrides, not claimed disabled. A synthetic local fsmonitor executable marker
+test verifies the hook is not run.

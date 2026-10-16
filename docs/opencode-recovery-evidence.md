@@ -4,8 +4,9 @@
 the existing private ledger's active/quarantined claims with a caller-supplied
 version-1 JSON snapshot and checks the ledger-bound worktree's owned paths using
 `git --no-optional-locks status`, with inherited `GIT_*` variables removed,
-Git config sources disabled, and owned paths passed as literal pathspecs. It
-does not query an OpenCode server or interpret
+system/global Git config disabled, explicit local overrides for fsmonitor and
+submodule recursion, and owned paths passed as literal pathspecs. It does not
+query an OpenCode server or interpret
 provider/session payloads. The raw native OpenCode evidence adapter remains
 **open**; the V2 API reference documents session routes, but this task does not
 assert their semantics prove termination.
@@ -31,8 +32,9 @@ Session states are `active`, `idle`, `missing`, or `reserved`; reserved requires
 `session_id: null`. This data is caller attestation, not authenticated or
 server-verified proof. The exact task/claim bindings must match every live
 ledger row; duplicate, missing, extra, malformed, stale (over five minutes),
-or future-dated evidence fails closed. Observations cannot predate evidence
-generation; a non-null session ID cannot bind multiple claims. Those IDs remain
+or future-dated evidence fails closed. The timestamp order is
+`observed_at <= generated_at <= now`; both observation and generation must be
+fresh. A non-null session ID cannot bind multiple claims. Those IDs remain
 caller-attested and do not constitute verified native bindings. The clock value
 must be finite and non-negative. The ledger is opened via SQLite
 `mode=ro` and `query_only`; existing claims/schema are required (the adapter

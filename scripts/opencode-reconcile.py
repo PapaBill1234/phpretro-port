@@ -111,8 +111,9 @@ def _worktree_status(row: dict) -> str:
     git_env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"})
     try:
-        result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "status",
-                                 "--porcelain", "--untracked-files=all", "--",
+        result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                                 "-c", "submodule.recurse=false", "-C", str(root), "status",
+                                 "--porcelain", "--untracked-files=all", "--ignore-submodules=all", "--",
                                  *[f":(literal){path}" for path in paths]],
                                 capture_output=True, text=True, timeout=5, check=False,
                                 env=git_env)
@@ -146,8 +147,8 @@ def reconcile(database: Path, evidence_path: Path, *, now: float | None = None) 
         if key in by_binding:
             raise ReconcileError("duplicate claim evidence binding")
         observed = _timestamp(item["observed_at"], "observed_at")
-        if observed < generated:
-            raise ReconcileError("claim observation predates evidence generation")
+        if observed > generated:
+            raise ReconcileError("claim observation postdates evidence generation")
         if observed > now or now - observed > MAX_AGE_SECONDS:
             raise ReconcileError("claim evidence is future-dated or stale")
         session = item["session"]

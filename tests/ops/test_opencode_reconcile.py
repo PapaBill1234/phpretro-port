@@ -137,6 +137,17 @@ class ReconcileTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_repository_local_fsmonitor_hook_is_never_invoked(self):
+        self.fixture("active")
+        marker = self.root / "fsmonitor-invoked"
+        hook = self.root / "fsmonitor-hook"
+        hook.write_text(f"#!/bin/sh\nprintf invoked > {marker}\n", encoding="utf-8")
+        hook.chmod(0o700)
+        subprocess.run(["git", "-C", str(self.main_repo), "config", "core.fsmonitor", str(hook)], check=True)
+        result = reconcile.reconcile(self.db, self.evidence, now=1200)
+        self.assertEqual(result["claims"][0]["worktree"], "clean")
+        self.assertFalse(marker.exists())
+
     def test_owned_pathspec_magic_is_treated_as_literal(self):
         self.fixture("active")
         (self.worktree / "unowned.txt").write_text("outside owned scope", encoding="utf-8")
@@ -160,13 +171,16 @@ class ReconcileTests(unittest.TestCase):
         with self.assertRaisesRegex(reconcile.ReconcileError, "multiple claims"):
             reconcile.reconcile(self.db, self.evidence, now=1200)
 
-    def test_rejects_nonfinite_negative_now_and_reversed_evidence_times(self):
+    def test_rejects_nonfinite_negative_now_and_observation_after_generation(self):
         self.fixture()
         for now in (math.nan, math.inf, -math.inf, -1):
             with self.subTest(now=now), self.assertRaisesRegex(reconcile.ReconcileError, "finite non-negative"):
                 reconcile.reconcile(self.db, self.evidence, now=now)
-        self.fixture(generated=1101, observed=1100)
-        with self.assertRaisesRegex(reconcile.ReconcileError, "predates"):
+        accepted = self.fixture(generated=1101, observed=1100)
+        self.assertEqual(reconcile.reconcile(self.db, self.evidence, now=1200)["claims"][0]["session"], "active")
+        self.assertEqual(accepted["generated_at"], stamp(1101))
+        self.fixture(generated=1100, observed=1101)
+        with self.assertRaisesRegex(reconcile.ReconcileError, "postdates"):
             reconcile.reconcile(self.db, self.evidence, now=1200)
 
     def test_malformed_ledger_payload_returns_sanitized_error(self):
