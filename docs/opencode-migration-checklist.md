@@ -203,3 +203,23 @@ acceptance ran or attribution is true.
 - A09 remains open: no real acceptance runner/receipt verifier, native dispatch,
   actual Sol help request, or live qualification. Independent M04b review and CI
   have not run. Usage and cost unavailable; unknown, not zero.
+
+## OC2-M06-R1 offline reconciliation adapter
+
+The read-only adapter is documented in [recovery evidence](opencode-recovery-evidence.md).
+It matches exact task/claim bindings in an explicit versioned evidence snapshot
+against existing active/quarantined ledger rows, checks ledger-bound owned paths
+without following worktree symlinks, and emits only advisory review
+recommendations. Idle, missing, reserved, or active session state and expired
+leases never establish termination or safe release. No ledger mutation, prompt
+replay, server call, process control, deletion, or worktree cleanup occurs.
+
+This remains local synthetic evidence, not native session reconciliation or
+live qualification. The raw native session evidence adapter and authoritative
+termination contract remain open; refer to the evidence document for scope and
+limitations. The official [V2 API reference](https://opencode.ai/v2/docs/api)
+lists session endpoints, but no termination semantics are inferred from that
+listing. Local checks: `python3 -m unittest discover -s tests/ops -p
+'test_opencode*.py' -v` (48 passed); `python3 scripts/repo-check.py` and
+`git diff --check` passed. Independent review and live qualification remain
+pending. Token usage/cost unavailable; unknown, not zero.
