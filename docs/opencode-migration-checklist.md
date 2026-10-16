@@ -1,10 +1,12 @@
 # OpenCode 2 migration gaps and acceptance
 
-Current combined local status: [OC2-C01 evidence](opencode-local-candidate.md)
-supersedes historical review-pending worker receipts for the exact reviewed
-offline code. Live acceptance gates remain open; no main integration or CI.
+Current combined local status: [OC2-C02 reviewed local chain](opencode-reviewed-local-chain.md),
+which extends [OC2-C01 candidate provenance](opencode-local-candidate.md).
+Historical worker receipts remain historical except for exact reviewed slices.
+Live acceptance gates remain open; no main integration or CI.
 
-Task: OC2-M01. Updated: 2026-10-15. Baseline `d094160`, OpenCode 2.0.29.
+Task: OC2-M01, status refreshed by OC2-C02. Updated: 2026-10-16. Baseline
+`d094160`, OpenCode 2.0.29.
 This is the **current builder migration** checklist. Historical CMS/Eliza
 evidence in `gaps.md` is not authorization to resume those workstreams.
 Architecture: [migration plan](opencode-migration-plan.md).
@@ -14,6 +16,25 @@ the real route passed declared acceptance. Neither source existence nor this
 checklist is a live acceptance result.
 
 ## Current state
+
+- [x] Four cumulative offline slices have independent accepted local evidence:
+  M06-R1 advisory reconciliation (`337a12a`), M06-R2 caller-attested durable
+  binding (`3761391`), M06-A09a local receipts/process bounds (`7eb8e1b`), and
+  M06-A09b explicit reviewed outcomes (`46dac62`). Focused suite rerun at
+  `46dac62`: **101 passed**; `repo-check` and full task diff check passed.
+  Details and limitations: [OC2-C02 evidence](opencode-reviewed-local-chain.md).
+- [ ] M06-R3 remains parked: pinned `Service.discover` performs an authenticated
+  probe before the caller endpoint guard (`service.ts:124–127`,
+  `service-probe.ts:49–57` at upstream `042d0832`). No supported preflight/custom
+  fetch or native termination contract is established; source changes are not
+  authorized until a supported contract/upstream change is available.
+- [x] Fresh multi-auth visibility and a successful `openai/gpt-6-luna#high`
+  turn were verified for bounded work. This does not establish automated quota
+  enforcement or resume native paid dispatch; do not reopen completed auth work.
+- [ ] Automated reserve cutoff/checkpoint enforcement, native request guard and
+  cancellation, native recovery/release, spend guard, GitHub CI/integration remain
+  open. GitHub CLI currently has no authenticated host; human login is required
+  before push/CI. Main is untouched.
 
 - [x] Official pinned CLI bootstrap and standalone profile launcher exist.
   Evidence: `scripts/opencode-builder.py`, `tests/ops/test_opencode_builder.py`;
@@ -73,25 +94,25 @@ checklist is a live acceptance result.
 
 ## Dispatch queue and current blocker
 
-1. **OC2-M01**: docs-only proposed architecture and checklist; offline validation
-   permitted. Owned paths: these two files, `docs/opencode-builder.md` and
-   a current-status pointer in `docs/gaps.md`. No runtime/config changes.
-2. **OC2-M02**, preferred `openai/gpt-6-luna#high`: bounded pinned-contract
-   audit/probe design, no auth/key access and no provider inference probes.
-   Return source locations for denial and cancellation, bypass inventory and
-   smallest fake-provider tests; <600 words, save larger evidence separately.
-   **Read-only Luna audit completed**, based on fresh manual quota evidence;
-   contract gap remains blocking. No runtime probe or implementation performed.
-3. Independent Sol review OC2-M01-R1 completed: high-level decomposition approved,
-   but native request enforcement and paid dispatch remain blocked. M04a offline
-   admission core may proceed independently of M02/M03 runtime qualification.
-4. OC2-M04a offline core is implemented on its task branch; no provider calls,
-   native session access, dispatch adapter or process control was used. A07–A09
-   and independent review/integration remain open.
+1. Do not restart completed offline slices. The exact cumulative R1/R2/A09a/A09b
+   boundaries and evidence are recorded in [OC2-C02](opencode-reviewed-local-chain.md).
+2. Do not implement an authentication bridge or treat PID/version bracketing as
+   a pre-request guard. The parked R3 source finding requires a supported native
+   contract/upstream change before native-route qualification.
+3. A credentials-free CLI smoke/fixture check may be possible with the existing
+   CLI and harness, but a supported fake-service contract is not established.
+   First pin a documented command and observable negative case; stop if none is
+   available. A fixture can qualify only its tested CLI behavior, not native
+   endpoint guarding, session termination/recovery, quota cutoff, spend, or
+   dispatch. No new framework is justified.
+4. Native quota cutoff enforcement, live A07/A08/A09 acceptance, spend control,
+   redacted GitHub progress, CI, and integration remain open. Fresh auth/quota
+   visibility does not itself enforce a guard. GitHub login is a human blocker;
+   do not retry push/CI while unauthenticated.
 
-No paid DeepSeek request was dispatched. Luna audit used the native OpenAI route.
-Runtime qualification, spend protection and account allowance remain unknown.
-PHPRetro stays paused; Eliza and custom subscription bridge stay retired.
+PHPRetro stays paused; Eliza and the custom subscription bridge stay retired.
+No paid DeepSeek request, main update, account action, or reset-credit use is
+authorized by this status refresh. Usage/cost is unknown, not zero.
 
 ## OC2-M01 offline validation
 

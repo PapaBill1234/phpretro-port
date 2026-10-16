@@ -1,5 +1,10 @@
 # OC2-C01 — reviewed local builder candidate
 
+Current continuation: [OC2-C02 reviewed local chain and qualification
+boundary](opencode-reviewed-local-chain.md). OC2-C02 consolidates the later
+R1/R2/A09a/A09b local slices and records the parked native-contract blocker;
+it does not change the scope or live-readiness status below.
+
 Status: **local coexistence/regression checked, not live-qualified or merged
 into main**. Continuous goal: qualify the native OpenCode 2 builder with Luna
 routine work and Sol review. PHPRetro remains paused; Eliza and the custom
