@@ -223,3 +223,14 @@ listing. Local checks: `python3 -m unittest discover -s tests/ops -p
 'test_opencode*.py' -v` (48 passed); `python3 scripts/repo-check.py` and
 `git diff --check` passed. Independent review and live qualification remain
 pending. Token usage/cost unavailable; unknown, not zero.
+
+### OC2-M06-R1-F1 Sol review corrections
+
+Follow-up `6cb51c9` findings are covered by read-only Git status
+(`--no-optional-locks`, sanitized `GIT_*` environment, literal pathspecs) and a
+linked-worktree index-hash regression test. Evidence now rejects a session ID
+shared by claims, non-finite/negative clocks, and observations older than
+generation time. Native session identity remains caller-attested; no real
+native binding or termination proof is claimed. The full OpenCode suite passed
+(54 tests), as did `python3 scripts/repo-check.py` and `git diff --check`; this
+remains local evidence, not live qualification.

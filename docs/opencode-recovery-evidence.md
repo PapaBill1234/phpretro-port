@@ -3,7 +3,9 @@
 `scripts/opencode-reconcile.py` is an offline, read-only adapter. It compares
 the existing private ledger's active/quarantined claims with a caller-supplied
 version-1 JSON snapshot and checks the ledger-bound worktree's owned paths using
-read-only `git status`. It does not query an OpenCode server or interpret
+`git --no-optional-locks status`, with inherited `GIT_*` variables removed,
+Git config sources disabled, and owned paths passed as literal pathspecs. It
+does not query an OpenCode server or interpret
 provider/session payloads. The raw native OpenCode evidence adapter remains
 **open**; the V2 API reference documents session routes, but this task does not
 assert their semantics prove termination.
@@ -29,7 +31,10 @@ Session states are `active`, `idle`, `missing`, or `reserved`; reserved requires
 `session_id: null`. This data is caller attestation, not authenticated or
 server-verified proof. The exact task/claim bindings must match every live
 ledger row; duplicate, missing, extra, malformed, stale (over five minutes),
-or future-dated evidence fails closed. The ledger is opened via SQLite
+or future-dated evidence fails closed. Observations cannot predate evidence
+generation; a non-null session ID cannot bind multiple claims. Those IDs remain
+caller-attested and do not constitute verified native bindings. The clock value
+must be finite and non-negative. The ledger is opened via SQLite
 `mode=ro` and `query_only`; existing claims/schema are required (the adapter
 does not initialize an absent ledger). Results omit raw task/session IDs and
 filesystem paths and are stable for identical inputs and clock value.
@@ -44,4 +49,6 @@ Local synthetic coverage exercises reserved/active/idle/missing sessions,
 binding and freshness failures, expired leases, dirty/missing/symlink worktree
 boundaries, deterministic repeats, and unchanged files. It is not live
 qualification and does not establish native OpenCode session lifecycle
-semantics. Token usage/cost is unavailable here (unknown, not zero).
+semantics. Linked-worktree tests exercise the real worktree gitfile and linked
+index to ensure status does not refresh index metadata. Token usage/cost is
+unavailable here (unknown, not zero).

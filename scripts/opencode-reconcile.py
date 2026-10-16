@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import math
 import sqlite3
 import stat
 import subprocess
@@ -68,8 +69,11 @@ def _ledger_rows(database: Path) -> list[dict]:
     after = database.lstat()
     if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         raise ReconcileError("ledger changed during read")
-    return [dict(task_id=r[0], claim_id=r[1], state=r[2], worktree=r[3],
-                 owned_paths=json.loads(r[4]), expires_at=r[5]) for r in rows]
+    try:
+        return [dict(task_id=r[0], claim_id=r[1], state=r[2], worktree=r[3],
+                     owned_paths=json.loads(r[4]), expires_at=r[5]) for r in rows]
+    except (TypeError, ValueError, IndexError):
+        raise ReconcileError("ledger claim data is malformed") from None
 
 
 def _worktree_status(row: dict) -> str:
@@ -103,9 +107,15 @@ def _worktree_status(row: dict) -> str:
                     return "unavailable"
             except FileNotFoundError:
                 pass
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    git_env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"})
     try:
-        result = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all", "--", *row["owned_paths"]],
-                                capture_output=True, text=True, timeout=5, check=False)
+        result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "status",
+                                 "--porcelain", "--untracked-files=all", "--",
+                                 *[f":(literal){path}" for path in paths]],
+                                capture_output=True, text=True, timeout=5, check=False,
+                                env=git_env)
     except (OSError, subprocess.TimeoutExpired):
         return "unavailable"
     if result.returncode != 0:
@@ -115,8 +125,8 @@ def _worktree_status(row: dict) -> str:
 
 def reconcile(database: Path, evidence_path: Path, *, now: float | None = None) -> dict:
     now = datetime.now(timezone.utc).timestamp() if now is None else now
-    if type(now) not in (int, float):
-        raise ReconcileError("now must be a timestamp")
+    if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
+        raise ReconcileError("now must be a finite non-negative timestamp")
     evidence = _load_json(evidence_path)
     if set(evidence) != {"version", "generated_at", "claims"} or type(evidence["version"]) is not int or evidence["version"] != 1 or not isinstance(evidence["claims"], list):
         raise ReconcileError("evidence schema is invalid")
@@ -125,6 +135,7 @@ def reconcile(database: Path, evidence_path: Path, *, now: float | None = None) 
         raise ReconcileError("evidence is future-dated or stale")
     rows = _ledger_rows(database)
     by_binding = {}
+    session_ids = set()
     for item in evidence["claims"]:
         if not isinstance(item, dict) or set(item) != {"task_id", "claim_id", "session", "observed_at"}:
             raise ReconcileError("claim evidence schema is invalid")
@@ -135,6 +146,8 @@ def reconcile(database: Path, evidence_path: Path, *, now: float | None = None) 
         if key in by_binding:
             raise ReconcileError("duplicate claim evidence binding")
         observed = _timestamp(item["observed_at"], "observed_at")
+        if observed < generated:
+            raise ReconcileError("claim observation predates evidence generation")
         if observed > now or now - observed > MAX_AGE_SECONDS:
             raise ReconcileError("claim evidence is future-dated or stale")
         session = item["session"]
@@ -146,6 +159,10 @@ def reconcile(database: Path, evidence_path: Path, *, now: float | None = None) 
                 raise ReconcileError("reserved evidence cannot bind a session")
         elif not isinstance(sid, str) or not OPAQUE.fullmatch(sid):
             raise ReconcileError("session ID is invalid")
+        if sid is not None and any(existing_sid == sid for existing_sid in session_ids):
+            raise ReconcileError("one session cannot be bound to multiple claims")
+        if sid is not None:
+            session_ids.add(sid)
         by_binding[key] = session["state"]
     if len(by_binding) != len(rows) or any((r["task_id"], r["claim_id"]) not in by_binding for r in rows):
         raise ReconcileError("ledger and evidence claim bindings do not match exactly")

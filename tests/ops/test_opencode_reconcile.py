@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import json
+import math
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -23,9 +25,17 @@ class ReconcileTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
-        self.worktree = self.root / "worktree"
-        self.worktree.mkdir()
-        subprocess.run(["git", "-C", str(self.worktree), "init", "-q"], check=True)
+        self.main_repo = self.root / "main-repo"
+        self.main_repo.mkdir()
+        subprocess.run(["git", "-C", str(self.main_repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.main_repo), "config", "user.name", "Synthetic"], check=True)
+        subprocess.run(["git", "-C", str(self.main_repo), "config", "user.email", "synthetic@example.invalid"], check=True)
+        (self.main_repo / "owned.txt").write_text("original", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.main_repo), "add", "owned.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.main_repo), "commit", "-qm", "fixture"], check=True)
+        self.worktree = self.root / "linked-worktree"
+        subprocess.run(["git", "-C", str(self.main_repo), "worktree", "add", "-q", "-b", "fixture-worker",
+                        str(self.worktree), "HEAD"], check=True)
         self.task = "synthetic-task"
         self.claim = ledger.claim(self.state, task_id=self.task, profile="test", branch="build/test",
                                   worktree=self.worktree, owned_paths=["owned.txt"], now=1000,
@@ -91,12 +101,81 @@ class ReconcileTests(unittest.TestCase):
 
     def test_repeat_is_identical_and_inputs_worktree_ledger_unchanged(self):
         self.fixture("idle")
-        snapshots = snapshot_paths(self.db, self.evidence, self.worktree)
+        snapshots = snapshot_paths(self.db, self.evidence, self.worktree, self.main_repo)
         first = reconcile.reconcile(self.db, self.evidence, now=1200)
         second = reconcile.reconcile(self.db, self.evidence, now=1200)
         self.assertEqual(first, second)
-        self.assertEqual(snapshots, snapshot_paths(self.db, self.evidence, self.worktree))
+        self.assertEqual(snapshots, snapshot_paths(self.db, self.evidence, self.worktree, self.main_repo))
         self.assertTrue(first["read_only"])
+
+    def test_status_does_not_refresh_gitfile_linked_worktree_index(self):
+        target = self.worktree / "owned.txt"
+        stat_before = target.stat()
+        os.utime(target, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 2_000_000_000))
+        gitdir = (self.worktree / ".git").read_text(encoding="utf-8").strip().removeprefix("gitdir: ")
+        index = self.worktree / gitdir / "index"
+        before = hashlib.sha256(index.read_bytes()).digest()
+        self.fixture("active")
+        reconcile.reconcile(self.db, self.evidence, now=1200)
+        self.assertEqual(before, hashlib.sha256(index.read_bytes()).digest())
+
+    def test_inherited_git_environment_cannot_redirect_status(self):
+        self.fixture("active")
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        subprocess.run(["git", "-C", str(foreign), "init", "-q"], check=True)
+        prior = {key: os.environ.get(key) for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+        try:
+            os.environ.update({"GIT_DIR": str(foreign / ".git"), "GIT_WORK_TREE": str(foreign),
+                               "GIT_INDEX_FILE": str(foreign / ".git/index")})
+            result = reconcile.reconcile(self.db, self.evidence, now=1200)
+            self.assertEqual(result["claims"][0]["worktree"], "clean")
+        finally:
+            for key, value in prior.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_owned_pathspec_magic_is_treated_as_literal(self):
+        self.fixture("active")
+        (self.worktree / "unowned.txt").write_text("outside owned scope", encoding="utf-8")
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE claims SET owned_paths=? WHERE claim_id=?", (json.dumps([":(glob)*"]), self.claim))
+        result = reconcile.reconcile(self.db, self.evidence, now=1200)
+        self.assertEqual(result["claims"][0]["worktree"], "clean")
+
+    def test_distinct_claims_cannot_bind_the_same_session_id(self):
+        other = self.root / "other-worktree"
+        subprocess.run(["git", "-C", str(self.main_repo), "worktree", "add", "-q", "-b", "other-worker",
+                        str(other), "HEAD"], check=True)
+        other_claim = ledger.claim(self.state, task_id="other-task", profile="test", branch="build/other",
+                                   worktree=other, owned_paths=["different.txt"], now=1000, lease_seconds=500)
+        first = {"task_id": self.task, "claim_id": self.claim,
+                 "session": {"state": "active", "session_id": "same-session"}, "observed_at": stamp(1100)}
+        second = {"task_id": "other-task", "claim_id": other_claim,
+                  "session": {"state": "idle", "session_id": "same-session"}, "observed_at": stamp(1100)}
+        self.evidence.write_text(json.dumps({"version": 1, "generated_at": stamp(1100),
+                                             "claims": [first, second]}), encoding="utf-8")
+        with self.assertRaisesRegex(reconcile.ReconcileError, "multiple claims"):
+            reconcile.reconcile(self.db, self.evidence, now=1200)
+
+    def test_rejects_nonfinite_negative_now_and_reversed_evidence_times(self):
+        self.fixture()
+        for now in (math.nan, math.inf, -math.inf, -1):
+            with self.subTest(now=now), self.assertRaisesRegex(reconcile.ReconcileError, "finite non-negative"):
+                reconcile.reconcile(self.db, self.evidence, now=now)
+        self.fixture(generated=1101, observed=1100)
+        with self.assertRaisesRegex(reconcile.ReconcileError, "predates"):
+            reconcile.reconcile(self.db, self.evidence, now=1200)
+
+    def test_malformed_ledger_payload_returns_sanitized_error(self):
+        self.fixture()
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE claims SET owned_paths=? WHERE claim_id=?", ("not-json-secret-path", self.claim))
+        with self.assertRaisesRegex(reconcile.ReconcileError, "ledger claim data is malformed") as caught:
+            reconcile.reconcile(self.db, self.evidence, now=1200)
+        self.assertNotIn("not-json-secret-path", str(caught.exception))
 
 
 def stamp(value):
