@@ -13,12 +13,12 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import sqlite3
 import stat
 import subprocess
 import sys
-import threading
 import time
 
 import importlib.util
@@ -34,6 +34,7 @@ MAX_OUTPUT = 16 * 1024 * 1024
 MAX_ARGV_ITEMS = 128
 MAX_ARG_LENGTH = 4096
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+RECEIPT_SCHEMA = 2
 
 
 class AcceptanceError(ValueError):
@@ -58,7 +59,7 @@ def _preflight(state_root: Path, task: str, claim_id: str, worktree: Path) -> Pa
     before = db.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) & 0o077:
         raise AcceptanceError("invalid ledger database")
-    uri = f"file:{db.as_posix()}?mode=ro"
+    uri = db.as_uri() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
     try:
         connection.execute("PRAGMA query_only=ON")
@@ -150,7 +151,7 @@ def _atomic_receipt(run_dir: Path, receipt: dict) -> None:
     _fsync_dir(run_dir)
 
 
-def _terminate(process: subprocess.Popen, grace: float = 1.0) -> None:
+def _terminate(process: subprocess.Popen, grace: float = 0.25) -> bool:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -159,35 +160,47 @@ def _terminate(process: subprocess.Popen, grace: float = 1.0) -> None:
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         pass
-    # The leader may exit while an in-group descendant remains.
+    # The leader may exit while an in-group descendant remains. Waiting for the
+    # leader is bounded too; neither this nor the receipt proves group death.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    process.wait()
-
-
-def _capture(process: subprocess.Popen, stream, destination: Path, budget: list[int], lock: threading.Lock, overflow: list[bool]) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(destination, flags, 0o600)
     try:
-        with os.fdopen(fd, "wb", closefd=False) as target:
-            while True:
-                block = stream.read(65536)
-                if not block:
-                    break
-                with lock:
-                    remaining = MAX_OUTPUT - budget[0]
-                    if len(block) > remaining:
-                        overflow[0] = True
-                    accepted = block[:max(0, remaining)]
-                    if accepted:
-                        target.write(accepted)
-                        budget[0] += len(accepted)
-            target.flush()
-            os.fsync(fd)
-    finally:
-        os.close(fd)
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        return False
+    return process.returncode is not None
+
+
+def _new_log(path: Path) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags, 0o600)
+
+
+def _group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _close_pipes(process: subprocess.Popen | None, selector: selectors.BaseSelector | None) -> None:
+    if selector is not None:
+        try:
+            selector.close()
+        except OSError:
+            pass
+    if process is not None:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: str,
@@ -218,7 +231,7 @@ def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: s
     started_wall = time.time()
     started_mono = time.monotonic()
     intent = {
-        "schema": 1, "run_id": run_name, "task_id": task, "claim_id": claim,
+        "schema": RECEIPT_SCHEMA, "run_id": run_name, "task_id": task, "claim_id": claim,
         "worktree": str(canonical), "argv": argv,
         "argv_sha256": hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode()).hexdigest(),
         "started_at": started_wall, "timeout_seconds": float(timeout),
@@ -232,21 +245,23 @@ def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: s
     status = "unresolved"
     returncode = None
     process = None
-    threads = []
-    overflow = [False]
-    budget = [0]
-    lock = threading.Lock()
+    selector = None
+    output_fds = {}
+    output_size = 0
+    overflow = False
     try:
+        output_fds["stdout"] = _new_log(run_dir / "stdout.log")
+        output_fds["stderr"] = _new_log(run_dir / "stderr.log")
         process = subprocess.Popen(argv, cwd=canonical, env=env, shell=False,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
-        for stream, name in ((process.stdout, "stdout.log"), (process.stderr, "stderr.log")):
-            thread = threading.Thread(target=_capture, args=(process, stream, run_dir / name, budget, lock, overflow), daemon=True)
-            thread.start()
-            threads.append(thread)
+        selector = selectors.DefaultSelector()
+        for label, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
         deadline = started_mono + float(timeout)
-        while process.poll() is None:
-            if overflow[0]:
+        while True:
+            if overflow:
                 _terminate(process)
                 status = "unresolved_output_limit"
                 break
@@ -254,20 +269,30 @@ def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: s
                 _terminate(process)
                 status = "unresolved_timeout"
                 break
-            time.sleep(0.02)
-        returncode = process.wait()
-        for thread in threads:
-            thread.join(timeout=3)
-        if any(thread.is_alive() for thread in threads):
-            status = "unresolved_capture"
-        elif overflow[0]:
-            status = "unresolved_output_limit"
-        elif status == "unresolved_timeout":
-            pass
-        elif returncode == 0:
-            status = "command_completed_zero"
-        elif status == "unresolved":
-            status = "unclassified_nonzero"
+            returncode = process.poll()
+            if returncode is not None and not selector.get_map() and not _group_exists(process.pid):
+                status = "command_completed_zero" if returncode == 0 else "unclassified_nonzero"
+                break
+            remaining = max(0.0, deadline - time.monotonic())
+            for key, _ in selector.select(min(0.05, remaining)):
+                label = key.data
+                try:
+                    block = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                available = MAX_OUTPUT - output_size
+                accepted = block[:max(0, available)]
+                if accepted:
+                    view = memoryview(accepted)
+                    while view:
+                        written = os.write(output_fds[label], view)
+                        view = view[written:]
+                    output_size += len(accepted)
+                if len(accepted) != len(block):
+                    overflow = True
     except (KeyboardInterrupt, SystemExit):
         if process is not None:
             _terminate(process)
@@ -277,13 +302,13 @@ def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: s
             _terminate(process)
         status = "unresolved_infrastructure"
     finally:
-        if process is not None:
-            for thread in threads:
-                thread.join(timeout=3)
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
+        _close_pipes(process, selector)
+        for fd in output_fds.values():
+            try:
+                os.fsync(fd)
+            except OSError:
+                status = "unresolved_infrastructure"
+            os.close(fd)
     for log_name in ("stdout.log", "stderr.log"):
         log_path = run_dir / log_name
         try:
@@ -292,9 +317,10 @@ def run(state_root: Path, task_id: str, claim_id: str, worktree: Path, run_id: s
             _write_new(log_path, b"")
     stdout_hash, stdout_size = _hash_file(run_dir / "stdout.log") if (run_dir / "stdout.log").exists() else (hashlib.sha256(b"").hexdigest(), 0)
     stderr_hash, stderr_size = _hash_file(run_dir / "stderr.log") if (run_dir / "stderr.log").exists() else (hashlib.sha256(b"").hexdigest(), 0)
-    receipt = {"schema": 1, "run_id": run_name, "task_id": task, "claim_id": claim,
+    receipt = {"schema": RECEIPT_SCHEMA, "run_id": run_name, "task_id": task, "claim_id": claim,
                "worktree": str(canonical), "argv_sha256": intent["argv_sha256"],
-               "started_at": started_wall, "finished_at": time.time(), "status": status,
+               "started_at": started_wall, "timeout_seconds": float(timeout),
+               "finished_at": time.time(), "status": status,
                "returncode": returncode, "stdout_sha256": stdout_hash, "stdout_size": stdout_size,
                "stderr_sha256": stderr_hash, "stderr_size": stderr_size}
     _atomic_receipt(run_dir, receipt)
@@ -315,36 +341,53 @@ def verify(state_root: Path, run_id: str) -> dict:
     try:
         receipt_path.lstat()
     except FileNotFoundError:
-        if intent.get("schema") != 1 or intent.get("run_id") != name:
+        if (type(intent.get("schema")) is not int or intent.get("schema") != RECEIPT_SCHEMA or
+                intent.get("run_id") != name):
             raise AcceptanceError("invalid incomplete intent")
         return {"run_id": name, "status": "unresolved_incomplete_intent"}
     receipt = _read_json_regular(receipt_path)
-    if intent.get("schema") != 1 or intent.get("run_id") != name:
+    if (type(intent.get("schema")) is not int or intent.get("schema") != RECEIPT_SCHEMA or
+            intent.get("run_id") != name):
         raise AcceptanceError("invalid intent schema")
+    if set(intent) != {"schema", "run_id", "task_id", "claim_id", "worktree", "argv",
+                       "argv_sha256", "started_at", "timeout_seconds"}:
+        raise AcceptanceError("invalid intent fields")
     _safe_id(intent.get("task_id"), "task ID")
     _safe_id(intent.get("claim_id"), "claim ID")
     worktree = ledger._canonical_worktree(Path(intent.get("worktree", "")))
     if str(worktree) != intent.get("worktree"):
         raise AcceptanceError("non-canonical worktree binding")
     argv = intent.get("argv")
-    if not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv):
+    if (not isinstance(argv, list) or not argv or len(argv) > MAX_ARGV_ITEMS or
+            any(not isinstance(item, str) or not item or len(item) > MAX_ARG_LENGTH or "\x00" in item for item in argv)):
         raise AcceptanceError("invalid intent argv")
     argv_hash = hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode()).hexdigest()
     if argv_hash != intent.get("argv_sha256"):
         raise AcceptanceError("intent argv hash mismatch")
-    if (isinstance(intent.get("started_at"), bool) or not isinstance(intent.get("started_at"), (int, float)) or
-            not math.isfinite(intent["started_at"]) or isinstance(intent.get("timeout_seconds"), bool) or
-            not isinstance(intent.get("timeout_seconds"), (int, float)) or
-            not 0 < intent["timeout_seconds"] <= MAX_TIMEOUT):
+    if (type(intent.get("started_at")) is not float or
+            not math.isfinite(intent["started_at"]) or intent["started_at"] < 0 or
+            type(intent.get("timeout_seconds")) is not float or
+            not math.isfinite(intent["timeout_seconds"]) or not 0 < intent["timeout_seconds"] <= MAX_TIMEOUT):
         raise AcceptanceError("invalid intent times")
-    for key in ("schema", "run_id", "task_id", "claim_id", "worktree", "argv_sha256"):
+    expected_fields = {"schema", "run_id", "task_id", "claim_id", "worktree", "argv_sha256",
+                       "started_at", "timeout_seconds", "finished_at", "status", "returncode",
+                       "stdout_sha256", "stdout_size", "stderr_sha256", "stderr_size"}
+    if (set(receipt) != expected_fields or type(receipt.get("schema")) is not int or
+            receipt.get("schema") != RECEIPT_SCHEMA):
+        raise AcceptanceError("invalid receipt fields")
+    if (type(receipt.get("started_at")) is not float or not math.isfinite(receipt["started_at"]) or
+            type(receipt.get("timeout_seconds")) is not float or
+            not math.isfinite(receipt["timeout_seconds"])):
+        raise AcceptanceError("invalid receipt binding types")
+    for key in ("schema", "run_id", "task_id", "claim_id", "worktree", "argv_sha256", "started_at", "timeout_seconds"):
         if receipt.get(key) != intent.get(key):
             raise AcceptanceError("receipt binding mismatch")
-    if receipt.get("status") not in {"command_completed_zero", "unclassified_nonzero", "unresolved_timeout",
-                                     "unresolved_output_limit", "unresolved_capture", "unresolved_interrupted",
-                                     "unresolved_infrastructure"}:
+    if (not isinstance(receipt.get("status"), str) or
+            receipt["status"] not in {"command_completed_zero", "unclassified_nonzero", "unresolved_timeout",
+                                      "unresolved_output_limit", "unresolved_capture", "unresolved_interrupted",
+                                      "unresolved_infrastructure"}):
         raise AcceptanceError("invalid receipt status")
-    if (isinstance(receipt.get("finished_at"), bool) or not isinstance(receipt.get("finished_at"), (int, float)) or
+    if (type(receipt.get("finished_at")) is not float or
             not math.isfinite(receipt["finished_at"]) or receipt["finished_at"] < intent["started_at"]):
         raise AcceptanceError("invalid receipt time")
     code = receipt.get("returncode")
@@ -354,14 +397,20 @@ def verify(state_root: Path, run_id: str) -> dict:
         raise AcceptanceError("invalid zero-exit receipt")
     if receipt["status"] == "unclassified_nonzero" and (code is None or code == 0):
         raise AcceptanceError("invalid nonzero receipt")
+    total_size = 0
     for stream in ("stdout", "stderr"):
         digest, size = _hash_file(run_dir / f"{stream}.log")
         stored_size = receipt.get(f"{stream}_size")
+        stored_hash = receipt.get(f"{stream}_sha256")
         if (digest != receipt.get(f"{stream}_sha256") or size != stored_size or
-                isinstance(stored_size, bool) or not isinstance(stored_size, int)):
+                isinstance(stored_size, bool) or not isinstance(stored_size, int) or
+                not isinstance(stored_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", stored_hash)):
             raise AcceptanceError("receipt log verification failed")
-        if size > MAX_OUTPUT:
+        if size > MAX_OUTPUT or stored_size < 0:
             raise AcceptanceError("receipt output exceeds bound")
+        total_size += size
+    if total_size > MAX_OUTPUT:
+        raise AcceptanceError("receipt output exceeds bound")
     return receipt
 
 
@@ -392,9 +441,12 @@ def _main(argv: list[str] | None = None) -> int:
             command = args.argv[1:] if args.argv and args.argv[0] == "--" else args.argv
             result = run(args.state_root, args.task, args.claim, args.worktree,
                          args.run_id, command, args.timeout)
+            public_result = {"status": result["status"], "receipt": "written"}
         else:
             result = verify(args.state_root, args.run_id)
-        print(json.dumps(result, sort_keys=True))
+            public_result = {"status": result["status"],
+                             "verified": result["status"] != "unresolved_incomplete_intent"}
+        print(json.dumps(public_result, sort_keys=True))
         return 0
     except (AcceptanceError, ledger.LedgerError, OSError, sqlite3.Error, ValueError, TypeError):
         print("opencode-acceptance: request rejected or receipt unresolved", file=sys.stderr)

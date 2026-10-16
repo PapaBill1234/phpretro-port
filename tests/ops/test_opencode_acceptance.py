@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,22 @@ class AcceptanceRunnerTests(unittest.TestCase):
 
     def verify(self, run_id):
         return acceptance.verify(self.state, run_id)
+
+    def assert_not_running(self, pid):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            try:
+                with open(f"/proc/{pid}/stat") as process_stat:
+                    if process_stat.read().split()[2] == "Z":
+                        return
+            except FileNotFoundError:
+                return
+            time.sleep(0.02)
+        self.fail("synthetic process remained running after bounded cleanup")
 
     def test_zero_nonzero_and_restart_verification_are_unclassified(self):
         zero = self.run_once("zero-1", self.command("print('ok')"))
@@ -135,6 +152,20 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertNotIn("PRIVATE-INVALID", result.stderr)
         self.assertNotIn(str(self.worktree), result.stderr)
 
+    def test_cli_success_output_is_redacted_for_run_and_verify(self):
+        run_id = "cli-private-run"
+        command = [sys.executable, str(SCRIPT), "--state-root", str(self.state), "run",
+                   "--task", self.task, "--claim", self.claim, "--worktree", str(self.worktree),
+                   "--run-id", run_id, "--timeout", "3", "--", *self.command("print('PRIVATE-LOG')")]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        verify = subprocess.run([sys.executable, str(SCRIPT), "--state-root", str(self.state),
+                                 "verify", "--run-id", run_id], capture_output=True, text=True, check=True)
+        for output in (result.stdout, verify.stdout):
+            for private in (self.task, self.claim, str(self.worktree), run_id, "PRIVATE-LOG", "print("):
+                self.assertNotIn(private, output)
+        self.assertEqual(json.loads(result.stdout), {"receipt": "written", "status": "command_completed_zero"})
+        self.assertEqual(json.loads(verify.stdout), {"status": "command_completed_zero", "verified": True})
+
     def test_symlink_or_log_tamper_rejected(self):
         self.run_once("tamper", self.command("print('safe')"))
         log = self.state / "acceptance-runs/tamper/stdout.log"
@@ -147,6 +178,34 @@ class AcceptanceRunnerTests(unittest.TestCase):
         log.chmod(0o600)
         with self.assertRaises(acceptance.AcceptanceError):
             self.verify("tamper")
+
+    def test_receipt_immutable_fields_schema_types_and_log_truncation_rejected(self):
+        self.run_once("receipt-tamper", self.command("print('receipt')"))
+        receipt_path = self.state / "acceptance-runs/receipt-tamper/receipt.json"
+        original = json.loads(receipt_path.read_text())
+        for mutate in (
+            lambda row: row.update(started_at="tampered"),
+            lambda row: row.update(started_at=True),
+            lambda row: row.update(started_at=1),
+            lambda row: row.update(schema=True),
+            lambda row: row.update(schema=1),
+            lambda row: row.update(returncode="0"),
+            lambda row: row.update(timeout_seconds=True),
+            lambda row: row.update(timeout_seconds=1),
+        ):
+            row = dict(original)
+            mutate(row)
+            receipt_path.write_text(json.dumps(row))
+            receipt_path.chmod(0o600)
+            with self.subTest(receipt=row), self.assertRaises(acceptance.AcceptanceError):
+                self.verify("receipt-tamper")
+        receipt_path.write_text(json.dumps(original))
+        receipt_path.chmod(0o600)
+        log = self.state / "acceptance-runs/receipt-tamper/stdout.log"
+        log.write_text("truncated")
+        log.chmod(0o600)
+        with self.assertRaises(acceptance.AcceptanceError):
+            self.verify("receipt-tamper")
 
     def test_receipt_symlink_rejected(self):
         self.run_once("receipt-link", self.command("pass"))
@@ -163,19 +222,38 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 f"open({str(pidfile)!r}, 'w').write(str(p.pid)); time.sleep(60)")
         receipt = self.run_once("timeout", self.command(code), timeout=0.25)
         self.assertEqual(receipt["status"], "unresolved_timeout")
-        pid = int(pidfile.read_text())
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.02)
-        else:
-            # A zombie may briefly remain; it is not running and will be reaped by init.
-            with open(f"/proc/{pid}/stat") as process_stat:
-                self.assertIn(process_stat.read().split()[2], ("Z",))
+        self.assert_not_running(int(pidfile.read_text()))
         self.assertEqual(self.verify("timeout")["status"], "unresolved_timeout")
+
+    def test_leader_exit_does_not_bypass_deadline_for_inherited_pipes(self):
+        pidfile = self.base / "leader-exited-descendant.pid"
+        code = ("import subprocess,sys; "
+                f"p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.2)']); "
+                f"open({str(pidfile)!r}, 'w').write(str(p.pid))")
+        started = time.monotonic()
+        receipt = self.run_once("leader-exited", self.command(code), timeout=0.15)
+        elapsed = time.monotonic() - started
+        self.assertEqual(receipt["status"], "unresolved_timeout")
+        self.assertLess(elapsed, 1.0)
+        self.assert_not_running(int(pidfile.read_text()))
+
+    def test_detached_pipe_holder_cannot_hang_runner_and_fixture_is_killed(self):
+        pidfile = self.base / "detached-descendant.pid"
+        code = ("import subprocess,sys; "
+                f"p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True); "
+                f"open({str(pidfile)!r}, 'w').write(str(p.pid))")
+        started = time.monotonic()
+        receipt = self.run_once("detached-holder", self.command(code), timeout=0.2)
+        elapsed = time.monotonic() - started
+        self.assertEqual(receipt["status"], "unresolved_timeout")
+        self.assertLess(elapsed, 1.5)
+        pid = int(pidfile.read_text())
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.assert_not_running(pid)
+        self.assertEqual(self.verify("detached-holder")["status"], "unresolved_timeout")
 
     def test_output_cap_leaves_unresolved_receipt(self):
         previous = acceptance.MAX_OUTPUT
@@ -220,6 +298,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
 
     def test_preflight_is_read_only_for_outcomes(self):
         db = self.state / ledger.DATABASE_NAME
+        before_hash = hashlib.sha256(db.read_bytes()).hexdigest()
         connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         before = connection.execute("select count(*) from outcomes").fetchone()[0]
         before_claims = connection.execute("select count(*) from claims").fetchone()[0]
@@ -231,6 +310,17 @@ class AcceptanceRunnerTests(unittest.TestCase):
         connection.close()
         self.assertEqual(before, after)
         self.assertEqual(before_claims, after_claims)
+        self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before_hash)
+
+    def test_read_only_preflight_escapes_uri_special_characters(self):
+        special_state = self.base / "state?#"
+        special_state.mkdir(mode=0o700)
+        claim_id = ledger.claim(special_state, task_id="special-task", profile="primary",
+                                branch="special-branch", worktree=self.worktree,
+                                owned_paths=["special.txt"])
+        result = acceptance.run(special_state, "special-task", claim_id, self.worktree,
+                                "uri-special", self.command("pass"), 3)
+        self.assertEqual(result["status"], "command_completed_zero")
 
     def test_inherited_git_routing_environment_is_removed(self):
         previous = os.environ.get("GIT_DIR")

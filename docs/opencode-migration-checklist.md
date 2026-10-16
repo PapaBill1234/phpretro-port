@@ -277,7 +277,9 @@ receipts. It checks the exact active/unexpired task claim and canonical
 worktree using a read-only ledger snapshot, then reserves a unique run ID and
 fsynced intent before launching one coordinator-supplied argv array without a
 shell. Existing or interrupted run IDs cannot replay. Private bounded logs and
-receipt hashes can be verified after process restart. Exit zero means only
+receipt hashes can be verified after process restart; CLI output is redacted.
+Nonblocking pipe multiplexing applies the run deadline through leader exit and
+inherited-pipe drainage, with bounded process-group cleanup. Exit zero means only
 `command_completed_zero`; nonzero is `unclassified_nonzero`; timeout,
 interruption, output limit, capture and infrastructure outcomes stay unresolved.
 The runner does not mutate outcomes or claims, and does not supply independent
@@ -289,5 +291,11 @@ This is a local execution/evidence slice only, not A09 live/native qualification
 dispatch, a worker-admission reservation, feature acceptance, or a counted
 implementation failure. Native discovery/auth, independent attribution, native
 dispatch and live acceptance remain open. Focused/full-suite results are to be
-recorded after implementation checks; token usage/cost unavailable, unknown,
-not zero.
+recorded after the review correction. Follow-up: nonblocking pipe supervision
+applies the monotonic deadline through process-group exit; detached pipe holders
+return unresolved with bounded close/cleanup. Receipt verification checks exact
+schema and immutable bindings/timestamps, while CLI output is redacted. The full
+OpenCode suite passed (**86 tests**), `python3 scripts/repo-check.py` and
+`git diff --check` passed. Local verifier checks are not cryptographic
+authenticity against an operator able to rewrite all private evidence. Token
+usage/cost unavailable, unknown, not zero.
