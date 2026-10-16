@@ -33,7 +33,7 @@ OC2-M06-R3 remains parked at `3761391`, with no source changes. The pinned
 OpenCode source is `042d0832f5f3a73eaa039a58a7d565776f6d4290`:
 
 - `packages/client/src/promise/service.ts:124–127` calls service discovery;
-- `packages/client/src/promise/service-probe.ts:49–57` performs an authenticated
+- `packages/client/src/service-probe.ts:49–57` performs an authenticated
   probe before the caller's endpoint guard can run.
 
 PID/version bracketing is only advisory and does not establish UUID continuity;
@@ -65,9 +65,10 @@ negative acceptance checks.
   `packages/core/src/session/execution/restart.ts:37–61`.
 - A09's local receipts/outcome API are not native acceptance-run verification,
   authenticated review, or real Sol escalation.
-- Automated quota cutoff/checkpoint enforcement remains open. Fresh multi-auth
-  visibility and a successful `openai/gpt-6-luna#high` turn establish neither
-  enforcement nor a quota reporter; do not reopen completed authentication work.
+- Automated quota cutoff/checkpoint enforcement remains open. Existing multi-auth
+  reporting is complete and a successful `openai/gpt-6-luna#high` turn is verified;
+  neither establishes automated enforcement. Do not reopen completed reporting
+  or authentication work.
 - Spend enforcement, autonomous paid dispatch, redacted GitHub progress/CI, and
   integration remain open. GitHub CLI has no authenticated host; human login is
   needed before any push/CI attempt. Main is untouched.
