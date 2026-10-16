@@ -130,7 +130,7 @@ def _main(argv: list[str] | None = None) -> int:
         print(json.dumps({"kind": result["kind"], "recorded": result["recorded"],
                           "acceptance_failures": result["acceptance_failures"],
                           "routine_retry_blocked": result["routine_retry_blocked"],
-                          "sol_help_intent": result["sol_help_intent"]}, sort_keys=True))
+                          "sol_help_intent": result["sol_help_intent"] is not None}, sort_keys=True))
         return 0
     except (OutcomeError, acceptance.AcceptanceError, ledger.LedgerError,
             OSError, sqlite3.Error, ValueError, TypeError):

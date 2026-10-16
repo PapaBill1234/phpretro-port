@@ -276,11 +276,38 @@ class ReviewedOutcomeTests(unittest.TestCase):
         ok = subprocess.run(command, text=True, capture_output=True, check=True)
         for private in (self.task, self.claim, str(self.worktree), "cli-run", "PRIVATE-CHILD-OUTPUT"):
             self.assertNotIn(private, ok.stdout + ok.stderr)
-        self.assertEqual(json.loads(ok.stdout)["kind"], "acceptance_pass")
+        public = json.loads(ok.stdout)
+        self.assertEqual(public["kind"], "acceptance_pass")
+        self.assertIs(public["sol_help_intent"], False)
         denied = subprocess.run(command[:-1], text=True, capture_output=True)
         self.assertEqual(denied.returncode, 2)
         self.assertNotIn(self.claim, denied.stderr)
         self.assertNotIn(str(self.worktree), denied.stderr)
+
+    def test_cli_redacts_sol_help_attempt_id_after_three_real_reviewed_failures(self):
+        private_attempts = ["PRIVATE-SOL-TRIGGER-ATTEMPT-1",
+                            "PRIVATE-SOL-TRIGGER-ATTEMPT-2",
+                            "PRIVATE-SOL-TRIGGER-ATTEMPT-3"]
+        secret_log = "PRIVATE-FAILURE-LOG-CONTENT"
+        outputs = []
+        for index, attempt in enumerate(private_attempts):
+            run_id = f"private-run-{index}"
+            self.run_child(run_id, f"print({secret_log!r}); raise SystemExit(7)")
+            command = [sys.executable, str(ADAPTER_SCRIPT), "--state-root", str(self.state),
+                       "--run-id", run_id, "--task", self.task, "--claim", self.claim,
+                       "--attempt-id", attempt, "--verdict", "failure", "--review-confirmed",
+                       "--implementation-attributed", "--failure-signature", f"test.failure.{index}"]
+            result = subprocess.run(command, text=True, capture_output=True, check=True)
+            outputs.append(json.loads(result.stdout))
+            for private in (self.task, self.claim, run_id, attempt, str(self.worktree), secret_log):
+                self.assertNotIn(private, result.stdout + result.stderr)
+
+        self.assertIs(outputs[0]["sol_help_intent"], False)
+        self.assertIs(outputs[1]["sol_help_intent"], False)
+        self.assertIs(outputs[2]["sol_help_intent"], True)
+        self.assertEqual(outputs[2]["acceptance_failures"], 3)
+        self.assertEqual(set(outputs[2]), {"kind", "recorded", "acceptance_failures",
+                                           "routine_retry_blocked", "sol_help_intent"})
 
     def test_rejected_cli_decision_does_not_mutate_ledger(self):
         self.run_child("cli-nonzero", "raise SystemExit(2)")
