@@ -337,3 +337,19 @@ Historical released/expired claims remain reviewable only at their exact
 original binding. No reviewer identity/authentication, dispatch, release,
 retry automation, feature-correctness proof, or native/live acceptance is
 established. Evidence and limitations: [local acceptance evidence](opencode-acceptance-evidence.md).
+
+### OC2-C02-R1-F1 lease clock validation correction
+
+Bounded independent fix based on base `d7e86fb419a42396c0238e4ca7f66e966d615da9`
+(branch `build/oc2-c02-r1-lease-fix`). Owned paths: the offline ledger,
+ledger/binding regression tests, and this appended checklist record. Claim and
+heartbeat now share strict finite non-negative clock and exact positive-integer
+lease validation, including overflow/finite-expiry checks before database
+initialization. Heartbeats reject a clock earlier than the persisted heartbeat
+inside the write transaction; equal clocks remain valid renewals. Invalid or
+regressing input does not mutate a claim, while a valid chronological heartbeat
+of an expired lease continues to quarantine it. The offline ledger remains
+caller-driven and does not qualify a native coordinator, runner, dispatch, or
+binding authenticity. Both focused suites passed (14 ledger, 13 binding tests); the
+full OpenCode suite passed (107 tests), as did `python3 scripts/repo-check.py`
+and `git diff --check`. Token usage/cost unavailable, unknown, not zero.

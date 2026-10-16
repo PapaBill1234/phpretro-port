@@ -39,6 +39,10 @@ class LedgerTests(unittest.TestCase):
         with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
             return db.execute("SELECT task_id, state, owned_paths FROM claims ORDER BY task_id").fetchall()
 
+    def full_claims(self):
+        with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
+            return db.execute("SELECT * FROM claims ORDER BY task_id").fetchall()
+
     def test_real_process_initial_contention_under_umask_022_admits_exactly_four(self):
         child_code = """
 import importlib.util, os, sys, time
@@ -223,6 +227,57 @@ m.claim(Path(sys.argv[2]), task_id='rollback', profile='p', branch='b',
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         finally:
             os.umask(previous_umask)
+
+    def test_claim_rejects_invalid_clocks_and_leases_before_database_mutation(self):
+        invalid_clocks = (True, False, "10", -1, float("nan"), float("inf"), 10**10000)
+        for index, clock in enumerate(invalid_clocks):
+            with self.subTest(clock=type(clock).__name__), self.assertRaises(ledger.LedgerError):
+                self.add(f"bad-clock-{index}", now=clock)
+        invalid_leases = (True, False, 1.0, "1", 0, -1, float("inf"), 10**10000)
+        for index, lease in enumerate(invalid_leases):
+            with self.subTest(lease=type(lease).__name__), self.assertRaises(ledger.LedgerError):
+                self.add(f"bad-lease-{index}", now=10, lease_seconds=lease)
+        self.assertFalse((self.state / ledger.DATABASE_NAME).exists())
+
+    def test_heartbeat_rejects_invalid_clock_lease_and_regression_without_mutation(self):
+        claim_id = self.add(now=20, lease_seconds=100)
+        before = self.full_claims()
+        invalid_clocks = (True, False, "21", -1, float("nan"), float("inf"), 10**10000)
+        for clock in invalid_clocks:
+            with self.subTest(clock=type(clock).__name__), self.assertRaises(ledger.LedgerError):
+                ledger.heartbeat(self.state, claim_id, now=clock)
+            self.assertEqual(self.full_claims(), before)
+        invalid_leases = (True, False, 1.0, "1", 0, -1, float("inf"), 10**10000)
+        for lease in invalid_leases:
+            with self.subTest(lease=type(lease).__name__), self.assertRaises(ledger.LedgerError):
+                ledger.heartbeat(self.state, claim_id, now=21, lease_seconds=lease)
+            self.assertEqual(self.full_claims(), before)
+        with self.assertRaisesRegex(ledger.LedgerError, "predates"):
+            ledger.heartbeat(self.state, claim_id, now=19)
+        self.assertEqual(self.full_claims(), before)
+
+    def test_heartbeat_accepts_equal_and_monotone_clocks_and_valid_expiry_still_quarantines(self):
+        claim_id = self.add(now=20, lease_seconds=100)
+        ledger.heartbeat(self.state, claim_id, now=20, lease_seconds=100)
+        ledger.heartbeat(self.state, claim_id, now=21, lease_seconds=100)
+        with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
+            self.assertEqual(db.execute("SELECT heartbeat_at, expires_at FROM claims WHERE claim_id=?",
+                                        (claim_id,)).fetchone(), (21.0, 121.0))
+        before_expiry = self.full_claims()
+        with self.assertRaisesRegex(ledger.LedgerError, "positive integer"):
+            ledger.heartbeat(self.state, claim_id, now=121, lease_seconds=0)
+        self.assertEqual(self.full_claims(), before_expiry)
+        with self.assertRaisesRegex(ledger.LedgerError, "cannot be revived"):
+            ledger.heartbeat(self.state, claim_id, now=121, lease_seconds=1)
+        with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
+            self.assertEqual(db.execute("SELECT state FROM claims WHERE claim_id=?",
+                                        (claim_id,)).fetchone()[0], "quarantined")
+
+    def test_clock_precision_that_prevents_expiry_advance_is_rejected(self):
+        stamp = float(2**53)
+        with self.assertRaisesRegex(ledger.LedgerError, "invalid expiry"):
+            self.add("precision", now=stamp, lease_seconds=1)
+        self.assertFalse((self.state / ledger.DATABASE_NAME).exists())
 
 
 if __name__ == "__main__":

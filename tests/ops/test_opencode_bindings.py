@@ -149,6 +149,27 @@ class BindingTests(unittest.TestCase):
         self.assertIsNone(ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim))
         self.assertEqual(self.bind("task-a", claim, now=21)["created_at"], 21)
 
+    def test_regressing_heartbeat_cannot_make_pre_creation_binding_clock_valid(self):
+        claim = self.add(now=20, lease=100)
+        with self.assertRaisesRegex(ledger.LedgerError, "predates persisted heartbeat"):
+            ledger.heartbeat(self.state, claim, now=10)
+        with self.assertRaisesRegex(ledger.LedgerError, "predates"):
+            self.bind("task-a", claim, now=11)
+        self.assertIsNone(ledger.get_session_binding(self.state, task_id="task-a", claim_id=claim))
+        with sqlite3.connect(self.state / ledger.DATABASE_NAME) as db:
+            self.assertEqual(db.execute("SELECT heartbeat_at, expires_at FROM claims WHERE claim_id=?",
+                                        (claim,)).fetchone(), (20.0, 120.0))
+        self.assertEqual(self.bind("task-a", claim, now=20)["created_at"], 20)
+
+    def test_infinite_or_overflowing_lease_cannot_create_claim_for_binding(self):
+        for lease in (float("inf"), 10**10000):
+            with self.subTest(lease=type(lease).__name__):
+                with self.assertRaises(ledger.LedgerError):
+                    self.add(f"invalid-{type(lease).__name__}", now=10, lease=lease)
+        self.assertIsNone(ledger.get_session_binding(self.state, task_id="invalid-float",
+                                                     claim_id="not-a-claim"))
+        self.assertFalse((self.state / ledger.DATABASE_NAME).exists())
+
     def test_concurrent_same_session_binding_has_one_winner(self):
         a = self.add("task-a")
         b = self.add("task-b", profile="secondary")

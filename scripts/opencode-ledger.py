@@ -165,12 +165,27 @@ def _finite_clock(value: object | None) -> float:
     if value is None:
         stamp = time.time()
     elif type(value) in (int, float):
-        stamp = float(value)
+        try:
+            stamp = float(value)
+        except OverflowError:
+            raise LedgerError("clock must be finite and non-negative") from None
     else:
         raise LedgerError("clock must be an int or float (not bool), finite and non-negative")
     if not math.isfinite(stamp) or stamp < 0:
         raise LedgerError("clock must be finite and non-negative")
     return stamp
+
+
+def _lease_expiry(stamp: float, lease_seconds: object) -> float:
+    if type(lease_seconds) is not int or lease_seconds <= 0:
+        raise LedgerError("lease duration must be a positive integer")
+    try:
+        expires_at = stamp + lease_seconds
+    except OverflowError:
+        raise LedgerError("lease duration produces an invalid expiry") from None
+    if not math.isfinite(expires_at) or expires_at <= stamp:
+        raise LedgerError("lease duration produces an invalid expiry")
+    return expires_at
 
 
 def _read_database(root: Path) -> sqlite3.Connection | None:
@@ -473,9 +488,8 @@ def claim(state_root: Path, *, task_id: str, profile: str, branch: str,
     paths = _owned_paths(canonical_worktree, owned_paths)
     if not all(isinstance(v, str) and v.strip() for v in (task_id, profile, branch)):
         raise LedgerError("task ID, profile and branch are required")
-    if not isinstance(lease_seconds, int) or lease_seconds <= 0:
-        raise LedgerError("lease duration must be a positive integer")
-    stamp = time.time() if now is None else float(now)
+    stamp = _finite_clock(now)
+    expires_at = _lease_expiry(stamp, lease_seconds)
     claim_id = str(uuid.uuid4())
     connection = _database(root)
     try:
@@ -501,7 +515,7 @@ def claim(state_root: Path, *, task_id: str, profile: str, branch: str,
             raise LedgerError("four-slot admission limit reached")
         _insert_claim(connection, (claim_id, task_id, profile, branch,
                                    str(canonical_worktree), json.dumps(paths), stamp,
-                                   stamp + lease_seconds))
+                                   expires_at))
         connection.commit()
         return claim_id
     except BaseException:
@@ -514,23 +528,28 @@ def claim(state_root: Path, *, task_id: str, profile: str, branch: str,
 
 def heartbeat(state_root: Path, claim_id: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS,
               now: float | None = None) -> None:
-    """Extend an unexpired claim; an expired claim is quarantined, never revived."""
-    if lease_seconds <= 0:
-        raise LedgerError("lease duration must be positive")
+    """Extend an unexpired claim; equal clocks renew, earlier clocks are rejected.
+
+    An expired claim is quarantined only for a valid, non-regressing clock and
+    is never revived.
+    """
+    stamp = _finite_clock(now)
+    expires_at = _lease_expiry(stamp, lease_seconds)
     root = _canonical_private_root(Path(state_root))
-    stamp = time.time() if now is None else float(now)
     connection = _database(root)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute("SELECT state, expires_at FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+        row = connection.execute("SELECT state, expires_at, heartbeat_at FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
         if row is None:
             raise LedgerError("unknown claim")
+        if stamp < row[2]:
+            raise LedgerError("heartbeat clock predates persisted heartbeat")
         if row[0] != "active" or row[1] <= stamp:
             connection.execute("UPDATE claims SET state='quarantined' WHERE claim_id=? AND state='active'", (claim_id,))
             connection.commit()
             raise LedgerError("expired or quarantined claim cannot be revived")
         connection.execute("UPDATE claims SET heartbeat_at=?, expires_at=? WHERE claim_id=?",
-                           (stamp, stamp + lease_seconds, claim_id))
+                           (stamp, expires_at, claim_id))
         connection.commit()
     except BaseException:
         if connection.in_transaction:
