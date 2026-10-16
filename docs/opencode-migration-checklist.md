@@ -299,3 +299,20 @@ OpenCode suite passed (**86 tests**), `python3 scripts/repo-check.py` and
 `git diff --check` passed. Local verifier checks are not cryptographic
 authenticity against an operator able to rewrite all private evidence. Token
 usage/cost unavailable, unknown, not zero.
+
+### OC2-M06-A09b explicit local reviewed-outcome adapter
+
+The separate `scripts/opencode-acceptance-outcome.py` adapter re-verifies a
+runner receipt/logs at record time, checks exact task/claim/canonical-worktree
+binding against the original claim using a read-only snapshot, then calls the
+unchanged typed ledger outcome API. Explicit strict reviewer confirmation is
+required; failures additionally require explicit implementation attribution
+and a bounded signature. Only zero-exit receipts may be reviewed as pass, and
+only unclassified-nonzero receipts may be reviewed as implementation failure.
+All unresolved/incomplete statuses are rejected. Evidence identity is
+`acceptance/<run_id>` (not content hash); exact `attempt_id` replay remains
+ledger-idempotent, while another attempt/verdict for the same run is rejected.
+Historical released/expired claims remain reviewable only at their exact
+original binding. No reviewer identity/authentication, dispatch, release,
+retry automation, feature-correctness proof, or native/live acceptance is
+established. Evidence and limitations: [local acceptance evidence](opencode-acceptance-evidence.md).
