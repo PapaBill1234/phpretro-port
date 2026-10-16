@@ -54,3 +54,33 @@ qualification and does not establish native OpenCode session lifecycle
 semantics. Linked-worktree tests exercise the real worktree gitfile and linked
 index to ensure status does not refresh index metadata. Token usage/cost is
 unavailable here (unknown, not zero).
+
+## OC2-M06-R2 offline durable claim-to-session binding
+
+The private SQLite ledger has an additive `session_bindings` table and two
+explicit coordinator APIs: `bind_session(...)` and the bounded private reader
+`get_session_binding(...)`. The write atomically matches exact task and claim
+IDs to an active, unexpired claim with the same profile, then records opaque
+session ID, project ID, profile, caller-attested server-scope identifier, a
+stable receipt, and creation clock. No worktree or branch can be supplied by
+the binder; those remain the claim's ledger-owned values. No claim, lease,
+release, or outcome state is changed. Missing bindings remain unknown.
+
+Exact replay returns its original durable receipt without refreshing its
+timestamp. Conflicting task/claim rebinding is rejected. A server-scope/session
+pair remains unique across profiles and historical released claims, preventing
+automatic reassignment. A different scope is distinct only as a caller-supplied
+configuration label; it is **not** proof of a different process or a new server
+incarnation. The scope and session identity are coordinator attestations, not
+authenticated OpenCode evidence. Future native collector work must verify the
+native project/session correspondence and establish authoritative server-scope
+identity independently. Restart recovery remains at-least-once; a binding does
+not prove termination, safe prompt replay, or live recovery qualification.
+
+The APIs perform no auth, quota, plugin, provider, server, or native API calls.
+They do not launch/stop sessions or issue prompts. The raw read API is private
+ledger access and the CLI intentionally provides no raw binding output. Tests
+cover additive migration with existing claim/outcome rows, persistence, replay,
+reject paths, cross-profile session collisions, different-scope semantics,
+concurrent insertion, and rollback. No dispatch or native binding verification
+is claimed.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -125,6 +126,19 @@ def _database(root: Path) -> sqlite3.Connection:
         created_by_attempt TEXT NOT NULL,
         reason TEXT NOT NULL
     )""")
+    # Additive durable coordinator attestation. Historical rows are retained;
+    # scope/session uniqueness deliberately includes released claims forever.
+    connection.execute("""CREATE TABLE IF NOT EXISTS session_bindings (
+        task_id TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        profile TEXT NOT NULL,
+        server_scope TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        receipt TEXT NOT NULL,
+        UNIQUE(server_scope, session_id)
+    )""")
     return connection
 
 
@@ -140,6 +154,99 @@ def _safe_label(value: str, field: str) -> str:
     if value and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value) is None:
         raise LedgerError(f"{field} must be a bounded opaque reference, not free-form text")
     return value
+
+
+def _opaque_id(value: object, field: str, maximum: int = 128) -> str:
+    result = _bounded_text(value, field, maximum)
+    return _safe_label(result, field)
+
+
+def _finite_clock(value: object | None) -> float:
+    try:
+        stamp = time.time() if value is None else float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise LedgerError("clock must be finite and non-negative") from None
+    if not math.isfinite(stamp) or stamp < 0:
+        raise LedgerError("clock must be finite and non-negative")
+    return stamp
+
+
+def bind_session(state_root: Path, *, task_id: str, claim_id: str,
+                 session_id: str, project_id: str, profile: str,
+                 server_scope: str, now: float | None = None) -> dict:
+    """Persist an offline coordinator attestation for one active task claim.
+
+    The server scope is a caller-supplied opaque configuration identity. This
+    function neither authenticates nor verifies the native server/session.
+    """
+    task = _opaque_id(task_id, "task ID")
+    claim = _opaque_id(claim_id, "claim ID", 64)
+    session = _opaque_id(session_id, "session ID")
+    project = _opaque_id(project_id, "project ID")
+    selected_profile = _opaque_id(profile, "profile")
+    scope = _opaque_id(server_scope, "server scope")
+    stamp = _finite_clock(now)
+    root = _canonical_private_root(Path(state_root))
+    connection = _database(root)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute("""SELECT task_id, claim_id, session_id,
+            project_id, profile, server_scope, receipt FROM session_bindings
+            WHERE task_id=? OR claim_id=? OR (server_scope=? AND session_id=?)""",
+            (task, claim, scope, session)).fetchall()
+        values = (task, claim, session, project, selected_profile, scope)
+        if existing:
+            if len(existing) == 1 and tuple(existing[0][:6]) == values:
+                receipt = json.loads(existing[0][6])
+                connection.commit()
+                return receipt
+            raise LedgerError("conflicting session binding already exists")
+        owner = connection.execute("SELECT task_id, profile, state, expires_at FROM claims WHERE claim_id=?",
+                                   (claim,)).fetchone()
+        if owner is None or owner[0] != task:
+            raise LedgerError("binding claim does not belong to task")
+        if owner[1] != selected_profile:
+            raise LedgerError("binding profile does not match claim")
+        if owner[2] != "active" or owner[3] <= stamp:
+            raise LedgerError("binding requires an active unexpired claim")
+        receipt = {"task_id": task, "claim_id": claim, "session_id": session,
+                   "project_id": project, "profile": selected_profile,
+                   "server_scope": scope, "created_at": stamp}
+        encoded_receipt = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        connection.execute("""INSERT INTO session_bindings
+            (task_id, claim_id, session_id, project_id, profile, server_scope,
+             created_at, receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*values, stamp, encoded_receipt))
+        connection.commit()
+        return receipt
+    except sqlite3.IntegrityError:
+        if connection.in_transaction:
+            connection.rollback()
+        raise LedgerError("conflicting session binding already exists") from None
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_session_binding(state_root: Path, *, task_id: str, claim_id: str) -> dict | None:
+    """Read one raw durable binding through the explicitly private API."""
+    task = _opaque_id(task_id, "task ID")
+    claim = _opaque_id(claim_id, "claim ID", 64)
+    root = _canonical_private_root(Path(state_root))
+    connection = _database(root)
+    try:
+        row = connection.execute("""SELECT task_id, claim_id, session_id, project_id,
+            profile, server_scope, created_at FROM session_bindings
+            WHERE task_id=? AND claim_id=?""", (task, claim)).fetchone()
+        if row is None:
+            return None
+        return dict(zip(("task_id", "claim_id", "session_id", "project_id",
+                         "profile", "server_scope", "created_at"), row))
+    finally:
+        connection.close()
 
 
 def _task_outcome_status(connection: sqlite3.Connection, task_id: str) -> dict:

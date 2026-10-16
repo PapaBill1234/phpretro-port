@@ -244,3 +244,18 @@ addition to the optional-lock and inherited-environment safeguards. System and
 global Git config are disabled; local config is bounded by explicit command-line
 overrides, not claimed disabled. A synthetic local fsmonitor executable marker
 test verifies the hook is not run.
+
+## OC2-M06-R2 offline durable claim-to-native-session binding
+
+Added an additive SQLite binding table and explicit offline coordinator
+attestation/read APIs. Binding requires the exact existing active, unexpired
+claim and matching profile. Replays preserve the original durable receipt;
+conflicts and historical scope/session reuse fail closed, including across
+profiles. See [recovery evidence](opencode-recovery-evidence.md) for the
+caller-attested nature of IDs and scope, API boundaries, and the future need
+for collector verification. This is not native binding verification, prompt
+recovery qualification, dispatch, or proof of server incarnation/termination.
+The full focused OpenCode suite passed (63 tests), as did
+`python3 scripts/repo-check.py` and `git diff --check`. These local checks do
+not qualify dispatch, native binding verification, or live recovery. Token
+usage/cost unavailable; unknown, not zero.
